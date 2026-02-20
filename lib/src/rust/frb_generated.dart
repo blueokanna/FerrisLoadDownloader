@@ -35,12 +35,8 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
   /// Initialize flutter_rust_bridge in mock mode.
   /// No libraries for FFI are loaded.
-  static void initMock({
-    required RustLibApi api,
-  }) {
-    instance.initMockImpl(
-      api: api,
-    );
+  static void initMock({required RustLibApi api}) {
+    instance.initMockImpl(api: api);
   }
 
   /// Dispose flutter_rust_bridge
@@ -74,21 +70,22 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
-    stem: 'rust_lib_m3u8_downloader',
-    ioDirectory: 'rust/target/release/',
-    webPrefix: 'pkg/',
-  );
+        stem: 'rust_lib_m3u8_downloader',
+        ioDirectory: 'rust/target/release/',
+        webPrefix: 'pkg/',
+      );
 }
 
 abstract class RustLibApi extends BaseApi {
-  Stream<ProgressUpdate> crateApiDownloaderHls2Mp4Run(
-      {required String url,
-      required int concurrency,
-      required String output,
-      required int retries,
-      required int videoBitrate,
-      required int audioBitrate,
-      required bool keepTemp});
+  Stream<ProgressUpdate> crateApiDownloaderHls2Mp4Run({
+    required String url,
+    required int concurrency,
+    required String output,
+    required int retries,
+    required int videoBitrate,
+    required int audioBitrate,
+    required bool keepTemp,
+  });
 
   Future<void> crateApiDownloaderInitApp();
 }
@@ -102,46 +99,55 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
-  Stream<ProgressUpdate> crateApiDownloaderHls2Mp4Run(
-      {required String url,
-      required int concurrency,
-      required String output,
-      required int retries,
-      required int videoBitrate,
-      required int audioBitrate,
-      required bool keepTemp}) {
+  Stream<ProgressUpdate> crateApiDownloaderHls2Mp4Run({
+    required String url,
+    required int concurrency,
+    required String output,
+    required int retries,
+    required int videoBitrate,
+    required int audioBitrate,
+    required bool keepTemp,
+  }) {
     final sink = RustStreamSink<ProgressUpdate>();
-    unawaited(handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        final serializer = SseSerializer(generalizedFrbRustBinding);
-        sse_encode_StreamSink_progress_update_Sse(sink, serializer);
-        sse_encode_String(url, serializer);
-        sse_encode_i_32(concurrency, serializer);
-        sse_encode_String(output, serializer);
-        sse_encode_i_32(retries, serializer);
-        sse_encode_i_32(videoBitrate, serializer);
-        sse_encode_i_32(audioBitrate, serializer);
-        sse_encode_bool(keepTemp, serializer);
-        pdeCallFfi(generalizedFrbRustBinding, serializer,
-            funcId: 1, port: port_);
-      },
-      codec: SseCodec(
-        decodeSuccessData: sse_decode_unit,
-        decodeErrorData: sse_decode_AnyhowException,
+    unawaited(
+      handler.executeNormal(
+        NormalTask(
+          callFfi: (port_) {
+            final serializer = SseSerializer(generalizedFrbRustBinding);
+            sse_encode_StreamSink_progress_update_Sse(sink, serializer);
+            sse_encode_String(url, serializer);
+            sse_encode_i_32(concurrency, serializer);
+            sse_encode_String(output, serializer);
+            sse_encode_i_32(retries, serializer);
+            sse_encode_i_32(videoBitrate, serializer);
+            sse_encode_i_32(audioBitrate, serializer);
+            sse_encode_bool(keepTemp, serializer);
+            pdeCallFfi(
+              generalizedFrbRustBinding,
+              serializer,
+              funcId: 1,
+              port: port_,
+            );
+          },
+          codec: SseCodec(
+            decodeSuccessData: sse_decode_unit,
+            decodeErrorData: sse_decode_AnyhowException,
+          ),
+          constMeta: kCrateApiDownloaderHls2Mp4RunConstMeta,
+          argValues: [
+            sink,
+            url,
+            concurrency,
+            output,
+            retries,
+            videoBitrate,
+            audioBitrate,
+            keepTemp,
+          ],
+          apiImpl: this,
+        ),
       ),
-      constMeta: kCrateApiDownloaderHls2Mp4RunConstMeta,
-      argValues: [
-        sink,
-        url,
-        concurrency,
-        output,
-        retries,
-        videoBitrate,
-        audioBitrate,
-        keepTemp
-      ],
-      apiImpl: this,
-    )));
+    );
     return sink.stream;
   }
 
@@ -156,32 +162,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           "retries",
           "videoBitrate",
           "audioBitrate",
-          "keepTemp"
+          "keepTemp",
         ],
       );
 
   @override
   Future<void> crateApiDownloaderInitApp() {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        final serializer = SseSerializer(generalizedFrbRustBinding);
-        pdeCallFfi(generalizedFrbRustBinding, serializer,
-            funcId: 2, port: port_);
-      },
-      codec: SseCodec(
-        decodeSuccessData: sse_decode_unit,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 2,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiDownloaderInitAppConstMeta,
+        argValues: [],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiDownloaderInitAppConstMeta,
-      argValues: [],
-      apiImpl: this,
-    ));
+    );
   }
 
-  TaskConstMeta get kCrateApiDownloaderInitAppConstMeta => const TaskConstMeta(
-        debugName: "init_app",
-        argNames: [],
-      );
+  TaskConstMeta get kCrateApiDownloaderInitAppConstMeta =>
+      const TaskConstMeta(debugName: "init_app", argNames: []);
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
@@ -191,7 +201,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   RustStreamSink<ProgressUpdate> dco_decode_StreamSink_progress_update_Sse(
-      dynamic raw) {
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     throw UnimplementedError();
   }
@@ -259,7 +270,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   RustStreamSink<ProgressUpdate> sse_decode_StreamSink_progress_update_Sse(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     throw UnimplementedError('Unreachable ()');
   }
@@ -317,22 +329,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_AnyhowException(
-      AnyhowException self, SseSerializer serializer) {
+    AnyhowException self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.message, serializer);
   }
 
   @protected
   void sse_encode_StreamSink_progress_update_Sse(
-      RustStreamSink<ProgressUpdate> self, SseSerializer serializer) {
+    RustStreamSink<ProgressUpdate> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(
-        self.setupAndSerialize(
-            codec: SseCodec(
+      self.setupAndSerialize(
+        codec: SseCodec(
           decodeSuccessData: sse_decode_progress_update,
           decodeErrorData: sse_decode_AnyhowException,
-        )),
-        serializer);
+        ),
+      ),
+      serializer,
+    );
   }
 
   @protected
@@ -361,7 +379,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_prim_u_8_strict(
-      Uint8List self, SseSerializer serializer) {
+    Uint8List self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
@@ -369,7 +389,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_progress_update(
-      ProgressUpdate self, SseSerializer serializer) {
+    ProgressUpdate self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.message, serializer);
     sse_encode_f_64(self.progress, serializer);

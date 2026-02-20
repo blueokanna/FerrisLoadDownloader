@@ -1,0 +1,63 @@
+# Flutter构建文件
+build/
+.dart_tool/
+.packages
+pubspec.lock
+
+# Rust构建文件
+rust/target/
+rust/Cargo.lock
+
+# IDE文件
+.vscode/
+.idea/
+*.iml
+
+# Git和版本控制
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 平台特定构建文件
+android/app/build/
+ios/build/
+linux/build/
+macos/build/
+windows/build/
+
+# 测试文件（如果不需要包含在镜像中）
+test/
+integration_test/
+test_driver/
+
+# Docker相关文件
+Dockerfile*
+docker-compose.yml
+.dockerignore
+docker-build.*
+DOCKER_README.md
+
+# 文档
+README.md
+DOCKER_README.md
+
+# 其他配置文件
+analysis_options.yaml
+
+# 临时文件
+*.tmp
+*.log
+*.cache
+
+# 特定于平台的构建产物
+*.app
+*.exe
+*.dmg
+*.deb
+*.rpm

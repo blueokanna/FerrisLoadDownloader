@@ -8,33 +8,31 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 // These functions are ignored because they are not marked as `pub`: `android_hardware_transcode`, `check_ffmpeg`, `convert_to_mp4`, `create_http_client`, `detect_acceleration`, `download_and_merge`, `download_playlist`, `select_transcoder_backend`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AccelType`, `TranscoderKind`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `fmt`, `fmt`
 
-Stream<ProgressUpdate> hls2Mp4Run(
-        {required String url,
-        required int concurrency,
-        required String output,
-        required int retries,
-        required int videoBitrate,
-        required int audioBitrate,
-        required bool keepTemp}) =>
-    RustLib.instance.api.crateApiDownloaderHls2Mp4Run(
-        url: url,
-        concurrency: concurrency,
-        output: output,
-        retries: retries,
-        videoBitrate: videoBitrate,
-        audioBitrate: audioBitrate,
-        keepTemp: keepTemp);
+Stream<ProgressUpdate> hls2Mp4Run({
+  required String url,
+  required int concurrency,
+  required String output,
+  required int retries,
+  required int videoBitrate,
+  required int audioBitrate,
+  required bool keepTemp,
+}) => RustLib.instance.api.crateApiDownloaderHls2Mp4Run(
+  url: url,
+  concurrency: concurrency,
+  output: output,
+  retries: retries,
+  videoBitrate: videoBitrate,
+  audioBitrate: audioBitrate,
+  keepTemp: keepTemp,
+);
 
 class ProgressUpdate {
   final String message;
   final double progress;
 
-  const ProgressUpdate({
-    required this.message,
-    required this.progress,
-  });
+  const ProgressUpdate({required this.message, required this.progress});
 
   @override
   int get hashCode => message.hashCode ^ progress.hashCode;

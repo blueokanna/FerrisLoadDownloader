@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  m3u8-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: m3u8-downloader-app
+    restart: unless-stopped
+    # 对于GUI应用，需要显示支持
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      # 挂载X11 socket用于GUI显示
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # 挂载下载目录
+      - ./downloads:/app/downloads:rw
+    # 允许访问X服务器
+    security_opt:
+      - seccomp:unconfined
+    # 特权模式（如果需要访问硬件加速）
+    # privileged: true
+    networks:
+      - m3u8-network
+
+  # 可选：API服务版本
+  m3u8-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "3000:3000"
+    container_name: m3u8-downloader-api
+    restart: unless-stopped
+    volumes:
+      - ./downloads:/app/downloads:rw
+    environment:
+      - API_PORT=3000
+    networks:
+      - m3u8-network
+    profiles:
+      - api
+
+networks:
+  m3u8-network:
+    driver: bridge
+
+volumes:
+  downloads:
+    driver: local

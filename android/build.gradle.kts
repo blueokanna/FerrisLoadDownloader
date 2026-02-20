@@ -19,12 +19,18 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
-// Disable lint tasks for problematic third-party plugins (e.g., file_picker) to avoid
-// release build failures when lint cache files are locked by external tools.
 subprojects {
     if (name.contains("file_picker")) {
         tasks.matching { it.name.contains("lint", ignoreCase = true) }
             .configureEach { enabled = false }
+    }
+}
+
+subprojects {
+    if (name.contains("file_picker")) {
+        tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+            incremental = false
+        }
     }
 }
 

@@ -51,22 +51,22 @@ dev_dependencies:
 flutter_launcher_icons:
   android: "ic_launcher"
   ios: true
-  image_path: "assets/ferrisload.png"
-  min_sdk_android: 21 # android min sdk min:16, default 21
-  adaptive_icon_background: "#FFFFFF"
-  adaptive_icon_foreground: "assets/ferrisload.png"
+  image_path: "assets/playstore.png"
+  min_sdk_android: 21
+  adaptive_icon_background: "#6750A4"
+  adaptive_icon_foreground: "assets/playstore.png"
   web:
     generate: true
-    image_path: "assets/ferrisload.png"
-    background_color: "#hex"
-    theme_color: "#hex"
+    image_path: "assets/playstore.png"
+    background_color: "#6750A4"
+    theme_color: "#6750A4"
   windows:
     generate: true
-    image_path: "assets/ferrisload.png"
-    icon_size: 48 # min:48, max:256, default: 48
+    image_path: "assets/playstore.png"
+    icon_size: 48
   macos:
     generate: true
-    image_path: "assets/ferrisload.png"
+    image_path: "assets/playstore.png"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

@@ -5,22 +5,61 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v1.0.0). Leave empty to use branch HEAD without release.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
 
+env:
+  FLUTTER_VERSION: '3.27.1'
+  FRB_VERSION: '2.11.1'
+
 jobs:
+  # ─────────────────────────────────────────────────────────
+  #  Android APK (arm64-v8a, armeabi-v7a, x86_64, x86)
+  # ─────────────────────────────────────────────────────────
   build-android:
     name: Build Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            x86_64-linux-android,
+            i686-linux-android
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-android-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml') }}
+          restore-keys: rust-android-
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -29,62 +68,57 @@ jobs:
           ndk-version: r27
           add-to-path: true
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android, i686-linux-android    
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked || true
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-          flutter-version: '3.27.1'
+      - name: Install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --locked || true
 
-      - name: Install Android NDK
-        run: |
-          # Flutter usually handles NDK, but sometimes explicit setup helps if specific version needed
-          flutter doctor
-
-      - name: Install Dependencies
+      - name: Flutter pub get
         run: flutter pub get
 
-      - name: Generate Launcher Icons
-        run: flutter pub run flutter_launcher_icons
-
-      - name: Install Codegen
-        run: cargo install flutter_rust_bridge_codegen --version 2.11.1
-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk
-
-      - name: Generate Rust Bridge Code
+      - name: Generate bridge code
         run: flutter_rust_bridge_codegen generate
 
-      - name: Build Rust for Android
+      - name: Build Rust native libraries
         working-directory: ./rust
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cargo ndk -t armeabi-v7a -t arm64-v8a -t x86 -t x86_64 -o ../android/app/src/main/jniLibs build --release
+          cargo ndk \
+            -t arm64-v8a \
+            -t armeabi-v7a \
+            -t x86_64 \
+            -t x86 \
+            -o ../android/app/src/main/jniLibs \
+            build --release
 
-      - name: Verify JNI Libs
-        run: ls -R android/app/src/main/jniLibs
+      - name: Verify JNI libs
+        run: find android/app/src/main/jniLibs -name "*.so" | head -20
 
-      - name: Build APK
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build release APK
         run: flutter build apk --release
 
       - name: Rename APK
-        run: mv build/app/outputs/flutter-apk/app-release.apk m3u8-downloader-android.apk
+        run: mv build/app/outputs/flutter-apk/app-release.apk FerrisLoad-android.apk
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: m3u8-downloader-android.apk
+          path: FerrisLoad-android.apk
+          retention-days: 5
 
+  # ─────────────────────────────────────────────────────────
+  #  Windows x64
+  # ─────────────────────────────────────────────────────────
   build-windows:
     name: Build Windows x64
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -92,99 +126,144 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-          flutter-version: '3.27.1'
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
 
-      - name: Setup Rust
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install Dependencies
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            rust\target
+          key: rust-windows-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml') }}
+          restore-keys: rust-windows-
+
+      - name: Install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --locked
+        continue-on-error: true
+
+      - name: Flutter pub get
         run: flutter pub get
 
-      - name: Install Codegen
-        run: cargo install flutter_rust_bridge_codegen --version 2.11.1
-
-      - name: Generate Rust Bridge Code
+      - name: Generate bridge code
         run: flutter_rust_bridge_codegen generate
 
-      - name: Build Windows
+      - name: Build Windows release
         run: flutter build windows --release
 
-      - name: Compress Release
+      - name: Create ZIP archive
         run: |
-          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath m3u8-downloader-windows-x64.zip
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "FerrisLoad-windows-x64.zip"
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-zip
-          path: m3u8-downloader-windows-x64.zip
+          path: FerrisLoad-windows-x64.zip
+          retention-days: 5
 
+  # ─────────────────────────────────────────────────────────
+  #  Linux x64
+  # ─────────────────────────────────────────────────────────
   build-linux:
-    name: Build Linux
+    name: Build Linux x64
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux Dependencies
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-          flutter-version: '3.27.1'
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
 
-      - name: Install Dependencies
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-linux-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml') }}
+          restore-keys: rust-linux-
+
+      - name: Install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --locked || true
+
+      - name: Flutter pub get
         run: flutter pub get
 
-      - name: Install Codegen
-        run: cargo install flutter_rust_bridge_codegen --version 2.11.1
-
-      - name: Generate Rust Bridge Code
+      - name: Generate bridge code
         run: flutter_rust_bridge_codegen generate
 
-      - name: Build Linux
+      - name: Build Linux release
         run: flutter build linux --release
 
-      - name: Compress Release
+      - name: Create tarball
         run: |
-          tar -czvf m3u8-downloader-linux-x64.tar.gz -C build/linux/x64/release/bundle .
+          tar -czvf FerrisLoad-linux-x64.tar.gz \
+            -C build/linux/x64/release/bundle .
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-tar
-          path: m3u8-downloader-linux-x64.tar.gz
+          path: FerrisLoad-linux-x64.tar.gz
+          retention-days: 5
 
+  # ─────────────────────────────────────────────────────────
+  #  Publish GitHub Release
+  # ─────────────────────────────────────────────────────────
   create-release:
     name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != ''
     needs: [build-android, build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
-      - name: Download Android Artifact
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: android-apk
+          path: artifacts
 
-      - name: Download Windows Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-zip
+      - name: List artifacts
+        run: find artifacts -type f
 
-      - name: Download Linux Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-tar
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: |
-            m3u8-downloader-android.apk
-            m3u8-downloader-windows-x64.zip
-            m3u8-downloader-linux-x64.tar.gz
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: FerrisLoad ${{ steps.tag.outputs.name }}
           generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/android-apk/FerrisLoad-android.apk
+            artifacts/windows-zip/FerrisLoad-windows-x64.zip
+            artifacts/linux-tar/FerrisLoad-linux-x64.tar.gz

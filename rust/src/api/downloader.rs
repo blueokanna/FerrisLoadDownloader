@@ -930,6 +930,7 @@ async fn convert_to_mp4(
         TranscoderKind::Ffmpeg(accel) => {
             info!("Using FFmpeg backend: {:?}", accel);
             let mut ffmpeg_args: Vec<String> = vec![
+                "-y".to_string(),
                 "-hide_banner".to_string(),
                 "-loglevel".to_string(),
                 "info".to_string(),
@@ -1007,6 +1008,14 @@ async fn convert_to_mp4(
 
             convert_pb.finish_with_message("MP4 transcode complete");
             info!("Output file: {}", output_path);
+
+            // Verify output file
+            let out_meta = std::fs::metadata(output_path)
+                .context("Transcode output file not found after FFmpeg")?;
+            if out_meta.len() < 1024 {
+                bail!("Transcode output file is too small ({} bytes), likely corrupted", out_meta.len());
+            }
+
             Ok(())
         }
         TranscoderKind::AndroidHardware => {
@@ -1021,6 +1030,14 @@ async fn convert_to_mp4(
             .await?;
             convert_pb.finish_with_message("Android hardware transcode complete");
             info!("Output file: {}", output_path);
+
+            // Verify output file
+            let out_meta = std::fs::metadata(output_path)
+                .context("Transcode output file not found after Android hardware transcode")?;
+            if out_meta.len() < 1024 {
+                bail!("Transcode output file is too small ({} bytes), likely corrupted", out_meta.len());
+            }
+
             Ok(())
         }
     }
