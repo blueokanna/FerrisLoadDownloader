@@ -1,11 +1,11 @@
 [package]
 name = "rust_lib_m3u8_downloader"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [lib]
 name = "rust_lib_m3u8_downloader"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 aes = { version = "0.7.5" }

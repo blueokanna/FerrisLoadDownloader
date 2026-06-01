@@ -31,6 +31,7 @@ use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::JavaVM;
 
 type Aes128Cbc = Cbc<Aes128, Pkcs7>;
+pub(crate) type ProgressReporter = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
 #[derive(Clone, Copy, Debug)]
 enum AccelType {
@@ -97,6 +98,23 @@ pub struct MediaInspectionResult {
     pub warnings: Vec<String>,
     pub auth_required: bool,
     pub challenge_reason: String,
+}
+
+pub(crate) fn sink_progress_reporter(sink: StreamSink<ProgressUpdate>) -> ProgressReporter {
+    Arc::new(move |update| {
+        let _ = sink.add(update);
+    })
+}
+
+pub(crate) fn noop_progress_reporter() -> ProgressReporter {
+    Arc::new(|_| {})
+}
+
+pub(crate) fn emit_progress(reporter: &ProgressReporter, message: impl Into<String>, progress: f64) {
+    reporter(ProgressUpdate {
+        message: message.into(),
+        progress,
+    });
 }
 
 #[cfg(target_os = "android")]
@@ -556,9 +574,32 @@ pub async fn hls2mp4_run(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
+    hls2mp4_core(
+        sink_progress_reporter(sink),
+        url,
+        concurrency,
+        output,
+        retries,
+        video_bitrate,
+        audio_bitrate,
+        keep_temp,
+    )
+    .await
+}
+
+pub(crate) async fn hls2mp4_core(
+    reporter: ProgressReporter,
+    url: String,
+    concurrency: i32,
+    output: String,
+    retries: i32,
+    video_bitrate: i32,
+    audio_bitrate: i32,
+    keep_temp: bool,
+) -> Result<()> {
     let request_context = RequestContext::default();
     run_hls_pipeline(
-        sink,
+        reporter,
         &url,
         &request_context,
         concurrency,
@@ -664,8 +705,8 @@ pub async fn download_media_run(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
-    download_media_with_context(
-        sink,
+    download_media_with_context_core(
+        sink_progress_reporter(sink),
         page_url,
         media_url,
         audio_url,
@@ -694,11 +735,40 @@ pub async fn download_media_with_context(
     keep_temp: bool,
     request_context: RequestContext,
 ) -> Result<()> {
+    download_media_with_context_core(
+        sink_progress_reporter(sink),
+        page_url,
+        media_url,
+        audio_url,
+        output,
+        concurrency,
+        retries,
+        video_bitrate,
+        audio_bitrate,
+        keep_temp,
+        request_context,
+    )
+    .await
+}
+
+pub(crate) async fn download_media_with_context_core(
+    reporter: ProgressReporter,
+    page_url: String,
+    media_url: String,
+    audio_url: Option<String>,
+    output: String,
+    concurrency: i32,
+    retries: i32,
+    video_bitrate: i32,
+    audio_bitrate: i32,
+    keep_temp: bool,
+    request_context: RequestContext,
+) -> Result<()> {
     init_runtime_logging();
 
     if is_hls_like(&media_url) {
         return run_hls_pipeline(
-            sink,
+            reporter,
             &media_url,
             &request_context,
             concurrency,
@@ -711,10 +781,7 @@ pub async fn download_media_with_context(
         .await;
     }
 
-    let _ = sink.add(ProgressUpdate {
-        message: "Preparing direct media download...".to_string(),
-        progress: 0.02,
-    });
+    emit_progress(&reporter, "Preparing direct media download...", 0.02);
 
     let page_url = Url::parse(&page_url).ok();
     let client = create_http_client_for_context(page_url.as_ref().map(Url::as_str), &request_context)?;
@@ -734,9 +801,9 @@ pub async fn download_media_with_context(
             let video_temp = temp_dir.join("stream_video_input.bin");
             let audio_temp = temp_dir.join("stream_audio_input.bin");
 
-            download_to_file(&client, &media_url, &video_temp, 0.42, &sink, "Downloading video stream")
+            download_to_file(&client, &media_url, &video_temp, 0.42, &reporter, "Downloading video stream")
                 .await?;
-            download_to_file(&client, &audio, &audio_temp, 0.78, &sink, "Downloading audio stream")
+            download_to_file(&client, &audio, &audio_temp, 0.78, &reporter, "Downloading audio stream")
                 .await?;
 
             merge_media_streams(
@@ -756,11 +823,11 @@ pub async fn download_media_with_context(
         None => {
             let extension = container_from_url(&media_url);
             if extension == "mp4" {
-                download_to_file(&client, &media_url, &output_path, 0.95, &sink, "Downloading media")
+                download_to_file(&client, &media_url, &output_path, 0.95, &reporter, "Downloading media")
                     .await?;
             } else {
                 let temp_input = temp_dir.join(format!("direct_input.{}", extension));
-                download_to_file(&client, &media_url, &temp_input, 0.72, &sink, "Downloading media")
+                download_to_file(&client, &media_url, &temp_input, 0.72, &reporter, "Downloading media")
                     .await?;
                 convert_to_mp4(
                     temp_input.to_string_lossy().as_ref(),
@@ -769,7 +836,7 @@ pub async fn download_media_with_context(
                     audio_bitrate.max(0) as u32,
                     &MultiProgress::new(),
                     select_transcoder_backend().await?,
-                    sink.clone(),
+                    reporter.clone(),
                 )
                 .await?;
                 if !keep_temp {
@@ -779,16 +846,13 @@ pub async fn download_media_with_context(
         }
     }
 
-    let _ = sink.add(ProgressUpdate {
-        message: "All tasks completed".to_string(),
-        progress: 1.0,
-    });
+    emit_progress(&reporter, "All tasks completed", 1.0);
 
     Ok(())
 }
 
-async fn run_hls_pipeline(
-    sink: StreamSink<ProgressUpdate>,
+pub(crate) async fn run_hls_pipeline(
+    reporter: ProgressReporter,
     url: &str,
     request_context: &RequestContext,
     concurrency: i32,
@@ -798,10 +862,7 @@ async fn run_hls_pipeline(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
-    let _ = sink.add(ProgressUpdate {
-        message: "Initializing...".to_string(),
-        progress: 0.0,
-    });
+    emit_progress(&reporter, "Initializing...", 0.0);
 
     init_runtime_logging();
 
@@ -819,10 +880,7 @@ async fn run_hls_pipeline(
     check_pb.set_message("Selecting transcoder backend...");
     check_pb.enable_steady_tick(Duration::from_millis(100));
 
-    let _ = sink.add(ProgressUpdate {
-        message: "Selecting transcoder backend...".to_string(),
-        progress: 0.01,
-    });
+    emit_progress(&reporter, "Selecting transcoder backend...", 0.01);
 
     let backend = select_transcoder_backend().await?;
     match backend {
@@ -843,10 +901,7 @@ async fn run_hls_pipeline(
     download_pb.set_message("Downloading M3U8 playlist...");
     download_pb.enable_steady_tick(Duration::from_millis(100));
 
-    let _ = sink.add(ProgressUpdate {
-        message: "Downloading M3U8 playlist...".to_string(),
-        progress: 0.02,
-    });
+    emit_progress(&reporter, "Downloading M3U8 playlist...", 0.02);
 
     let m3u8_content = download_playlist(url, request_context).await?;
     let (_, playlist) =
@@ -931,7 +986,7 @@ async fn run_hls_pipeline(
                     &temp_ts_str,
                     &temp_dir,
                     &multi_progress,
-                    sink.clone(),
+                    reporter.clone(),
                     request_context.clone(),
                 )
                 .await?;
@@ -949,7 +1004,7 @@ async fn run_hls_pipeline(
                 &temp_ts_str,
                 &temp_dir,
                 &multi_progress,
-                sink.clone(),
+                reporter.clone(),
                 request_context.clone(),
             )
             .await?;
@@ -963,7 +1018,7 @@ async fn run_hls_pipeline(
         audio_bitrate,
         &multi_progress,
         backend,
-        sink.clone(),
+        reporter.clone(),
     )
     .await?;
 
@@ -971,10 +1026,7 @@ async fn run_hls_pipeline(
         let _ = fs::remove_file(&temp_ts_str).await;
     }
 
-    let _ = sink.add(ProgressUpdate {
-        message: "All tasks completed".to_string(),
-        progress: 1.0,
-    });
+    emit_progress(&reporter, "All tasks completed", 1.0);
 
     Ok(())
 }
@@ -1517,13 +1569,10 @@ async fn download_to_file(
     url: &str,
     path: &Path,
     progress: f64,
-    sink: &StreamSink<ProgressUpdate>,
+    reporter: &ProgressReporter,
     label: &str,
 ) -> Result<()> {
-    let _ = sink.add(ProgressUpdate {
-        message: label.to_string(),
-        progress,
-    });
+    emit_progress(reporter, label, progress);
     let response = client.get(url).send().await?.error_for_status()?;
     let bytes = response.bytes().await?;
     fs::write(path, &bytes)
@@ -1816,7 +1865,7 @@ async fn download_and_merge(
     output_file: &str,
     temp_dir: &Path,
     multi_progress: &MultiProgress,
-    sink: StreamSink<ProgressUpdate>,
+    reporter: ProgressReporter,
     request_context: RequestContext,
 ) -> Result<()> {
     if !temp_dir.exists() {
@@ -1889,7 +1938,7 @@ async fn download_and_merge(
             let key = key.clone();
             let pb = download_pb.clone();
             let completed = completed.clone();
-            let sink = sink.clone();
+            let reporter = reporter.clone();
             let temp_dir = temp_dir.clone();
 
             tokio::spawn(async move {
@@ -1926,10 +1975,11 @@ async fn download_and_merge(
                             *count += 1;
                             pb.set_position(*count);
                             pb.set_message(format!("Downloading segments [{}/{}]", *count, total));
-                            let _ = sink.add(ProgressUpdate {
-                                message: format!("Downloading segments [{}/{}]", *count, total),
-                                progress: (*count as f64) / (total as f64) * 0.9,
-                            });
+                            emit_progress(
+                                &reporter,
+                                format!("Downloading segments [{}/{}]", *count, total),
+                                (*count as f64) / (total as f64) * 0.9,
+                            );
 
                             return Ok::<(), anyhow::Error>(());
                         }
@@ -2046,7 +2096,7 @@ async fn convert_to_mp4(
     audio_bitrate: u32,
     multi_progress: &MultiProgress,
     backend: TranscoderKind,
-    sink: StreamSink<ProgressUpdate>,
+    reporter: ProgressReporter,
 ) -> Result<()> {
     let convert_pb = multi_progress.add(ProgressBar::new_spinner());
     convert_pb.set_style(
@@ -2056,10 +2106,7 @@ async fn convert_to_mp4(
     convert_pb.set_message("Converting to MP4...");
     convert_pb.enable_steady_tick(Duration::from_millis(120));
 
-    let _ = sink.add(ProgressUpdate {
-        message: "Converting to MP4...".to_string(),
-        progress: 0.95,
-    });
+    emit_progress(&reporter, "Converting to MP4...", 0.95);
 
     match backend {
         TranscoderKind::Ffmpeg(accel) => {

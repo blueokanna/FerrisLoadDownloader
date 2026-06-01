@@ -59,7 +59,7 @@ flutter_rust_bridge_codegen generate
 Android (recommended per-ABI for the Rust core):
 
 ```bash
-flutter build apk --release --target-platform=android-arm64
+flutter build apk --release --split-per-abi
 ```
 
 Other platforms:
@@ -70,6 +70,18 @@ flutter build macos --release
 flutter build linux --release
 flutter build ios --release
 ```
+
+## Release outputs
+
+The GitHub Actions workflow in `.github/workflows/release.yml` produces:
+
+- Android split APKs for `arm64-v8a`, `armeabi-v7a`, and `x86_64`
+- Windows `x64` portable ZIP
+- macOS `x64` ZIP and macOS `arm64` ZIP
+- Linux `x64` portable tarball
+- Multi-arch Docker API image on GHCR for `linux/amd64`, `linux/arm64`, and `linux/arm/v7`
+
+If the workflow is started from a tag like `v1.2.0`, it also creates a GitHub Release and attaches the desktop/mobile artifacts automatically.
 
 ## Usage
 
@@ -82,6 +94,44 @@ flutter build ios --release
 5. When finished, the saved file path is shown and added to **History**.
 
 For sites that require login or human verification, open the authorization browser, complete it yourself, and import the session; FerrisLoad reuses that authorized context for analysis and download.
+
+## Docker API
+
+The API container runs the real Rust downloader, not a simulated progress loop. It can accept either:
+
+- a direct `.m3u8` or media URL in `url`
+- a page URL in `url` and it will inspect the page and pick the best detected candidate automatically
+- an explicit `media_url` (and optional `audio_url`) if your caller already knows the exact streams
+
+Run locally:
+
+```bash
+docker build -f Dockerfile.api -t ferrisload-api .
+docker run --rm -p 3000:3000 -e DOWNLOAD_DIR=/app/downloads -v $(pwd)/downloads:/app/downloads ferrisload-api
+```
+
+Example request:
+
+```bash
+curl -X POST http://localhost:3000/download \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "https://example.com/video/master.m3u8",
+    "output_filename": "demo.mp4",
+    "concurrency": 8,
+    "retries": 3,
+    "video_bitrate": 0,
+    "audio_bitrate": 0,
+    "keep_temp": false
+  }'
+```
+
+The API exposes:
+
+- `GET /health`
+- `POST /download`
+- `GET /status/:task_id`
+- `GET /tasks`
 
 ## How M3U8 download works
 
@@ -96,6 +146,7 @@ For sites that require login or human verification, open the authorization brows
 ```bash
 flutter analyze lib
 cargo check --manifest-path rust/Cargo.toml
+cargo check --manifest-path rust/Cargo.toml --bin m3u8_api_server
 ```
 
 ## Responsible use

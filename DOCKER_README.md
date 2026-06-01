@@ -1,6 +1,6 @@
 # M3U8下载器 Docker部署指南
 
-本项目提供了完整的Docker容器化支持，可以将Flutter + Rust的M3U8 HLS视频下载器部署为桌面应用或REST API服务。
+本项目提供了 Docker 化支持，主要面向可实际使用的 REST API 服务，同时保留 Linux GUI 镜像构建入口。推荐在容器中使用 API 版本，因为它不依赖宿主机图形栈，并且现在已经接入真实的 Rust 下载核心。
 
 ## 功能特性
 
@@ -11,8 +11,8 @@
 
 ## 文件说明
 
-- `Dockerfile` - Linux桌面应用Docker镜像构建文件
-- `Dockerfile.api` - REST API服务Docker镜像构建文件
+- `Dockerfile` - Linux桌面应用镜像构建文件（需要 X11 / GUI 环境）
+- `Dockerfile.api` - REST API 服务镜像构建文件（推荐）
 - `docker-compose.yml` - Docker Compose多服务编排配置
 - `.dockerignore` - Docker构建时忽略的文件列表
 - `docker-build.sh` / `docker-build.bat` - 跨平台构建脚本
@@ -30,7 +30,7 @@
 docker-build.bat
 ```
 
-**构建API服务版本:**
+**构建 API 服务版本:**
 ```bash
 # Linux/macOS
 ./docker-build.sh api
@@ -93,7 +93,7 @@ docker run -it --rm \
 - 需要安装X11服务器（如VcXsrv或MobaXterm）
 - 设置DISPLAY环境变量指向X服务器
 
-### 2. REST API服务
+### 2. REST API 服务
 
 适合集成到其他系统或提供web服务。
 
@@ -107,7 +107,34 @@ docker run -p 3000:3000 \
 **API端点:**
 - `POST /download` - 开始下载任务
 - `GET /status/:task_id` - 查询下载状态
+- `GET /tasks` - 列出任务
 - `GET /health` - 健康检查
+
+**下载请求体示例:**
+```json
+{
+  "url": "https://example.com/master.m3u8",
+  "output_filename": "demo.mp4",
+  "concurrency": 8,
+  "retries": 3,
+  "video_bitrate": 0,
+  "audio_bitrate": 0,
+  "keep_temp": false,
+  "request_context": {
+    "user_agent": "Mozilla/5.0",
+    "referer": "https://example.com/",
+    "origin": "https://example.com",
+    "cookie": "session=...",
+    "headers": {
+      "Authorization": "Bearer ..."
+    }
+  }
+}
+```
+
+说明：
+- 只传 `url` 时，服务会先自动分析并挑选最佳候选媒体。
+- 如果调用方已经知道精确流地址，可以直接传 `media_url`，并按需传 `audio_url`。
 
 ## Docker镜像说明
 
@@ -121,12 +148,12 @@ docker run -p 3000:3000 \
 - **运行时依赖**: GTK3, FFmpeg, X11库
 - **存储**: 自动挂载downloads目录
 
-### API服务镜像
+### API 服务镜像
 - **基础镜像**: Ubuntu 22.04
 - **构建过程**:
-  1. 安装Rust环境
-  2. 生成桥接代码
-  3. 编译Rust API服务器二进制文件
+  1. 安装 Rust 构建环境
+  2. 编译真实的 `m3u8_api_server`
+  3. 将二进制复制到轻量运行时镜像
 - **运行时依赖**: FFmpeg, SSL证书
 - **端口**: 3000 (可配置)
 - **健康检查**: 内置健康检查端点
@@ -137,8 +164,22 @@ docker run -p 3000:3000 \
 |--------|--------|------|
 | `FFMPEG_PATH` | `/usr/bin/ffmpeg` | FFmpeg可执行文件路径 |
 | `DOWNLOAD_DIR` | `/app/downloads` | 下载文件存储目录 |
-| `API_PORT` | `3000` | API服务端口（仅API版本） |
+| `API_PORT` | `3000` | API 服务端口（仅 API 版本） |
+| `API_HOST` | `0.0.0.0` | API 绑定地址 |
 | `RUST_LOG` | `info` | 日志级别 |
+
+## GitHub Actions 与 GHCR
+
+Release 工作流会构建并推送多架构 API 镜像到 GHCR：
+
+- `linux/amd64`
+- `linux/arm64`
+- `linux/arm/v7`
+
+推送 tag（例如 `v1.2.0`）时，镜像标签会包含：
+
+- `ghcr.io/<owner>/m3u8-downloader-api:v1.2.0`
+- `ghcr.io/<owner>/m3u8-downloader-api:latest`
 
 ## 硬件加速支持
 

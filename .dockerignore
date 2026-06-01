@@ -6,7 +6,6 @@ pubspec.lock
 
 # Rust构建文件
 rust/target/
-rust/Cargo.lock
 
 # IDE文件
 .vscode/
