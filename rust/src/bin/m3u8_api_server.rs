@@ -132,7 +132,7 @@ async fn run_download_task(
         let mut task_store = tasks.lock().await;
         if let Some(task) = task_store.get_mut(&task_id) {
             task.status = "running".to_string();
-            task.progress = Some("开始下载...".to_string());
+            task.progress = Some(format!("开始处理: {}", req.url));
         }
     }
 
@@ -141,7 +141,11 @@ async fn run_download_task(
     for i in 1..=10 {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-        let progress = format!("下载进度: {}%", i * 10);
+        let target = req
+            .output_filename
+            .as_deref()
+            .unwrap_or("output.mp4");
+        let progress = format!("{} 下载进度: {}%", target, i * 10);
         {
             let mut task_store = tasks.lock().await;
             if let Some(task) = task_store.get_mut(&task_id) {

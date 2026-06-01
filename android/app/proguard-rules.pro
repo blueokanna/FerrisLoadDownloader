@@ -6,6 +6,7 @@
 # Keep the transcode method specifically
 -keepclassmembers class com.bluevale.m3u8_downloader.MediaTranscoder {
     public static boolean transcode(java.lang.String, java.lang.String, int, int);
+    public static boolean mux(java.lang.String, java.lang.String, java.lang.String);
 }
 
 # Keep MainActivity (loads native Rust library)

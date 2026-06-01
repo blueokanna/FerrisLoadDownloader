@@ -2,6 +2,7 @@ package com.bluevale.m3u8_downloader
 
 import android.annotation.SuppressLint
 import android.media.*
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.io.IOException
@@ -65,9 +66,118 @@ object MediaTranscoder {
         }
     }
 
+    @JvmStatic
+    fun mux(videoPath: String?, audioPath: String?, outputPath: String?): Boolean {
+        if (videoPath == null || audioPath == null || outputPath == null) {
+            Log.e(TAG, "mux: input or output is null")
+            return false
+        }
+        val videoFile = File(videoPath)
+        val audioFile = File(audioPath)
+        if (!videoFile.exists() || videoFile.length() == 0L) {
+            Log.e(TAG, "mux: invalid video file $videoPath")
+            return false
+        }
+        if (!audioFile.exists() || audioFile.length() == 0L) {
+            Log.e(TAG, "mux: invalid audio file $audioPath")
+            return false
+        }
+
+        var muxer: MediaMuxer? = null
+        try {
+            val videoTrack = findTrack(videoPath, true)
+            val audioTrack = findTrack(audioPath, false)
+            if (videoTrack.index < 0 || audioTrack.index < 0) {
+                Log.e(TAG, "mux: missing video or audio track")
+                return false
+            }
+            if (!isMp4MuxableVideo(videoTrack.mime) || !isMp4MuxableAudio(audioTrack.mime)) {
+                Log.e(TAG, "mux: unsupported mime video=${videoTrack.mime} audio=${audioTrack.mime}")
+                return false
+            }
+
+            muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val muxVideoIndex = muxer.addTrack(videoTrack.format)
+            val muxAudioIndex = muxer.addTrack(audioTrack.format)
+            muxer.start()
+            val videoSamples = writeTrackSamples(videoPath, videoTrack.index, muxVideoIndex, muxer)
+            val audioSamples = writeTrackSamples(audioPath, audioTrack.index, muxAudioIndex, muxer)
+            muxer.stop()
+            val ok = videoSamples > 0 && audioSamples > 0 && verifyOutput(outputPath)
+            if (!ok) File(outputPath).delete()
+            Log.i(TAG, "mux done video=$videoSamples audio=$audioSamples ok=$ok")
+            return ok
+        } catch (e: Exception) {
+            Log.e(TAG, "mux exception: ${e.message}", e)
+            runCatching { File(outputPath).delete() }
+            return false
+        } finally {
+            runCatching { muxer?.release() }
+        }
+    }
+
     private fun verifyOutput(path: String): Boolean {
         val f = File(path)
         return f.exists() && f.length() > 1024 // 至少 1KB 才算有效
+    }
+
+    private data class TrackInfo(val index: Int, val format: MediaFormat, val mime: String)
+
+    private fun findTrack(path: String, video: Boolean): TrackInfo {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(path)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                if ((video && mime.startsWith("video/")) || (!video && mime.startsWith("audio/"))) {
+                    return TrackInfo(i, format, mime)
+                }
+            }
+            return TrackInfo(-1, MediaFormat(), "")
+        } finally {
+            extractor.release()
+        }
+    }
+
+    private fun isMp4MuxableVideo(mime: String): Boolean =
+        mime == "video/avc" || mime == "video/hevc" || mime == "video/mp4v-es" || mime == "video/av01"
+
+    private fun isMp4MuxableAudio(mime: String): Boolean =
+        mime == "audio/mp4a-latm" || mime == "audio/aac"
+
+    private fun writeTrackSamples(
+        path: String,
+        sourceIndex: Int,
+        destinationIndex: Int,
+        muxer: MediaMuxer
+    ): Int {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(path)
+            extractor.selectTrack(sourceIndex)
+            val buffer = ByteBuffer.allocateDirect(1024 * 1024)
+            val info = MediaCodec.BufferInfo()
+            var firstPts = -1L
+            var samples = 0
+            while (true) {
+                val size = extractor.readSampleData(buffer, 0)
+                if (size < 0) break
+                info.offset = 0
+                info.size = size
+                info.presentationTimeUs = extractor.sampleTime
+                info.flags = extractor.sampleFlags
+                if (firstPts < 0) firstPts = info.presentationTimeUs
+                if (firstPts > 0) info.presentationTimeUs -= firstPts
+                if (info.presentationTimeUs < 0) info.presentationTimeUs = 0
+                muxer.writeSampleData(destinationIndex, buffer, info)
+                samples++
+                extractor.advance()
+            }
+            return samples
+        } finally {
+            extractor.release()
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -197,13 +307,27 @@ object MediaTranscoder {
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
-            encoder = MediaCodec.createEncoderByType("video/avc")
+            val encoderInfo = selectCodec("video/avc", encoder = true)
+            encoder = if (encoderInfo != null) {
+                Log.i(TAG, "Using encoder ${encoderInfo.name}")
+                MediaCodec.createByCodecName(encoderInfo.name)
+            } else {
+                Log.w(TAG, "No preferred hardware AVC encoder found, using system default")
+                MediaCodec.createEncoderByType("video/avc")
+            }
             encoder.configure(encFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surface = encoder.createInputSurface()
             encoder.start()
 
             // ── 解码器 ──
-            decoder = MediaCodec.createDecoderByType(vMime)
+            val decoderInfo = selectCodec(vMime, encoder = false)
+            decoder = if (decoderInfo != null) {
+                Log.i(TAG, "Using decoder ${decoderInfo.name}")
+                MediaCodec.createByCodecName(decoderInfo.name)
+            } else {
+                Log.w(TAG, "No preferred hardware decoder found for $vMime, using system default")
+                MediaCodec.createDecoderByType(vMime)
+            }
             decoder.configure(vFmt, surface, null, 0)
             decoder.start()
 
@@ -357,6 +481,45 @@ object MediaTranscoder {
         } finally {
             ext.release()
         }
+    }
+
+    private fun selectCodec(mime: String, encoder: Boolean): MediaCodecInfo? {
+        val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            .filter { codec ->
+                codec.isEncoder == encoder &&
+                    codec.supportedTypes.any { it.equals(mime, ignoreCase = true) }
+            }
+            .sortedByDescending { scoreCodec(it) }
+        val selected = codecs.firstOrNull()
+        if (selected != null) {
+            Log.i(TAG, "Selected ${if (encoder) "encoder" else "decoder"} ${selected.name} for $mime")
+        }
+        return selected
+    }
+
+    private fun scoreCodec(codec: MediaCodecInfo): Int {
+        val name = codec.name.lowercase()
+        var score = 0
+        if (!isSoftwareCodec(codec)) score += 100
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && codec.isHardwareAccelerated) score += 60
+        if (name.contains("qcom") || name.contains("qti")) score += 40
+        if (name.contains("mtk") || name.contains("mediatek")) score += 38
+        if (name.contains("hisi") || name.contains("kirin") || name.contains("huawei")) score += 36
+        if (name.contains("exynos") || name.contains("sec")) score += 34
+        if (name.startsWith("c2.") || name.startsWith("omx.")) score += 10
+        if (name.contains("google") || name.contains("android") || name.contains("sw")) score -= 80
+        return score
+    }
+
+    private fun isSoftwareCodec(codec: MediaCodecInfo): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return codec.isSoftwareOnly
+        val name = codec.name.lowercase()
+        return name.contains("google") ||
+            name.contains("android") ||
+            name.contains("ffmpeg") ||
+            name.contains("sw") ||
+            name.startsWith("c2.android") ||
+            name.startsWith("omx.google")
     }
 
     private fun MediaFormat.safeInt(key: String, default: Int): Int =

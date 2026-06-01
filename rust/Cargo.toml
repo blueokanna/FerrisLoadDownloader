@@ -14,7 +14,7 @@ anyhow = "1.0.100"
 block-modes = { version = "0.8.1" }
 clap = { version = "4.5.48", features = ["derive"] }
 
-flutter_rust_bridge = "=2.11.1"
+flutter_rust_bridge = "=2.12.0"
 futures = "0.3.31"
 
 hex = "0.4.3"
@@ -23,6 +23,7 @@ jni = "0.21.1"
 log = "0.4.28"
 
 m3u8-rs = "6.0.0"
+regex = "1.12.2"
 
 reqwest = { version = "0.12.24", features = ["json", "stream", "gzip", "brotli", "deflate", "rustls-tls-webpki-roots"], default-features = false }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "fs", "process"] }

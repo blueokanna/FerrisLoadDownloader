@@ -27,10 +27,8 @@ subprojects {
 }
 
 subprojects {
-    if (name.contains("file_picker")) {
-        tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
-            incremental = false
-        }
+    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+        incremental = false
     }
 }
 

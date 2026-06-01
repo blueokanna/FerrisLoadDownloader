@@ -9,7 +9,10 @@ use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use m3u8_rs::{parse_playlist, Playlist};
+use regex::Regex;
 use reqwest::{header, Client};
+use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(target_os = "android")]
@@ -46,6 +49,54 @@ enum TranscoderKind {
 pub struct ProgressUpdate {
     pub message: String,
     pub progress: f64,
+}
+
+#[derive(Clone, Default)]
+pub struct RequestContext {
+    pub user_agent: String,
+    pub referer: String,
+    pub origin: String,
+    pub cookie: String,
+    pub headers: Vec<HeaderEntry>,
+}
+
+#[derive(Clone)]
+pub struct HeaderEntry {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone)]
+pub struct MediaCandidate {
+    pub id: String,
+    pub title: String,
+    pub extractor: String,
+    pub page_url: String,
+    pub media_url: String,
+    pub audio_url: Option<String>,
+    pub container: String,
+    pub protocol: String,
+    pub mime_type: String,
+    pub quality_label: String,
+    pub width: i32,
+    pub height: i32,
+    pub requires_ffmpeg: bool,
+    pub score: i32,
+    pub segment_count: i32,
+    pub duration_seconds: f64,
+    pub primary: bool,
+    pub reason: String,
+}
+
+#[derive(Clone)]
+pub struct MediaInspectionResult {
+    pub page_url: String,
+    pub page_title: String,
+    pub extractor: String,
+    pub candidates: Vec<MediaCandidate>,
+    pub warnings: Vec<String>,
+    pub auth_required: bool,
+    pub challenge_reason: String,
 }
 
 #[cfg(target_os = "android")]
@@ -158,6 +209,88 @@ impl AndroidMediaCodecTranscoder {
                 Ok(())
             } else {
                 Err(anyhow!("Java MediaCodec transcode failed"))
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("tokio spawn_blocking failed: {}", e))?
+    }
+
+    pub async fn mux(
+        &self,
+        video_path: &str,
+        audio_path: &str,
+        output_mp4: &str,
+    ) -> Result<()> {
+        let jvm = self.jvm.clone();
+        let video_path = video_path.to_string();
+        let audio_path = audio_path.to_string();
+        let output_mp4 = output_mp4.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let mut env = jvm
+                .attach_current_thread()
+                .map_err(|e| anyhow!("JNI attach thread failed: {}", e))?;
+
+            let class: JClass = if let Some(class_ref) = MEDIA_TRANSCODER_CLASS.get() {
+                unsafe { JClass::from_raw(class_ref.as_obj().as_raw()) }
+            } else {
+                let ctx = get_android_context()
+                    .map_err(|e| anyhow!("Failed to get Android context: {}", e))?;
+                let class_loader = env
+                    .call_method(ctx.app_context.as_obj(), "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+                    .map_err(|e| anyhow!("Failed to get ClassLoader: {:?}", e))?
+                    .l()
+                    .map_err(|e| anyhow!("ClassLoader is not an object: {:?}", e))?;
+                let class_name = env
+                    .new_string("com.bluevale.m3u8_downloader.MediaTranscoder")
+                    .map_err(|e| anyhow!("Failed to create class name string: {:?}", e))?;
+                let loaded_class = env
+                    .call_method(
+                        &class_loader,
+                        "loadClass",
+                        "(Ljava/lang/String;)Ljava/lang/Class;",
+                        &[JValue::Object(&class_name)],
+                    )
+                    .map_err(|e| anyhow!("Failed to load MediaTranscoder class: {:?}", e))?
+                    .l()
+                    .map_err(|e| anyhow!("loadClass did not return a Class: {:?}", e))?;
+                if let Ok(global_ref) = env.new_global_ref(&loaded_class) {
+                    let _ = MEDIA_TRANSCODER_CLASS.set(global_ref);
+                }
+                unsafe { JClass::from_raw(loaded_class.as_raw()) }
+            };
+
+            let video_jstring = env
+                .new_string(&video_path)
+                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
+            let audio_jstring = env
+                .new_string(&audio_path)
+                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
+            let output_jstring = env
+                .new_string(&output_mp4)
+                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
+
+            let result = env
+                .call_static_method(
+                    class,
+                    "mux",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+                    &[
+                        JValue::Object(&video_jstring),
+                        JValue::Object(&audio_jstring),
+                        JValue::Object(&output_jstring),
+                    ],
+                )
+                .map_err(|e| anyhow!("JNI call_static_method mux failed: {}", e))?;
+
+            let success = result
+                .z()
+                .map_err(|e| anyhow!("JNI get boolean return failed: {}", e))?;
+
+            if success {
+                Ok(())
+            } else {
+                Err(anyhow!("Java MediaMuxer merge failed"))
             }
         })
         .await
@@ -423,21 +556,254 @@ pub async fn hls2mp4_run(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
+    let request_context = RequestContext::default();
+    run_hls_pipeline(
+        sink,
+        &url,
+        &request_context,
+        concurrency,
+        &output,
+        retries,
+        video_bitrate,
+        audio_bitrate,
+        keep_temp,
+    )
+    .await
+}
+
+#[flutter_rust_bridge::frb()]
+pub async fn inspect_media_from_url(url: String) -> Result<MediaInspectionResult> {
+    inspect_media_with_context(url, RequestContext::default()).await
+}
+
+#[flutter_rust_bridge::frb()]
+pub async fn inspect_media_with_context(
+    url: String,
+    request_context: RequestContext,
+) -> Result<MediaInspectionResult> {
+    init_runtime_logging();
+
+    if let Some(candidate) = direct_media_candidate(&url, &url) {
+        return Ok(MediaInspectionResult {
+            page_url: url.clone(),
+            page_title: infer_title_from_url(&url),
+            extractor: "direct".to_string(),
+            candidates: vec![candidate],
+            warnings: Vec::new(),
+            auth_required: false,
+            challenge_reason: String::new(),
+        });
+    }
+
+    let page_url = Url::parse(&url).context("Invalid inspection URL")?;
+    let client = create_http_client_for_context(Some(&url), &request_context)?;
+    let response = client
+        .get(page_url.clone())
+        .send()
+        .await?;
+    let status = response.status();
+    let html = response.text().await?;
+    let mut warnings = Vec::new();
+    if let Some(reason) = detect_access_challenge(status.as_u16(), &html) {
+        warnings.push(reason.clone());
+        return Ok(MediaInspectionResult {
+            page_url: url,
+            page_title: extract_page_title(&html).unwrap_or_else(|| "Authorization required".to_string()),
+            extractor: extractor_name_for_host(page_url.domain()),
+            candidates: Vec::new(),
+            warnings,
+            auth_required: true,
+            challenge_reason: reason,
+        });
+    }
+    if !status.is_success() {
+        bail!("Failed to inspect page: HTTP {}", status);
+    }
+    let page_title = extract_page_title(&html).unwrap_or_else(|| infer_title_from_url(&url));
+    let extractor = extractor_name_for_host(page_url.domain());
+    let mut collector = CandidateCollector::new(page_url.as_str(), &page_title, &extractor);
+
+    match page_url.domain() {
+        Some(domain) if domain.contains("youtube.com") || domain.contains("youtu.be") => {
+            extract_youtube_candidates(&page_url, &html, &mut collector, &mut warnings)?;
+        }
+        Some(domain) if domain.contains("bilibili.com") || domain.contains("b23.tv") => {
+            extract_bilibili_candidates(&page_url, &html, &mut collector, &mut warnings)?;
+        }
+        _ => {}
+    }
+
+    extract_generic_candidates(&page_url, &html, &mut collector)?;
+    let candidates = score_candidates(collector.finish(), &request_context).await;
+
+    if candidates.is_empty() {
+        warnings.push("No downloadable media candidates were found in the current page source".to_string());
+    }
+
+    Ok(MediaInspectionResult {
+        page_url: url,
+        page_title,
+        extractor,
+        candidates,
+        warnings,
+        auth_required: false,
+        challenge_reason: String::new(),
+    })
+}
+
+#[flutter_rust_bridge::frb()]
+pub async fn download_media_run(
+    sink: StreamSink<ProgressUpdate>,
+    page_url: String,
+    media_url: String,
+    audio_url: Option<String>,
+    output: String,
+    concurrency: i32,
+    retries: i32,
+    video_bitrate: i32,
+    audio_bitrate: i32,
+    keep_temp: bool,
+) -> Result<()> {
+    download_media_with_context(
+        sink,
+        page_url,
+        media_url,
+        audio_url,
+        output,
+        concurrency,
+        retries,
+        video_bitrate,
+        audio_bitrate,
+        keep_temp,
+        RequestContext::default(),
+    )
+    .await
+}
+
+#[flutter_rust_bridge::frb()]
+pub async fn download_media_with_context(
+    sink: StreamSink<ProgressUpdate>,
+    page_url: String,
+    media_url: String,
+    audio_url: Option<String>,
+    output: String,
+    concurrency: i32,
+    retries: i32,
+    video_bitrate: i32,
+    audio_bitrate: i32,
+    keep_temp: bool,
+    request_context: RequestContext,
+) -> Result<()> {
+    init_runtime_logging();
+
+    if is_hls_like(&media_url) {
+        return run_hls_pipeline(
+            sink,
+            &media_url,
+            &request_context,
+            concurrency,
+            &output,
+            retries,
+            video_bitrate,
+            audio_bitrate,
+            keep_temp,
+        )
+        .await;
+    }
+
+    let _ = sink.add(ProgressUpdate {
+        message: "Preparing direct media download...".to_string(),
+        progress: 0.02,
+    });
+
+    let page_url = Url::parse(&page_url).ok();
+    let client = create_http_client_for_context(page_url.as_ref().map(Url::as_str), &request_context)?;
+    let output_path = PathBuf::from(&output);
+    let temp_dir = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    if !temp_dir.exists() {
+        std::fs::create_dir_all(&temp_dir)
+            .with_context(|| format!("Failed to create output directory: {}", temp_dir.display()))?;
+    }
+
+    match audio_url {
+        Some(audio) => {
+            let video_temp = temp_dir.join("stream_video_input.bin");
+            let audio_temp = temp_dir.join("stream_audio_input.bin");
+
+            download_to_file(&client, &media_url, &video_temp, 0.42, &sink, "Downloading video stream")
+                .await?;
+            download_to_file(&client, &audio, &audio_temp, 0.78, &sink, "Downloading audio stream")
+                .await?;
+
+            merge_media_streams(
+                &video_temp,
+                &audio_temp,
+                &output,
+                video_bitrate.max(0) as u32,
+                audio_bitrate.max(0) as u32,
+            )
+            .await?;
+
+            if !keep_temp {
+                let _ = fs::remove_file(video_temp).await;
+                let _ = fs::remove_file(audio_temp).await;
+            }
+        }
+        None => {
+            let extension = container_from_url(&media_url);
+            if extension == "mp4" {
+                download_to_file(&client, &media_url, &output_path, 0.95, &sink, "Downloading media")
+                    .await?;
+            } else {
+                let temp_input = temp_dir.join(format!("direct_input.{}", extension));
+                download_to_file(&client, &media_url, &temp_input, 0.72, &sink, "Downloading media")
+                    .await?;
+                convert_to_mp4(
+                    temp_input.to_string_lossy().as_ref(),
+                    &output,
+                    video_bitrate.max(0) as u32,
+                    audio_bitrate.max(0) as u32,
+                    &MultiProgress::new(),
+                    select_transcoder_backend().await?,
+                    sink.clone(),
+                )
+                .await?;
+                if !keep_temp {
+                    let _ = fs::remove_file(temp_input).await;
+                }
+            }
+        }
+    }
+
+    let _ = sink.add(ProgressUpdate {
+        message: "All tasks completed".to_string(),
+        progress: 1.0,
+    });
+
+    Ok(())
+}
+
+async fn run_hls_pipeline(
+    sink: StreamSink<ProgressUpdate>,
+    url: &str,
+    request_context: &RequestContext,
+    concurrency: i32,
+    output: &str,
+    retries: i32,
+    video_bitrate: i32,
+    audio_bitrate: i32,
+    keep_temp: bool,
+) -> Result<()> {
     let _ = sink.add(ProgressUpdate {
         message: "Initializing...".to_string(),
         progress: 0.0,
     });
 
-    #[cfg(target_os = "android")]
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
-    );
-
-    #[cfg(not(target_os = "android"))]
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .try_init()
-        .ok();
+    init_runtime_logging();
 
     let concurrency = concurrency.max(1) as usize;
     let retries = retries.max(1) as u8;
@@ -482,13 +848,13 @@ pub async fn hls2mp4_run(
         progress: 0.02,
     });
 
-    let m3u8_content = download_playlist(&url).await?;
+    let m3u8_content = download_playlist(url, request_context).await?;
     let (_, playlist) =
         parse_playlist(&m3u8_content).map_err(|e| anyhow!("Failed to parse M3U8: {:?}", e))?;
     download_pb.finish_with_message("Parsed M3U8 playlist");
 
     let base_url = if url.starts_with("http") {
-        let mut parsed_url = Url::parse(&url)?;
+        let mut parsed_url = Url::parse(url)?;
         parsed_url.set_query(None);
         let mut path = parsed_url.path().to_string();
         if let Some(pos) = path.rfind('/') {
@@ -552,7 +918,7 @@ pub async fn hls2mp4_run(
                 bail!("Master playlist missing URL");
             };
 
-            let media_content = download_playlist(media_url.as_str()).await?;
+            let media_content = download_playlist(media_url.as_str(), request_context).await?;
             let (_, media_pl) = parse_playlist(&media_content)
                 .map_err(|e| anyhow!("Failed to parse m3u8: {:?}", e))?;
 
@@ -566,6 +932,7 @@ pub async fn hls2mp4_run(
                     &temp_dir,
                     &multi_progress,
                     sink.clone(),
+                    request_context.clone(),
                 )
                 .await?;
             } else {
@@ -583,6 +950,7 @@ pub async fn hls2mp4_run(
                 &temp_dir,
                 &multi_progress,
                 sink.clone(),
+                request_context.clone(),
             )
             .await?;
         }
@@ -590,7 +958,7 @@ pub async fn hls2mp4_run(
 
     convert_to_mp4(
         &temp_ts_str,
-        &output,
+        output,
         video_bitrate,
         audio_bitrate,
         &multi_progress,
@@ -611,32 +979,798 @@ pub async fn hls2mp4_run(
     Ok(())
 }
 
-async fn download_playlist(url: &str) -> Result<Vec<u8>> {
+fn init_runtime_logging() {
+    #[cfg(target_os = "android")]
+    android_logger::init_once(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
+
+    #[cfg(not(target_os = "android"))]
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .try_init()
+        .ok();
+}
+
+struct CandidateCollector {
+    page_url: String,
+    default_title: String,
+    extractor: String,
+    seen: HashSet<String>,
+    candidates: Vec<MediaCandidate>,
+}
+
+impl CandidateCollector {
+    fn new(page_url: &str, default_title: &str, extractor: &str) -> Self {
+        Self {
+            page_url: page_url.to_string(),
+            default_title: default_title.to_string(),
+            extractor: extractor.to_string(),
+            seen: HashSet::new(),
+            candidates: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        media_url: String,
+        audio_url: Option<String>,
+        title: Option<String>,
+        quality_label: Option<String>,
+        mime_type: Option<String>,
+        width: Option<i32>,
+        height: Option<i32>,
+        extractor: Option<&str>,
+    ) {
+        if media_url.is_empty() {
+            return;
+        }
+        let key = format!("{}|{}", media_url, audio_url.clone().unwrap_or_default());
+        if !self.seen.insert(key) {
+            return;
+        }
+        let protocol = protocol_from_url(&media_url);
+        let container = container_from_url(&media_url);
+        let resolved_title = title.unwrap_or_else(|| self.default_title.clone());
+        self.candidates.push(MediaCandidate {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: resolved_title,
+            extractor: extractor.unwrap_or(&self.extractor).to_string(),
+            page_url: self.page_url.clone(),
+            media_url,
+            audio_url: audio_url.clone(),
+            container,
+            protocol,
+            mime_type: mime_type.unwrap_or_else(|| mime_from_urls(audio_url.is_some()).to_string()),
+            quality_label: quality_label.unwrap_or_else(|| "Auto".to_string()),
+            width: width.unwrap_or(0),
+            height: height.unwrap_or(0),
+            requires_ffmpeg: audio_url.is_some() && !cfg!(target_os = "android"),
+            score: 0,
+            segment_count: 0,
+            duration_seconds: 0.0,
+            primary: false,
+            reason: String::new(),
+        });
+    }
+
+    fn finish(mut self) -> Vec<MediaCandidate> {
+        self.candidates.sort_by(|left, right| {
+            let left_score = (left.height.max(0), left.width.max(0), left.quality_label.clone());
+            let right_score = (right.height.max(0), right.width.max(0), right.quality_label.clone());
+            right_score.cmp(&left_score)
+        });
+        self.candidates
+    }
+}
+
+fn extractor_name_for_host(host: Option<&str>) -> String {
+    match host {
+        Some(domain) if domain.contains("youtube.com") || domain.contains("youtu.be") => "youtube".to_string(),
+        Some(domain) if domain.contains("bilibili.com") || domain.contains("b23.tv") => "bilibili".to_string(),
+        Some(domain) => domain.to_string(),
+        None => "generic".to_string(),
+    }
+}
+
+fn infer_title_from_url(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last().map(str::to_string))
+        })
+        .map(|name| name.replace(['-', '_'], " "))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Untitled download".to_string())
+}
+
+fn direct_media_candidate(page_url: &str, media_url: &str) -> Option<MediaCandidate> {
+    if !is_supported_media_like(media_url) {
+        return None;
+    }
+
+    Some(MediaCandidate {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: infer_title_from_url(media_url),
+        extractor: "direct".to_string(),
+        page_url: page_url.to_string(),
+        media_url: media_url.to_string(),
+        audio_url: None,
+        container: container_from_url(media_url),
+        protocol: protocol_from_url(media_url),
+        mime_type: mime_from_extension(&container_from_url(media_url)).to_string(),
+        quality_label: "Direct".to_string(),
+        width: 0,
+        height: 0,
+        requires_ffmpeg: false,
+        score: 200,
+        segment_count: 0,
+        duration_seconds: 0.0,
+        primary: true,
+        reason: "direct media url".to_string(),
+    })
+}
+
+fn is_supported_media_like(url: &str) -> bool {
+    is_hls_like(url)
+        || url.contains(".mp4")
+        || url.contains(".webm")
+        || url.contains(".mkv")
+        || url.contains(".m4v")
+        || url.contains(".mpd")
+}
+
+fn is_hls_like(url: &str) -> bool {
+    url.contains(".m3u8") || url.contains("application/vnd.apple.mpegurl")
+}
+
+fn protocol_from_url(url: &str) -> String {
+    if url.contains(".mpd") {
+        "dash".to_string()
+    } else if is_hls_like(url) {
+        "hls".to_string()
+    } else {
+        "progressive".to_string()
+    }
+}
+
+fn container_from_url(url: &str) -> String {
+    let without_query = url.split('?').next().unwrap_or(url);
+    Path::new(without_query)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "bin".to_string())
+}
+
+fn mime_from_extension(extension: &str) -> &'static str {
+    match extension {
+        "m3u8" => "application/vnd.apple.mpegurl",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mpd" => "application/dash+xml",
+        "m4a" => "audio/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+fn mime_from_urls(split_streams: bool) -> &'static str {
+    if split_streams {
+        "video/mp4"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn extract_page_title(html: &str) -> Option<String> {
+    let patterns = [
+        r#"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']"#,
+        r#"<meta[^>]+name=[\"']twitter:title[\"'][^>]+content=[\"']([^\"']+)[\"']"#,
+        r#"<title>([^<]+)</title>"#,
+    ];
+
+    for pattern in patterns {
+        let regex = Regex::new(pattern).ok()?;
+        if let Some(caps) = regex.captures(html) {
+            if let Some(value) = caps.get(1) {
+                let cleaned = html_unescape(value.as_str()).trim().to_string();
+                if !cleaned.is_empty() {
+                    return Some(cleaned);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn html_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", '"'.to_string().as_str())
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn normalize_exposed_media_url(page_url: &Url, raw: &str) -> Option<String> {
+    let normalized = html_unescape(raw)
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u003A", ":")
+        .replace("\\u003a", ":")
+        .replace("\\u0026", "&")
+        .replace("\\u0026", "&")
+        .replace("\\/", "/")
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let normalized = if normalized.starts_with("//") {
+        format!("https:{}", normalized)
+    } else {
+        normalized
+    };
+
+    let resolved = page_url
+        .join(&normalized)
+        .map(|url| url.to_string())
+        .or_else(|_| Url::parse(&normalized).map(|url| url.to_string()))
+        .ok()?;
+
+    if is_supported_media_like(&resolved) {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+fn push_generic_candidate(
+    page_url: &Url,
+    raw: &str,
+    quality_label: &str,
+    collector: &mut CandidateCollector,
+) {
+    if let Some(resolved) = normalize_exposed_media_url(page_url, raw) {
+        collector.push(
+            resolved,
+            None,
+            None,
+            Some(quality_label.to_string()),
+            None,
+            None,
+            None,
+            Some("generic"),
+        );
+    }
+}
+
+fn extract_generic_candidates(
+    page_url: &Url,
+    html: &str,
+    collector: &mut CandidateCollector,
+) -> Result<()> {
+    let absolute_url_regex = Regex::new(r#"https?:\\?/\\?/[^\"'<>\s]+?(?:m3u8|mp4|webm|m4v|m4a|mpd)(?:\?[^\"'<>\s]*)?"#)?;
+    let relative_url_regex = Regex::new(r#"(?:src|href|content|data-src|data-url|data-video|data-hls|data-mp4)\s*=\s*[\"']([^\"']+?(?:m3u8|mp4|webm|m4v|m4a|mpd)(?:\?[^\"']*)?)[\"']"#)?;
+    let content_url_regex = Regex::new(r#"\"(?:contentUrl|embedUrl|playbackUrl|streamUrl|videoUrl|video_url|playUrl|play_url|hlsUrl|hls_url|dashUrl|dash_url|mp4Url|mp4_url)\"\s*:\s*\"([^\"]+)\""#)?;
+    let meta_url_regex = Regex::new(r#"<meta[^>]+(?:property|name)=[\"'](?:og:video|og:video:url|og:video:secure_url|twitter:player:stream|twitter:player:stream:content_type)[\"'][^>]+content=[\"']([^\"']+)[\"']"#)?;
+    let source_tag_regex = Regex::new(r#"<source[^>]+src=[\"']([^\"']+?(?:m3u8|mp4|webm|m4v|m4a|mpd)(?:\?[^\"']*)?)[\"']"#)?;
+
+    for capture in absolute_url_regex.captures_iter(html) {
+        if let Some(raw) = capture.get(0) {
+            push_generic_candidate(page_url, raw.as_str(), "Detected", collector);
+        }
+    }
+
+    for capture in relative_url_regex.captures_iter(html) {
+        if let Some(raw) = capture.get(1) {
+            push_generic_candidate(page_url, raw.as_str(), "Detected", collector);
+        }
+    }
+
+    for capture in content_url_regex.captures_iter(html) {
+        if let Some(raw) = capture.get(1) {
+            push_generic_candidate(page_url, raw.as_str(), "Content URL", collector);
+        }
+    }
+
+    for capture in meta_url_regex.captures_iter(html) {
+        if let Some(raw) = capture.get(1) {
+            push_generic_candidate(page_url, raw.as_str(), "Open Graph", collector);
+        }
+    }
+
+    for capture in source_tag_regex.captures_iter(html) {
+        if let Some(raw) = capture.get(1) {
+            push_generic_candidate(page_url, raw.as_str(), "Video Source", collector);
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_bilibili_candidates(
+    page_url: &Url,
+    html: &str,
+    collector: &mut CandidateCollector,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let Some(json) = extract_json_object_after(html, "__playinfo__=") else {
+        warnings.push("Bilibili playinfo JSON was not exposed in the page source".to_string());
+        return Ok(());
+    };
+
+    let value: Value = serde_json::from_str(&json).context("Failed to parse bilibili playinfo JSON")?;
+    let title = extract_page_title(html);
+
+    if let Some(durl_list) = value.pointer("/data/durl").and_then(Value::as_array) {
+        for (index, item) in durl_list.iter().enumerate() {
+            if let Some(media_url) = item.get("url").and_then(Value::as_str) {
+                collector.push(
+                    media_url.to_string(),
+                    None,
+                    title.clone(),
+                    Some(format!("Part {}", index + 1)),
+                    Some("video/mp4".to_string()),
+                    None,
+                    None,
+                    Some("bilibili"),
+                );
+            }
+        }
+    }
+
+    let best_audio = value
+        .pointer("/data/dash/audio")
+        .and_then(Value::as_array)
+        .and_then(|audios| {
+            audios
+                .iter()
+                .filter_map(|audio| {
+                    Some((
+                        audio.get("bandwidth")?.as_i64().unwrap_or_default(),
+                        audio.get("baseUrl")
+                            .or_else(|| audio.get("base_url"))?
+                            .as_str()?
+                            .to_string(),
+                    ))
+                })
+                .max_by_key(|entry| entry.0)
+                .map(|entry| entry.1)
+        });
+
+    if let Some(videos) = value.pointer("/data/dash/video").and_then(Value::as_array) {
+        for video in videos {
+            let Some(media_url) = video
+                .get("baseUrl")
+                .or_else(|| video.get("base_url"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+
+            collector.push(
+                media_url.to_string(),
+                best_audio.clone(),
+                title.clone(),
+                video
+                    .get("height")
+                    .and_then(Value::as_i64)
+                    .map(|height| format!("{}p", height)),
+                video.get("mimeType").and_then(Value::as_str).map(str::to_string),
+                video.get("width").and_then(Value::as_i64).map(|value| value as i32),
+                video.get("height").and_then(Value::as_i64).map(|value| value as i32),
+                Some("bilibili"),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_youtube_candidates(
+    page_url: &Url,
+    html: &str,
+    collector: &mut CandidateCollector,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let json = extract_json_object_after(html, "ytInitialPlayerResponse = ")
+        .or_else(|| extract_json_object_after(html, "var ytInitialPlayerResponse = "));
+
+    let Some(json) = json else {
+        warnings.push("YouTube player JSON was not exposed in the page source".to_string());
+        return Ok(());
+    };
+
+    let value: Value = serde_json::from_str(&json).context("Failed to parse youtube player JSON")?;
+    let title = value
+        .pointer("/videoDetails/title")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| extract_page_title(html))
+        .or_else(|| Some(infer_title_from_url(page_url.as_str())));
+
+    if let Some(manifest) = value
+        .pointer("/streamingData/hlsManifestUrl")
+        .and_then(Value::as_str)
+    {
+        collector.push(
+            manifest.to_string(),
+            None,
+            title.clone(),
+            Some("HLS".to_string()),
+            Some("application/vnd.apple.mpegurl".to_string()),
+            None,
+            None,
+            Some("youtube"),
+        );
+    }
+
+    let best_audio = value
+        .pointer("/streamingData/adaptiveFormats")
+        .and_then(Value::as_array)
+        .and_then(|formats| {
+            formats
+                .iter()
+                .filter(|item| {
+                    item.get("mimeType")
+                        .and_then(Value::as_str)
+                        .map(|mime| mime.starts_with("audio/"))
+                        .unwrap_or(false)
+                })
+                .filter_map(|item| {
+                    Some((
+                        item.get("bitrate")?.as_i64().unwrap_or_default(),
+                        item.get("url")?.as_str()?.to_string(),
+                    ))
+                })
+                .max_by_key(|entry| entry.0)
+                .map(|entry| entry.1)
+        });
+
+    let mut saw_cipher_only = false;
+
+    for path in ["/streamingData/formats", "/streamingData/adaptiveFormats"] {
+        if let Some(formats) = value.pointer(path).and_then(Value::as_array) {
+            for item in formats {
+                let mime_type = item.get("mimeType").and_then(Value::as_str).unwrap_or_default();
+                let Some(media_url) = item.get("url").and_then(Value::as_str) else {
+                    if item.get("signatureCipher").is_some() {
+                        saw_cipher_only = true;
+                    }
+                    continue;
+                };
+                let is_video_only = mime_type.starts_with("video/") && path.ends_with("adaptiveFormats");
+                collector.push(
+                    media_url.to_string(),
+                    if is_video_only { best_audio.clone() } else { None },
+                    title.clone(),
+                    item.get("qualityLabel").and_then(Value::as_str).map(str::to_string),
+                    Some(mime_type.to_string()),
+                    item.get("width").and_then(Value::as_i64).map(|value| value as i32),
+                    item.get("height").and_then(Value::as_i64).map(|value| value as i32),
+                    Some("youtube"),
+                );
+            }
+        }
+    }
+
+    if saw_cipher_only {
+        warnings.push("Some YouTube streams require signature resolution and were intentionally skipped".to_string());
+    }
+
+    Ok(())
+}
+
+fn extract_json_object_after(haystack: &str, marker: &str) -> Option<String> {
+    let start = haystack.find(marker)? + marker.len();
+    let remainder = &haystack[start..];
+    let json_start = remainder.find('{')?;
+    let bytes = remainder.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end_index = None;
+
+    for (offset, byte) in bytes.iter().enumerate().skip(json_start) {
+        let ch = *byte as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end_index = Some(offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    end_index.map(|end| remainder[json_start..end].to_string())
+}
+
+async fn download_to_file(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    progress: f64,
+    sink: &StreamSink<ProgressUpdate>,
+    label: &str,
+) -> Result<()> {
+    let _ = sink.add(ProgressUpdate {
+        message: label.to_string(),
+        progress,
+    });
+    let response = client.get(url).send().await?.error_for_status()?;
+    let bytes = response.bytes().await?;
+    fs::write(path, &bytes)
+        .await
+        .with_context(|| format!("Failed to write downloaded media: {}", path.display()))?;
+    Ok(())
+}
+
+async fn merge_media_streams(
+    video_path: &Path,
+    audio_path: &Path,
+    output_path: &str,
+    video_bitrate: u32,
+    audio_bitrate: u32,
+) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        if video_bitrate == 0 && audio_bitrate == 0 {
+            if let Some(transcoder) = ANDROID_HW_TRANSCODER.get() {
+                match transcoder
+                    .mux(
+                        video_path.to_string_lossy().as_ref(),
+                        audio_path.to_string_lossy().as_ref(),
+                        output_path,
+                    )
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(e) => warn!("Android MediaMuxer merge failed, falling back if possible: {}", e),
+                }
+            }
+        }
+    }
+
+    if !check_ffmpeg().await {
+        bail!("FFmpeg is required to merge separated audio and video streams");
+    }
+
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        video_path.to_string_lossy().to_string(),
+        "-i".to_string(),
+        audio_path.to_string_lossy().to_string(),
+    ];
+
+    if video_bitrate == 0 && audio_bitrate == 0 {
+        args.extend(["-c".to_string(), "copy".to_string()]);
+    } else {
+        args.extend([
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-c:a".to_string(),
+            "aac".to_string(),
+        ]);
+        if video_bitrate > 0 {
+            args.push("-b:v".to_string());
+            args.push(format!("{}k", video_bitrate));
+        }
+        if audio_bitrate > 0 {
+            args.push("-b:a".to_string());
+            args.push(format!("{}k", audio_bitrate));
+        }
+    }
+
+    args.push(output_path.to_string());
+
+    let output = Command::new("ffmpeg")
+        .args(&args)
+        .output()
+        .await
+        .context("FFmpeg merge failed")?;
+
+    if !output.status.success() {
+        bail!("FFmpeg merge failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(())
+}
+
+fn detect_access_challenge(status: u16, body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    if status == 401 || status == 403 {
+        return Some("The server requires authorization. Import cookies or headers from an account that is allowed to access this resource.".to_string());
+    }
+    if status == 429 {
+        return Some("The server is rate limiting this client. Wait and retry with normal authorized traffic; this app will not bypass rate limits.".to_string());
+    }
+    if status == 503 && (lower.contains("cloudflare") || lower.contains("checking your browser")) {
+        return Some("A browser verification page was detected. Complete verification in a browser, then import the resulting authorized cookies if you are allowed to access the content.".to_string());
+    }
+    if lower.contains("cf-chl-")
+        || lower.contains("turnstile")
+        || lower.contains("g-recaptcha")
+        || lower.contains("hcaptcha")
+        || lower.contains("captcha")
+        || lower.contains("checking if the site connection is secure")
+    {
+        return Some("A human verification challenge was detected. Complete it in a browser and import the authorized session cookies; automated bypass is not supported.".to_string());
+    }
+    None
+}
+
+async fn score_candidates(
+    mut candidates: Vec<MediaCandidate>,
+    request_context: &RequestContext,
+) -> Vec<MediaCandidate> {
+    for candidate in &mut candidates {
+        let mut score = 0;
+        let mut reasons = Vec::new();
+        let lower_url = candidate.media_url.to_ascii_lowercase();
+        let lower_quality = candidate.quality_label.to_ascii_lowercase();
+
+        if candidate.protocol == "hls" {
+            score += 300;
+            reasons.push("hls".to_string());
+            if let Ok((segments, duration)) = inspect_hls_metadata(&candidate.media_url, request_context).await {
+                candidate.segment_count = segments as i32;
+                candidate.duration_seconds = duration;
+                score += (duration.min(7200.0) / 6.0) as i32;
+                score += (segments.min(2000) / 4) as i32;
+                if duration >= 60.0 {
+                    reasons.push(format!("{:.0}s", duration));
+                }
+            }
+        }
+
+        if candidate.protocol == "progressive" {
+            score += 120;
+            reasons.push("direct".to_string());
+        }
+        if candidate.audio_url.is_some() {
+            score += 80;
+            reasons.push("audio+video".to_string());
+        }
+        if candidate.height > 0 {
+            score += candidate.height.min(2160) / 3;
+            reasons.push(format!("{}p", candidate.height));
+        }
+        if candidate.width > 0 {
+            score += candidate.width.min(3840) / 24;
+        }
+        if lower_quality.contains("1080") || lower_quality.contains("720") || lower_quality.contains("高") {
+            score += 120;
+        }
+        for marker in ["preview", "试看", "trial", "sample", "ad", "ads", "promo", "trailer", "thumb", "sprite", "teaser"] {
+            if lower_url.contains(marker) || lower_quality.contains(marker) {
+                score -= 500;
+                reasons.push(format!("deprioritized:{}", marker));
+            }
+        }
+        if lower_url.contains("master") || lower_url.contains("index") || lower_url.contains("playlist") {
+            score += 40;
+        }
+        candidate.score = score;
+        candidate.reason = if reasons.is_empty() { "ranked by available metadata".to_string() } else { reasons.join(", ") };
+    }
+
+    candidates.sort_by(|left, right| {
+        let left_score = (left.score, left.height.max(0), left.duration_seconds as i64, left.segment_count);
+        let right_score = (right.score, right.height.max(0), right.duration_seconds as i64, right.segment_count);
+        right_score.cmp(&left_score)
+    });
+    if let Some(first) = candidates.first_mut() {
+        first.primary = true;
+    }
+    candidates
+}
+
+fn retry_backoff_delay(attempt: u8, status: Option<u16>) -> Duration {
+    let base_ms = match status {
+        Some(429) => 3500,
+        Some(503) => 2800,
+        Some(403) => 2200,
+        _ => 1200,
+    };
+    let exponent = u32::from(attempt.saturating_sub(1).min(4));
+    Duration::from_millis(base_ms * (1u64 << exponent))
+}
+
+async fn inspect_hls_metadata(url: &str, request_context: &RequestContext) -> Result<(usize, f64)> {
+    let bytes = download_playlist(url, request_context).await?;
+    let (_, playlist) = parse_playlist(&bytes).map_err(|e| anyhow!("Failed to parse HLS metadata: {:?}", e))?;
+    match playlist {
+        Playlist::MediaPlaylist(media) => {
+            let duration = media.segments.iter().map(|segment| segment.duration as f64).sum();
+            Ok((media.segments.len(), duration))
+        }
+        Playlist::MasterPlaylist(master) => Ok((master.variants.len(), 0.0)),
+    }
+}
+
+fn create_http_client_for_context(source_url: Option<&str>, request_context: &RequestContext) -> Result<Client> {
     let mut headers = header::HeaderMap::new();
+    let user_agent = if request_context.user_agent.trim().is_empty() {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    } else {
+        request_context.user_agent.trim()
+    };
     headers.insert(
         header::USER_AGENT,
-        header::HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        ),
+        header::HeaderValue::from_str(user_agent)?,
     );
     headers.insert(header::ACCEPT, header::HeaderValue::from_static("*/*"));
     headers.insert(
         header::ACCEPT_LANGUAGE,
-        header::HeaderValue::from_static("en-US,en;q=0.9"),
+        header::HeaderValue::from_static("en-US,en;q=0.9,zh-CN;q=0.8"),
     );
 
-    if let Ok(parsed_url) = Url::parse(url) {
-        if let Some(domain) = parsed_url.domain() {
-            let referer = format!("https://{}/", domain);
-            headers.insert(header::REFERER, header::HeaderValue::from_str(&referer)?);
+    if let Some(source_url) = source_url {
+        if let Ok(parsed_url) = Url::parse(source_url) {
+            if let Some(domain) = parsed_url.domain() {
+                let default_referer = format!("https://{}/", domain);
+                let default_origin = format!("https://{}", domain);
+                let referer = if request_context.referer.trim().is_empty() { default_referer.as_str() } else { request_context.referer.trim() };
+                let origin = if request_context.origin.trim().is_empty() { default_origin.as_str() } else { request_context.origin.trim() };
+                headers.insert(header::REFERER, header::HeaderValue::from_str(referer)?);
+                headers.insert(header::ORIGIN, header::HeaderValue::from_str(origin)?);
+            }
         }
     }
 
-    let client = Client::builder()
-        .default_headers(headers)
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    if !request_context.cookie.trim().is_empty() {
+        headers.insert(header::COOKIE, header::HeaderValue::from_str(request_context.cookie.trim())?);
+    }
 
+    for entry in &request_context.headers {
+        let name = entry.name.trim();
+        let value = entry.value.trim();
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        let header_name = header::HeaderName::from_bytes(name.as_bytes())?;
+        headers.insert(header_name, header::HeaderValue::from_str(value)?);
+    }
+
+    Ok(Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(45))
+        .build()?)
+}
+
+async fn download_playlist(url: &str, request_context: &RequestContext) -> Result<Vec<u8>> {
+    let client = create_http_client_for_context(Some(url), request_context)?;
     let response = client.get(url).send().await?;
     if !response.status().is_success() {
         bail!("Failed to download playlist: HTTP {}", response.status());
@@ -683,8 +1817,8 @@ async fn download_and_merge(
     temp_dir: &Path,
     multi_progress: &MultiProgress,
     sink: StreamSink<ProgressUpdate>,
+    request_context: RequestContext,
 ) -> Result<()> {
-    // 纭繚涓存椂鐩綍瀛樺湪涓斿彲鍐�
     if !temp_dir.exists() {
         std::fs::create_dir_all(temp_dir)
             .with_context(|| format!("Failed to create temp dir: {}", temp_dir.display()))?;
@@ -705,7 +1839,6 @@ async fn download_and_merge(
     );
     download_pb.set_message("Downloading segments");
 
-    // 澶勭悊 AES-128 鍔犲瘑
     let key: Option<(Vec<u8>, Vec<u8>)> = {
         if let Some(first_seg) = segments.first() {
             if let Some(ref key_def) = first_seg.key {
@@ -718,7 +1851,7 @@ async fn download_and_merge(
                 } else {
                     Url::parse(&key_uri)?
                 };
-                let client = create_http_client()?;
+                let client = create_http_client_for_context(Some(key_url.as_str()), &request_context)?;
                 let resp = client.get(key_url).send().await?.error_for_status()?;
                 let key_bytes = resp.bytes().await?.to_vec();
 
@@ -738,10 +1871,9 @@ async fn download_and_merge(
     };
 
     let sem = Arc::new(Semaphore::new(concurrency));
-    let client = Arc::new(create_http_client()?);
+    let client = Arc::new(create_http_client_for_context(base_url.as_ref().map(Url::as_str), &request_context)?);
     let completed = Arc::new(Mutex::new(0u64));
 
-    // 鉁� 鍏抽敭淇锛氫紶閫� temp_dir 鍒板紓姝ヤ换鍔�
     let temp_dir = temp_dir.to_path_buf();
 
     let tasks = stream::iter(segments.into_iter().enumerate())
@@ -758,7 +1890,7 @@ async fn download_and_merge(
             let pb = download_pb.clone();
             let completed = completed.clone();
             let sink = sink.clone();
-            let temp_dir = temp_dir.clone(); // 鉁� 鍏嬮殕鍒颁换鍔�
+            let temp_dir = temp_dir.clone();
 
             tokio::spawn(async move {
                 let _permit = sem
@@ -780,7 +1912,6 @@ async fn download_and_merge(
                                 data.to_vec()
                             };
 
-                            // 鉁� 鍏抽敭淇锛氬垎鐗囧啓鍏� temp_dir 涓�
                             let file_name = format!("seg_{:05}.ts", idx);
                             let tmp_path = temp_dir.join(file_name);
                             fs::write(&tmp_path, &buf).await.with_context(|| {
@@ -811,16 +1942,20 @@ async fn download_and_merge(
                                 seg_url,
                                 r.status()
                             );
+                            if attempt < retries {
+                                let delay = retry_backoff_delay(attempt, Some(r.status().as_u16()));
+                                tokio::time::sleep(delay).await;
+                            }
                         }
 
                         Err(e) => {
                             pb.set_message(format!("Retrying... ({}/{})", attempt, retries));
                             warn!("Attempt {} request error: {} - {}", attempt, seg_url, e);
+                            if attempt < retries {
+                                let delay = retry_backoff_delay(attempt, None);
+                                tokio::time::sleep(delay).await;
+                            }
                         }
-                    }
-
-                    if attempt < retries {
-                        tokio::time::sleep(Duration::from_millis(2000)).await;
                     }
                 }
 
@@ -1009,7 +2144,6 @@ async fn convert_to_mp4(
             convert_pb.finish_with_message("MP4 transcode complete");
             info!("Output file: {}", output_path);
 
-            // Verify output file
             let out_meta = std::fs::metadata(output_path)
                 .context("Transcode output file not found after FFmpeg")?;
             if out_meta.len() < 1024 {
@@ -1031,7 +2165,6 @@ async fn convert_to_mp4(
             convert_pb.finish_with_message("Android hardware transcode complete");
             info!("Output file: {}", output_path);
 
-            // Verify output file
             let out_meta = std::fs::metadata(output_path)
                 .context("Transcode output file not found after Android hardware transcode")?;
             if out_meta.len() < 1024 {
@@ -1053,7 +2186,7 @@ async fn android_hardware_transcode(
     #[cfg(target_os = "android")]
     {
         let transcoder = ANDROID_HW_TRANSCODER.get().ok_or_else(|| {
-            error!("鉂� CRITICAL: Android MediaCodec transcoder not registered!");
+            error!("   CRITICAL: Android MediaCodec transcoder not registered!");
             error!("   This means JNI_OnLoad was not executed by Android runtime.");
             error!("   Possible causes:");
             error!("   1. Your Rust library (.so) was not loaded as a JNI library");
@@ -1085,10 +2218,10 @@ pub fn init_app() {
     {
         match init_android_transcoder_check() {
             Ok(msg) => {
-                info!("鉁� {}", msg);
+                info!("   ℹ️ {}", msg);
             }
             Err(e) => {
-                warn!("鈿狅笍 Transcoder check result: {}", e);
+                warn!("Transcoder check result: {}", e);
             }
         }
     }
@@ -1120,17 +2253,17 @@ pub extern "C" fn JNI_OnLoad(
     let jvm = match unsafe { jni::JavaVM::from_raw(vm) } {
         Ok(vm) => Arc::new(vm),
         Err(e) => {
-            eprintln!("鉂� JNI_OnLoad: Failed to create JavaVM: {:?}", e);
+            eprintln!("Failed to create JavaVM in JNI_OnLoad: {:?}", e);
             return jni::sys::JNI_VERSION_1_6 as i32;
         }
     };
 
     match register_android_mediacodec_transcoder(jvm.clone()) {
         Ok(_) => {
-            info!("鉁� Android MediaCodec transcoder registered successfully in JNI_OnLoad");
+            info!("Android MediaCodec transcoder registered successfully in JNI_OnLoad");
         }
         Err(e) => {
-            error!("鉂� Failed to register transcoder in JNI_OnLoad: {}", e);
+            error!("Failed to register transcoder in JNI_OnLoad: {}", e);
         }
     }
 
