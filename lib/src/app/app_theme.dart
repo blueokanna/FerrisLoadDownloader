@@ -9,6 +9,9 @@ class AppThemeProfile {
     required this.accent,
     required this.canvasLight,
     required this.canvasDark,
+    this.schemeVariant = DynamicSchemeVariant.tonalSpot,
+    this.supportsDynamicColor = false,
+    this.useAmoledSurface = false,
   });
 
   final String id;
@@ -18,9 +21,46 @@ class AppThemeProfile {
   final Color accent;
   final Color canvasLight;
   final Color canvasDark;
+  final DynamicSchemeVariant schemeVariant;
+  final bool supportsDynamicColor;
+  final bool useAmoledSurface;
 }
 
 const appThemeProfiles = <AppThemeProfile>[
+  AppThemeProfile(
+    id: 'monet_flow',
+    name: 'Monet Flow',
+    description: 'Material You dynamic color with layered tonal surfaces',
+    seed: Color(0xFF5C8DFF),
+    accent: Color(0xFFB6C7FF),
+    canvasLight: Color(0xFFF5F6FB),
+    canvasDark: Color(0xFF10131A),
+    schemeVariant: DynamicSchemeVariant.tonalSpot,
+    supportsDynamicColor: true,
+  ),
+  AppThemeProfile(
+    id: 'amoled_monet',
+    name: 'Amoled Monet',
+    description: 'Dynamic color with true-black OLED surfaces',
+    seed: Color(0xFF7C91FF),
+    accent: Color(0xFFC8D1FF),
+    canvasLight: Color(0xFFF4F6FC),
+    canvasDark: Color(0xFF000000),
+    schemeVariant: DynamicSchemeVariant.content,
+    supportsDynamicColor: true,
+    useAmoledSurface: true,
+  ),
+  AppThemeProfile(
+    id: 'amoled_pantone',
+    name: 'Amoled Pantone',
+    description: 'Pantone-led accents over true-black AMOLED framing',
+    seed: Color(0xFF0F766E),
+    accent: Color(0xFFF59E7A),
+    canvasLight: Color(0xFFF8F4EF),
+    canvasDark: Color(0xFF000000),
+    schemeVariant: DynamicSchemeVariant.fidelity,
+    useAmoledSurface: true,
+  ),
   AppThemeProfile(
     id: 'cloud_dancer',
     name: 'Cloud Dancer',
@@ -29,6 +69,7 @@ const appThemeProfiles = <AppThemeProfile>[
     accent: Color(0xFF7FA8B2),
     canvasLight: Color(0xFFF4F1EB),
     canvasDark: Color(0xFF14191C),
+    schemeVariant: DynamicSchemeVariant.neutral,
   ),
   AppThemeProfile(
     id: 'sea_glass',
@@ -38,6 +79,7 @@ const appThemeProfiles = <AppThemeProfile>[
     accent: Color(0xFFB7E0D8),
     canvasLight: Color(0xFFEAF5F2),
     canvasDark: Color(0xFF101818),
+    schemeVariant: DynamicSchemeVariant.vibrant,
   ),
   AppThemeProfile(
     id: 'oxide',
@@ -47,6 +89,7 @@ const appThemeProfiles = <AppThemeProfile>[
     accent: Color(0xFFF0B8A9),
     canvasLight: Color(0xFFF9ECE7),
     canvasDark: Color(0xFF1C1414),
+    schemeVariant: DynamicSchemeVariant.expressive,
   ),
   AppThemeProfile(
     id: 'forest_signal',
@@ -56,27 +99,80 @@ const appThemeProfiles = <AppThemeProfile>[
     accent: Color(0xFFB8DDC1),
     canvasLight: Color(0xFFEEF5F0),
     canvasDark: Color(0xFF101614),
+    schemeVariant: DynamicSchemeVariant.content,
   ),
 ];
 
-ThemeData buildAppTheme(AppThemeProfile profile, Brightness brightness) {
-  final scheme = ColorScheme.fromSeed(
+ThemeData buildAppTheme(
+  AppThemeProfile profile,
+  Brightness brightness, {
+  ColorScheme? dynamicScheme,
+}) {
+  final isDark = brightness == Brightness.dark;
+  final generatedScheme = ColorScheme.fromSeed(
     seedColor: profile.seed,
     brightness: brightness,
-    dynamicSchemeVariant: DynamicSchemeVariant.fidelity,
+    dynamicSchemeVariant: profile.schemeVariant,
   );
-  final canvas = brightness == Brightness.light
-      ? profile.canvasLight
-      : profile.canvasDark;
+  final baseScheme = profile.supportsDynamicColor && dynamicScheme != null
+      ? dynamicScheme
+      : generatedScheme;
+  final canvas = profile.useAmoledSurface && isDark
+      ? const Color(0xFF000000)
+      : isDark
+          ? profile.canvasDark
+          : profile.canvasLight;
+  final surface =
+      profile.useAmoledSurface && isDark ? const Color(0xFF000000) : canvas;
+  final surfaceLow = profile.useAmoledSurface && isDark
+      ? const Color(0xFF050505)
+      : Color.alphaBlend(
+          baseScheme.primary.withValues(alpha: isDark ? 0.08 : 0.04),
+          canvas,
+        );
+  final surfaceContainer = profile.useAmoledSurface && isDark
+      ? const Color(0xFF0A0A0A)
+      : Color.alphaBlend(
+          baseScheme.primary.withValues(alpha: isDark ? 0.14 : 0.07),
+          canvas,
+        );
+  final surfaceHigh = profile.useAmoledSurface && isDark
+      ? const Color(0xFF121212)
+      : Color.alphaBlend(
+          profile.accent.withValues(alpha: isDark ? 0.18 : 0.1),
+          canvas,
+        );
+  final surfaceHighest = profile.useAmoledSurface && isDark
+      ? const Color(0xFF191919)
+      : Color.alphaBlend(
+          baseScheme.secondary.withValues(alpha: isDark ? 0.2 : 0.12),
+          canvas,
+        );
+  final elevatedSurface = Color.alphaBlend(
+    baseScheme.primary.withValues(alpha: isDark ? 0.18 : 0.06),
+    surfaceHigh,
+  );
+  final scheme = baseScheme.copyWith(
+    surface: surface,
+    surfaceDim: surfaceLow,
+    surfaceBright: surfaceHigh,
+    surfaceContainerLowest: surface,
+    surfaceContainerLow: surfaceLow,
+    surfaceContainer: surfaceContainer,
+    surfaceContainerHigh: surfaceHigh,
+    surfaceContainerHighest: surfaceHighest,
+  );
 
   return ThemeData(
     useMaterial3: true,
-    colorScheme: scheme.copyWith(surface: canvas),
+    brightness: brightness,
+    colorScheme: scheme,
     scaffoldBackgroundColor: canvas,
     canvasColor: canvas,
     appBarTheme: AppBarTheme(
       backgroundColor: canvas,
       foregroundColor: scheme.onSurface,
+      surfaceTintColor: Colors.transparent,
       scrolledUnderElevation: 0,
       elevation: 0,
       centerTitle: false,
@@ -102,7 +198,9 @@ ThemeData buildAppTheme(AppThemeProfile profile, Brightness brightness) {
       ),
     ),
     cardTheme: CardThemeData(
-      color: scheme.surface.withValues(alpha: brightness == Brightness.light ? 0.86 : 0.9),
+      color: scheme.surface
+          .withValues(alpha: brightness == Brightness.light ? 0.86 : 0.9),
+      surfaceTintColor: Colors.transparent,
       margin: EdgeInsets.zero,
       elevation: 0,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(26)),
@@ -110,6 +208,7 @@ ThemeData buildAppTheme(AppThemeProfile profile, Brightness brightness) {
     filledButtonTheme: FilledButtonThemeData(
       style: FilledButton.styleFrom(
         minimumSize: const Size.fromHeight(54),
+        animationDuration: const Duration(milliseconds: 220),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
         textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
       ),
@@ -117,7 +216,15 @@ ThemeData buildAppTheme(AppThemeProfile profile, Brightness brightness) {
     outlinedButtonTheme: OutlinedButtonThemeData(
       style: OutlinedButton.styleFrom(
         minimumSize: const Size.fromHeight(52),
+        animationDuration: const Duration(milliseconds: 220),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      ),
+    ),
+    iconButtonTheme: IconButtonThemeData(
+      style: IconButton.styleFrom(
+        backgroundColor: scheme.surfaceContainerHigh.withValues(alpha: 0.42),
+        foregroundColor: scheme.onSurface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       ),
     ),
     segmentedButtonTheme: SegmentedButtonThemeData(
@@ -127,6 +234,49 @@ ThemeData buildAppTheme(AppThemeProfile profile, Brightness brightness) {
         ),
       ),
     ),
+    switchTheme: SwitchThemeData(
+      trackOutlineColor: WidgetStatePropertyAll(scheme.outlineVariant),
+      thumbIcon: WidgetStateProperty.resolveWith((states) {
+        if (states.contains(WidgetState.selected)) {
+          return const Icon(Icons.check_rounded, size: 14);
+        }
+        return const Icon(Icons.circle, size: 12);
+      }),
+    ),
+    snackBarTheme: SnackBarThemeData(
+      behavior: SnackBarBehavior.floating,
+      backgroundColor: scheme.surfaceContainerHigh,
+      contentTextStyle: TextStyle(color: scheme.onSurface),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+    ),
+    bottomSheetTheme: BottomSheetThemeData(
+      backgroundColor: scheme.surface,
+      modalBackgroundColor: scheme.surface,
+      surfaceTintColor: Colors.transparent,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+    ),
+    dialogTheme: DialogThemeData(
+      backgroundColor: scheme.surface,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+    ),
+    navigationBarTheme: NavigationBarThemeData(
+      backgroundColor: scheme.surface,
+      indicatorColor: scheme.primaryContainer,
+      labelTextStyle: WidgetStatePropertyAll(
+        TextStyle(
+          color: scheme.onSurface,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    ),
+    progressIndicatorTheme: ProgressIndicatorThemeData(
+      color: scheme.primary,
+      linearTrackColor: scheme.surfaceContainerHighest,
+      circularTrackColor: scheme.surfaceContainerHighest,
+    ),
     chipTheme: ChipThemeData(
       backgroundColor: scheme.surfaceContainerHigh,
       selectedColor: scheme.primaryContainer,
@@ -134,12 +284,25 @@ ThemeData buildAppTheme(AppThemeProfile profile, Brightness brightness) {
       side: BorderSide.none,
       labelStyle: TextStyle(color: scheme.onSurface),
     ),
+    listTileTheme: ListTileThemeData(
+      iconColor: scheme.onSurfaceVariant,
+      tileColor: elevatedSurface.withValues(
+          alpha: brightness == Brightness.dark ? 0.7 : 0.56),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+    ),
+    textSelectionTheme: TextSelectionThemeData(
+      cursorColor: scheme.primary,
+      selectionColor: scheme.primary.withValues(alpha: 0.24),
+      selectionHandleColor: scheme.primary,
+    ),
     pageTransitionsTheme: const PageTransitionsTheme(
       builders: {
         TargetPlatform.android: PredictiveBackPageTransitionsBuilder(),
         TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
       },
     ),
-    dividerTheme: DividerThemeData(color: scheme.outlineVariant.withValues(alpha: 0.35)),
+    splashFactory: InkRipple.splashFactory,
+    dividerTheme:
+        DividerThemeData(color: scheme.outlineVariant.withValues(alpha: 0.35)),
   );
 }

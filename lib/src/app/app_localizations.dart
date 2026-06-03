@@ -34,10 +34,51 @@ class AppLocalizations {
 
   static const delegate = _AppLocalizationsDelegate();
 
+  static const _rtlLanguages = <String>{'ar', 'fa', 'ur', 'ug', 'ku'};
+
   static AppLocalizations of(BuildContext context) {
     final value = Localizations.of<AppLocalizations>(context, AppLocalizations);
     assert(value != null, 'AppLocalizations not found in context');
     return value!;
+  }
+
+  static String localeKeyOf(Locale locale) {
+    return locale.scriptCode == null
+        ? locale.languageCode
+        : '${locale.languageCode}_${locale.scriptCode}';
+  }
+
+  static Locale resolveLocale(Locale? locale) {
+    if (locale == null) {
+      return supportedLocales.firstWhere(
+        (item) => item.languageCode == _fallbackLocale,
+        orElse: () => supportedLocales.first,
+      );
+    }
+
+    final exactKey = localeKeyOf(locale);
+    for (final item in supportedLocales) {
+      if (localeKeyOf(item) == exactKey) {
+        return item;
+      }
+    }
+
+    for (final item in supportedLocales) {
+      if (item.languageCode == locale.languageCode) {
+        return item;
+      }
+    }
+
+    return supportedLocales.firstWhere(
+      (item) => item.languageCode == _fallbackLocale,
+      orElse: () => supportedLocales.first,
+    );
+  }
+
+  static TextDirection textDirectionOf(Locale locale) {
+    return _rtlLanguages.contains(resolveLocale(locale).languageCode)
+        ? TextDirection.rtl
+        : TextDirection.ltr;
   }
 
   static const localeLabels = <String, String>{
@@ -92,6 +133,9 @@ class AppLocalizations {
       'keep_temp_hint': 'Useful for diagnostics and manual remuxing',
       'analysis_results': 'Detected media',
       'status': 'Status',
+      'active_downloads': 'Active downloads',
+      'running_downloads': 'Running',
+      'no_active_downloads': 'No active downloads yet.',
       'history': 'History',
       'warnings': 'Warnings',
       'appearance': 'Appearance',
@@ -147,12 +191,37 @@ class AppLocalizations {
           'Authorization challenge detected. Opening auth browser...',
       'clear_auth_context': 'Clear imported session',
       'preparing': 'Preparing download...',
+      'current_selection': 'Current selection',
+      'candidate_switched': 'Selection updated',
+      'recovery_started': 'Recovery in progress',
+      'status_phase_inspect': 'Inspect',
+      'status_phase_acquire': 'Acquire',
+      'status_phase_assemble': 'Assemble',
+      'status_phase_deliver': 'Deliver',
+      'status_stage_idle': 'Standing by',
+      'status_stage_inspecting': 'Inspecting source',
+      'status_stage_ready': 'Candidate ready',
+      'status_stage_auth': 'Authorizing session',
+      'status_stage_preparing': 'Preparing transfer',
+      'status_stage_backend': 'Selecting backend',
+      'status_stage_playlist': 'Resolving playlist',
+      'status_stage_transfer': 'Downloading media',
+      'status_stage_segments': 'Fetching segments',
+      'status_stage_merge': 'Merging streams',
+      'status_stage_transcode': 'Transcoding output',
+      'status_stage_exporting': 'Exporting file',
+      'status_stage_completed': 'Completed',
+      'status_stage_failed': 'Needs attention',
       'output_not_created':
           'The download finished but no output file was produced. Check the source URL, request context, or try again.',
       'export_failed':
           'Failed to export the file to the selected location. Temporary output:',
       'download_hint':
           'You can download directly without analyzing: paste an m3u8 or direct media link and start.',
+      'retry': 'Retry',
+      'retry_analyze': 'Retry analysis',
+      'retry_download': 'Retry download',
+      'separate_audio': 'Separate audio',
     },
     'zh': {
       'app_title': 'FerrisLoad',
@@ -175,6 +244,9 @@ class AppLocalizations {
       'keep_temp_hint': '便于诊断与手动封装',
       'analysis_results': '识别到的媒体',
       'status': '状态',
+      'active_downloads': '正在下载',
+      'running_downloads': '运行中',
+      'no_active_downloads': '当前没有正在下载的任务。',
       'history': '历史记录',
       'warnings': '提示',
       'appearance': '外观',
@@ -224,9 +296,34 @@ class AppLocalizations {
       'auth_redirecting': '检测到授权挑战，正在打开授权浏览器…',
       'clear_auth_context': '清空已导入会话',
       'preparing': '正在准备下载…',
+      'current_selection': '当前选择',
+      'candidate_switched': '候选已切换',
+      'recovery_started': '正在从上一次失败中恢复',
+      'status_phase_inspect': '分析',
+      'status_phase_acquire': '获取',
+      'status_phase_assemble': '组装',
+      'status_phase_deliver': '落盘',
+      'status_stage_idle': '等待操作',
+      'status_stage_inspecting': '正在分析来源',
+      'status_stage_ready': '候选已就绪',
+      'status_stage_auth': '正在恢复授权会话',
+      'status_stage_preparing': '正在准备传输',
+      'status_stage_backend': '正在选择后端',
+      'status_stage_playlist': '正在解析播放列表',
+      'status_stage_transfer': '正在下载媒体',
+      'status_stage_segments': '正在抓取分片',
+      'status_stage_merge': '正在合并流',
+      'status_stage_transcode': '正在转码输出',
+      'status_stage_exporting': '正在导出文件',
+      'status_stage_completed': '已完成',
+      'status_stage_failed': '需要处理',
       'output_not_created': '下载已结束，但没有生成输出文件。请检查资源地址、请求上下文，或重试。',
       'export_failed': '无法将文件导出到所选位置。临时输出：',
       'download_hint': '无需分析即可直接下载：粘贴 m3u8 或直链地址后直接开始。',
+      'retry': '重试',
+      'retry_analyze': '重新分析',
+      'retry_download': '重新下载',
+      'separate_audio': '独立音轨',
     },
     'zh_Hant': {
       'app_title': 'FerrisLoad',
@@ -300,16 +397,16 @@ class AppLocalizations {
     },
     'ja': {
       'app_title': 'FerrisLoad',
-      'app_subtitle': 'ページを解析し、再生可能なメディアを見つけて、公開された最適なストリームを取得します。',
+      'app_subtitle': 'ページを解析し、再生可能なメディアを見つけて、公開されている最適なストリームをダウンロードします。',
       'input_source': 'ソース URL',
-      'source_hint': 'Web ページ、m3u8、mp4、YouTube、Bilibili のリンクを貼り付け',
+      'source_hint': 'Web ページ、m3u8、mp4、YouTube、Bilibili のリンクを貼り付けます',
       'file_name': '出力ファイル',
       'save_location': '保存先',
       'default_location': '既定の保存先',
       'choose_directory': 'フォルダーを選択',
       'reset_default': '既定に戻す',
-      'analyze': '解析',
-      'download': '選択したストリームを保存',
+      'analyze': 'ソースを解析',
+      'download': '選択したストリームをダウンロード',
       'download_options': 'ダウンロード設定',
       'concurrency': '並列数',
       'retries': '再試行',
@@ -338,34 +435,69 @@ class AppLocalizations {
       'completed': '完了',
       'output_path': '保存済みファイル',
       'analyzing': '解析中…',
-      'ready': '候補を選択可能',
+      'ready': '候補の準備ができました',
       'inspector': 'インスペクター',
       'stream': 'ストリーム',
+      'authorization': '認証済みリクエスト設定',
+      'authorization_hint':
+          '自分が所有または利用権限を持つサイト向けの Cookie、User-Agent、Referer、Origin、カスタムヘッダー',
+      'cookie_hint': 'name=value; another=value',
+      'headers_hint':
+          'Authorization: Bearer ...\nX-Requested-With: XMLHttpRequest',
+      'core': '主要',
+      'score': '評価',
+      'segments': 'セグメント',
+      'auth_browser_open': '認証ブラウザーを開く',
+      'auth_browser_title': '認証済みセッションブラウザー',
+      'auth_browser_hint':
+          'ここで対象サイトを開き、自分でログインや本人確認を完了したあと、現在のセッションを FerrisLoad に取り込みます。',
+      'auth_browser_hint_inline':
+          'サイト側でログイン、Cookie による再生権限、または人による確認が必要な場合は、認証ブラウザーを使ってください。',
+      'auth_browser_address': 'ブラウザーのアドレス',
+      'auth_browser_go': '開く',
+      'auth_browser_import': '現在のセッションを取り込む',
+      'auth_browser_no_session':
+          '現在のページには再利用できる Cookie またはブラウザーセッションが見つかりませんでした。',
+      'auth_session_imported':
+          '認証済みセッションを取り込みました。更新されたリクエスト設定で、もう一度解析またはダウンロードできます。',
+      'auth_challenge_detected': 'アクセス制限を検出しました',
+      'auth_challenge_help':
+          'FerrisLoad は、自分で認証を完了したあとのセッションを再利用できますが、Cloudflare、CAPTCHA、アクセス制限、DRM、署名検証、試聴制限を回避することはありません。',
+      'auth_auto_open': '制限検出時に認証ブラウザーを自動で開く',
+      'auth_auto_open_hint':
+          '解析やダウンロードでログイン、レート制限、Cloudflare、人による確認が求められた場合、FerrisLoad が認証ブラウザーを自動で開きます。',
+      'auth_redirecting': '認証が必要な状態を検出しました。認証ブラウザーを開いています…',
+      'clear_auth_context': '取り込んだセッションを消去',
+      'preparing': 'ダウンロードを準備しています…',
+      'output_not_created':
+          'ダウンロードは終了しましたが、出力ファイルは作成されませんでした。ソース URL やリクエスト設定を確認してから、もう一度お試しください。',
+      'export_failed': '選択した保存先へ書き出せませんでした。一時出力:',
+      'download_hint': '解析しなくても直接ダウンロードできます。m3u8 や直接のメディア URL を貼り付けて開始してください。',
     },
     'ar': {
       'app_title': 'FerrisLoad',
       'app_subtitle':
-          'حلّل الصفحة وحدد الوسائط القابلة للتشغيل ونزّل أفضل تدفق ظاهر في الصفحة.',
+          'حلّل الصفحة، واعثر على الوسائط القابلة للتشغيل، ثم نزّل أفضل تدفّق مكشوف فيها.',
       'input_source': 'رابط المصدر',
       'source_hint': 'ألصق رابط صفحة أو m3u8 أو mp4 أو YouTube أو Bilibili',
       'file_name': 'ملف الإخراج',
       'save_location': 'مكان الحفظ',
-      'default_location': 'الموقع الافتراضي',
+      'default_location': 'الموقع الافتراضي للحفظ',
       'choose_directory': 'اختر المجلد',
       'reset_default': 'استخدم الافتراضي',
-      'analyze': 'تحليل',
-      'download': 'تنزيل التدفق المحدد',
+      'analyze': 'حلّل المصدر',
+      'download': 'نزّل التدفّق المحدد',
       'download_options': 'خيارات التنزيل',
       'concurrency': 'التوازي',
-      'retries': 'إعادات المحاولة',
-      'video_bitrate': 'معدل فيديو',
-      'audio_bitrate': 'معدل صوت',
+      'retries': 'إعادة المحاولة',
+      'video_bitrate': 'معدل بت الفيديو',
+      'audio_bitrate': 'معدل بت الصوت',
       'keep_temp': 'الاحتفاظ بالملفات المؤقتة',
-      'keep_temp_hint': 'مفيد للتشخيص والدمج اليدوي',
+      'keep_temp_hint': 'يفيد في التشخيص والدمج اليدوي',
       'analysis_results': 'الوسائط المكتشفة',
       'status': 'الحالة',
       'history': 'السجل',
-      'warnings': 'تنبيهات',
+      'warnings': 'تحذيرات',
       'appearance': 'المظهر',
       'mode': 'الوضع',
       'system': 'النظام',
@@ -378,15 +510,220 @@ class AppLocalizations {
           'تعطيل القيود يساعد على استمرار التنزيلات الطويلة في الخلفية',
       'disable_now': 'عطّل الآن',
       'no_candidates': 'لم يتم العثور على وسائط قابلة للتنزيل بعد.',
-      'select_candidate': 'اختر مرشح وسائط قبل التنزيل.',
+      'select_candidate': 'اختر وسيطًا مرشحًا قبل التنزيل.',
       'source_page': 'صفحة المصدر',
-      'extractor': 'المستخرج',
+      'extractor': 'أداة الاستخراج',
       'completed': 'اكتمل',
       'output_path': 'الملف المحفوظ',
-      'analyzing': 'جارٍ التحليل...',
-      'ready': 'المرشح جاهز',
-      'inspector': 'المحلل',
-      'stream': 'تدفق',
+      'analyzing': 'جارٍ تحليل المصدر…',
+      'ready': 'أصبح المرشح جاهزًا',
+      'inspector': 'الفاحص',
+      'stream': 'التدفّق',
+      'authorization': 'إعدادات الطلب المصرّح بها',
+      'authorization_hint':
+          'للمواقع التي تملك حق الوصول إليها أو تستخدمها بإذن: Cookie وUser-Agent وReferer وOrigin والرؤوس المخصصة',
+      'cookie_hint': 'name=value; another=value',
+      'headers_hint':
+          'Authorization: Bearer ...\nX-Requested-With: XMLHttpRequest',
+      'core': 'أساسي',
+      'score': 'التقييم',
+      'segments': 'مقاطع',
+      'auth_browser_open': 'افتح متصفح التفويض',
+      'auth_browser_title': 'متصفح الجلسة المصرّح بها',
+      'auth_browser_hint':
+          'افتح الموقع المستهدف هنا، وأكمل تسجيل الدخول أو التحقق البشري بنفسك، ثم استورد الجلسة الحالية مرة أخرى إلى FerrisLoad.',
+      'auth_browser_hint_inline':
+          'استخدم متصفح التفويض عندما يتطلب الموقع تسجيل الدخول، أو صلاحية تشغيل مرتبطة بملفات تعريف الارتباط، أو صفحة تحقق بشري.',
+      'auth_browser_address': 'عنوان المتصفح',
+      'auth_browser_go': 'انتقل',
+      'auth_browser_import': 'استورد الجلسة الحالية',
+      'auth_browser_no_session':
+          'لم يتم العثور على ملفات تعريف ارتباط قابلة لإعادة الاستخدام أو جلسة متصفح قابلة للاستيراد في الصفحة الحالية.',
+      'auth_session_imported':
+          'تم استيراد الجلسة المصرّح بها. يمكنك الآن إعادة التحليل أو التنزيل باستخدام سياق الطلب المحدّث.',
+      'auth_challenge_detected': 'تم اكتشاف تحدي وصول',
+      'auth_challenge_help':
+          'يمكن لـ FerrisLoad إعادة استخدام جلسة أكملتها بنفسك، لكنه لا يتجاوز Cloudflare أو CAPTCHA أو الحظر أو DRM أو التواقيع أو قيود المعاينة.',
+      'auth_auto_open': 'افتح متصفح التفويض تلقائيًا عند اكتشاف تحدٍ',
+      'auth_auto_open_hint':
+          'عندما يواجه التحليل أو التنزيل تسجيل دخول أو تقييد معدل أو Cloudflare أو تحققًا بشريًا، يفتح FerrisLoad متصفح التفويض تلقائيًا.',
+      'auth_redirecting':
+          'تم اكتشاف حاجة إلى جلسة مصرح بها. جارٍ فتح متصفح التفويض…',
+      'clear_auth_context': 'امسح الجلسة المستوردة',
+      'preparing': 'جارٍ تجهيز التنزيل…',
+      'output_not_created':
+          'انتهى التنزيل، لكن لم يتم إنشاء ملف الإخراج. تحقّق من رابط المصدر أو سياق الطلب أو أعد المحاولة.',
+      'export_failed': 'تعذّر تصدير الملف إلى الموقع المحدد. المخرج المؤقت:',
+      'download_hint':
+          'يمكنك التنزيل مباشرة من دون تحليل: ألصق رابط m3u8 أو رابط الوسائط المباشر ثم ابدأ.',
+    },
+    'fa': {
+      'app_title': 'FerrisLoad',
+      'app_subtitle':
+          'صفحه را بررسی کنید، رسانه قابل پخش را پیدا کنید و بهترین جریان در دسترس را دانلود کنید.',
+      'input_source': 'نشانی منبع',
+      'source_hint':
+          'پیوند صفحه وب، m3u8، mp4، YouTube یا Bilibili را وارد کنید',
+      'file_name': 'نام فایل خروجی',
+      'save_location': 'محل ذخیره',
+      'default_location': 'محل پیش‌فرض ذخیره',
+      'choose_directory': 'انتخاب پوشه',
+      'reset_default': 'استفاده از پیش‌فرض',
+      'analyze': 'تحلیل منبع',
+      'download': 'دانلود جریان انتخاب‌شده',
+      'download_options': 'تنظیمات دانلود',
+      'concurrency': 'همزمانی',
+      'retries': 'تلاش مجدد',
+      'video_bitrate': 'بیت‌ریت ویدیو',
+      'audio_bitrate': 'بیت‌ریت صدا',
+      'keep_temp': 'نگه‌داشتن فایل‌های موقت',
+      'keep_temp_hint': 'برای عیب‌یابی و ترکیب دستی مفید است',
+      'analysis_results': 'رسانه‌های شناسایی‌شده',
+      'status': 'وضعیت',
+      'history': 'تاریخچه',
+      'warnings': 'هشدارها',
+      'appearance': 'ظاهر',
+      'mode': 'حالت',
+      'system': 'سیستم',
+      'light': 'روشن',
+      'dark': 'تیره',
+      'theme': 'پوسته',
+      'language': 'زبان',
+      'battery': 'بهینه‌سازی باتری',
+      'battery_hint':
+          'غیرفعال کردن محدودیت‌ها کمک می‌کند دانلودهای طولانی در پس‌زمینه قطع نشوند',
+      'disable_now': 'اکنون غیرفعال کن',
+      'no_candidates': 'هنوز رسانه‌ای برای دانلود شناسایی نشده است.',
+      'select_candidate': 'پیش از دانلود، یک گزینه رسانه را انتخاب کنید.',
+      'source_page': 'صفحه منبع',
+      'extractor': 'استخراج‌کننده',
+      'completed': 'تکمیل شد',
+      'output_path': 'فایل ذخیره‌شده',
+      'analyzing': 'در حال تحلیل منبع…',
+      'ready': 'گزینه آماده است',
+      'inspector': 'بررسی‌گر',
+      'stream': 'جریان',
+      'authorization': 'تنظیمات درخواست مجاز',
+      'authorization_hint':
+          'برای سایت‌هایی که مالک آن هستید یا مجوز استفاده از آن‌ها را دارید: Cookie، User-Agent، Referer، Origin و سرصفحه‌های سفارشی',
+      'cookie_hint': 'name=value; another=value',
+      'headers_hint':
+          'Authorization: Bearer ...\nX-Requested-With: XMLHttpRequest',
+      'core': 'اصلی',
+      'score': 'امتیاز',
+      'segments': 'بخش',
+      'auth_browser_open': 'باز کردن مرورگر احراز هویت',
+      'auth_browser_title': 'مرورگر نشست مجاز',
+      'auth_browser_hint':
+          'سایت هدف را اینجا باز کنید، ورود یا تأیید انسانی را خودتان انجام دهید، سپس نشست فعلی را دوباره به FerrisLoad وارد کنید.',
+      'auth_browser_hint_inline':
+          'وقتی سایت به ورود، مجوز پخش وابسته به Cookie یا صفحه تأیید انسانی نیاز دارد، از مرورگر احراز هویت استفاده کنید.',
+      'auth_browser_address': 'نشانی مرورگر',
+      'auth_browser_go': 'برو',
+      'auth_browser_import': 'وارد کردن نشست فعلی',
+      'auth_browser_no_session':
+          'در صفحه فعلی هیچ Cookie قابل استفاده مجدد یا نشست مرورگر قابل واردکردنی پیدا نشد.',
+      'auth_session_imported':
+          'نشست مجاز وارد شد. اکنون می‌توانید با زمینه درخواست به‌روزشده دوباره تحلیل یا دانلود کنید.',
+      'auth_challenge_detected': 'چالش دسترسی شناسایی شد',
+      'auth_challenge_help':
+          'FerrisLoad می‌تواند از نشستی که خودتان تکمیل کرده‌اید دوباره استفاده کند، اما Cloudflare، CAPTCHA، مسدودسازی، DRM، امضاها یا محدودیت پیش‌نمایش را دور نمی‌زند.',
+      'auth_auto_open':
+          'در صورت تشخیص چالش، مرورگر احراز هویت را خودکار باز کن',
+      'auth_auto_open_hint':
+          'اگر هنگام تحلیل یا دانلود با ورود، محدودیت نرخ، Cloudflare یا تأیید انسانی روبه‌رو شوید، FerrisLoad مرورگر احراز هویت را خودکار باز می‌کند.',
+      'auth_redirecting':
+          'نیاز به نشست مجاز تشخیص داده شد. در حال باز کردن مرورگر احراز هویت…',
+      'clear_auth_context': 'پاک کردن نشست واردشده',
+      'preparing': 'در حال آماده‌سازی دانلود…',
+      'output_not_created':
+          'دانلود تمام شد، اما فایل خروجی ساخته نشد. نشانی منبع، زمینه درخواست یا تلاش دوباره را بررسی کنید.',
+      'export_failed': 'صدور فایل به محل انتخاب‌شده انجام نشد. خروجی موقت:',
+      'download_hint':
+          'می‌توانید بدون تحلیل هم مستقیم دانلود کنید: یک پیوند m3u8 یا پیوند مستقیم رسانه را وارد کنید و شروع کنید.',
+    },
+    'ur': {
+      'app_title': 'FerrisLoad',
+      'app_subtitle':
+          'صفحہ دیکھیں، چلنے کے قابل میڈیا تلاش کریں، اور دستیاب بہترین اسٹریم ڈاؤن لوڈ کریں۔',
+      'input_source': 'ماخذ URL',
+      'source_hint':
+          'ویب صفحہ، m3u8، mp4، YouTube یا Bilibili کا لنک چسپاں کریں',
+      'file_name': 'آؤٹ پٹ فائل',
+      'save_location': 'محفوظ کرنے کی جگہ',
+      'default_location': 'پہلے سے طے شدہ محفوظ کرنے کی جگہ',
+      'choose_directory': 'فولڈر منتخب کریں',
+      'reset_default': 'ڈیفالٹ استعمال کریں',
+      'analyze': 'ماخذ کا تجزیہ کریں',
+      'download': 'منتخب اسٹریم ڈاؤن لوڈ کریں',
+      'download_options': 'ڈاؤن لوڈ کی ترتیبات',
+      'concurrency': 'ہم وقت تعداد',
+      'retries': 'دوبارہ کوششیں',
+      'video_bitrate': 'ویڈیو بٹ ریٹ',
+      'audio_bitrate': 'آڈیو بٹ ریٹ',
+      'keep_temp': 'عارضی فائلیں محفوظ رکھیں',
+      'keep_temp_hint': 'تشخیص اور دستی مرج کے لیے مفید',
+      'analysis_results': 'شناخت شدہ میڈیا',
+      'status': 'حالت',
+      'history': 'تاریخچہ',
+      'warnings': 'انتباہات',
+      'appearance': 'ظاہری شکل',
+      'mode': 'موڈ',
+      'system': 'سسٹم',
+      'light': 'روشن',
+      'dark': 'تاریک',
+      'theme': 'تھیم',
+      'language': 'زبان',
+      'battery': 'بیٹری کی بہتری',
+      'battery_hint':
+          'پابندیاں بند کرنے سے لمبے بیک گراؤنڈ ڈاؤن لوڈز کے رکنے کا امکان کم ہوتا ہے',
+      'disable_now': 'ابھی بند کریں',
+      'no_candidates': 'ابھی تک ڈاؤن لوڈ کے قابل کوئی میڈیا نہیں ملا۔',
+      'select_candidate': 'ڈاؤن لوڈ سے پہلے ایک میڈیا امیدوار منتخب کریں۔',
+      'source_page': 'ماخذ صفحہ',
+      'extractor': 'ایکسٹریکٹر',
+      'completed': 'مکمل',
+      'output_path': 'محفوظ شدہ فائل',
+      'analyzing': 'ماخذ کا تجزیہ ہو رہا ہے…',
+      'ready': 'امیدوار تیار ہے',
+      'inspector': 'انسپکٹر',
+      'stream': 'اسٹریم',
+      'authorization': 'مجاز درخواست کی ترتیبات',
+      'authorization_hint':
+          'ان سائٹس کے لیے جن کی آپ کو ملکیت یا اجازت حاصل ہے: Cookie، User-Agent، Referer، Origin اور حسب ضرورت ہیڈر',
+      'cookie_hint': 'name=value; another=value',
+      'headers_hint':
+          'Authorization: Bearer ...\nX-Requested-With: XMLHttpRequest',
+      'core': 'بنیادی',
+      'score': 'اسکور',
+      'segments': 'حصے',
+      'auth_browser_open': 'تصدیقی براؤزر کھولیں',
+      'auth_browser_title': 'مجاز سیشن براؤزر',
+      'auth_browser_hint':
+          'ہدف سائٹ یہاں کھولیں، لاگ اِن یا انسانی تصدیق خود مکمل کریں، پھر موجودہ سیشن واپس FerrisLoad میں درآمد کریں۔',
+      'auth_browser_hint_inline':
+          'جب سائٹ کو لاگ اِن، Cookie سے منسلک پلے بیک اجازت، یا انسانی تصدیق درکار ہو تو تصدیقی براؤزر استعمال کریں۔',
+      'auth_browser_address': 'براؤزر کا پتہ',
+      'auth_browser_go': 'کھولیں',
+      'auth_browser_import': 'موجودہ سیشن درآمد کریں',
+      'auth_browser_no_session':
+          'موجودہ صفحے پر دوبارہ استعمال ہونے والی Cookie یا درآمد کے قابل براؤزر سیشن نہیں ملا۔',
+      'auth_session_imported':
+          'مجاز سیشن درآمد ہو گیا۔ اب آپ تازہ درخواست سیاق کے ساتھ دوبارہ تجزیہ یا ڈاؤن لوڈ کر سکتے ہیں۔',
+      'auth_challenge_detected': 'رسائی کا چیلنج معلوم ہوا',
+      'auth_challenge_help':
+          'FerrisLoad اس سیشن کو دوبارہ استعمال کر سکتا ہے جسے آپ نے خود مکمل کیا ہو، لیکن یہ Cloudflare، CAPTCHA، پابندی، DRM، دستخط یا پیش نظارہ کی حد کو نظرانداز نہیں کرتا۔',
+      'auth_auto_open': 'چیلنج ملنے پر تصدیقی براؤزر خودکار کھولیں',
+      'auth_auto_open_hint':
+          'اگر تجزیہ یا ڈاؤن لوڈ کے دوران لاگ اِن، ریٹ لمٹ، Cloudflare یا انسانی تصدیق سامنے آئے تو FerrisLoad تصدیقی براؤزر خودکار کھول دے گا۔',
+      'auth_redirecting': 'مجاز سیشن درکار ہے۔ تصدیقی براؤزر کھولا جا رہا ہے…',
+      'clear_auth_context': 'درآمد شدہ سیشن صاف کریں',
+      'preparing': 'ڈاؤن لوڈ کی تیاری ہو رہی ہے…',
+      'output_not_created':
+          'ڈاؤن لوڈ مکمل ہوا، لیکن آؤٹ پٹ فائل نہیں بنی۔ ماخذ URL، درخواست سیاق یا دوبارہ کوشش چیک کریں۔',
+      'export_failed': 'فائل منتخب مقام پر ایکسپورٹ نہ ہو سکی۔ عارضی آؤٹ پٹ:',
+      'download_hint':
+          'آپ تجزیہ کے بغیر بھی براہ راست ڈاؤن لوڈ کر سکتے ہیں: m3u8 یا براہ راست میڈیا لنک چسپاں کریں اور شروع کریں۔',
     },
     'es': {
       'app_title': 'FerrisLoad',
@@ -532,16 +869,17 @@ class AppLocalizations {
       'app_subtitle':
           'Analysez une page, repérez les médias lisibles et téléchargez le meilleur flux exposé.',
       'input_source': 'URL source',
-      'source_hint': 'Collez un lien page web, m3u8, mp4, YouTube ou Bilibili',
+      'source_hint':
+          'Collez un lien de page web, m3u8, mp4, YouTube ou Bilibili',
       'file_name': 'Fichier de sortie',
-      'save_location': 'Emplacement',
-      'default_location': 'Emplacement par défaut',
+      'save_location': 'Emplacement d’enregistrement',
+      'default_location': 'Emplacement de sortie par défaut',
       'choose_directory': 'Choisir un dossier',
-      'reset_default': 'Par défaut',
-      'analyze': 'Analyser',
-      'download': 'Télécharger le flux choisi',
+      'reset_default': 'Utiliser l’emplacement par défaut',
+      'analyze': 'Analyser la source',
+      'download': 'Télécharger le flux sélectionné',
       'download_options': 'Options de téléchargement',
-      'concurrency': 'Concurrence',
+      'concurrency': 'Téléchargements parallèles',
       'retries': 'Réessais',
       'video_bitrate': 'Débit vidéo',
       'audio_bitrate': 'Débit audio',
@@ -572,11 +910,50 @@ class AppLocalizations {
       'ready': 'Candidat prêt',
       'inspector': 'Inspecteur',
       'stream': 'Flux',
+      'authorization': 'Contexte de requête autorisé',
+      'authorization_hint':
+          'Pour les sites que vous possédez ou que vous êtes autorisé à utiliser : Cookie, User-Agent, Referer, Origin et en-têtes personnalisés',
+      'cookie_hint': 'name=value; another=value',
+      'headers_hint':
+          'Authorization: Bearer ...\nX-Requested-With: XMLHttpRequest',
+      'core': 'Principal',
+      'score': 'Score',
+      'segments': 'segments',
+      'auth_browser_open': 'Ouvrir le navigateur d’autorisation',
+      'auth_browser_title': 'Navigateur de session autorisée',
+      'auth_browser_hint':
+          'Ouvrez le site cible ici, terminez vous-même la connexion ou la vérification humaine, puis réimportez la session actuelle dans FerrisLoad.',
+      'auth_browser_hint_inline':
+          'Utilisez le navigateur d’autorisation quand le site exige une connexion, une lecture liée à un Cookie ou une vérification humaine.',
+      'auth_browser_address': 'Adresse du navigateur',
+      'auth_browser_go': 'Ouvrir',
+      'auth_browser_import': 'Importer la session actuelle',
+      'auth_browser_no_session':
+          'Aucun Cookie réutilisable ni aucune session de navigateur exploitable n’a été trouvé sur la page actuelle.',
+      'auth_session_imported':
+          'La session autorisée a été importée. Vous pouvez relancer l’analyse ou le téléchargement avec le contexte de requête mis à jour.',
+      'auth_challenge_detected': 'Défi d’accès détecté',
+      'auth_challenge_help':
+          'FerrisLoad peut réutiliser une session que vous avez validée vous-même, mais ne contourne pas Cloudflare, les CAPTCHA, les blocages, le DRM, les signatures ni les limites d’aperçu.',
+      'auth_auto_open':
+          'Ouvrir automatiquement le navigateur d’autorisation en cas de défi',
+      'auth_auto_open_hint':
+          'Quand l’analyse ou le téléchargement rencontre une connexion obligatoire, une limitation, Cloudflare ou une vérification humaine, FerrisLoad ouvre automatiquement le navigateur d’autorisation.',
+      'auth_redirecting':
+          'Une session autorisée est nécessaire. Ouverture du navigateur d’autorisation…',
+      'clear_auth_context': 'Effacer la session importée',
+      'preparing': 'Préparation du téléchargement...',
+      'output_not_created':
+          'Le téléchargement est terminé, mais aucun fichier de sortie n’a été créé. Vérifiez l’URL source, le contexte de requête ou réessayez.',
+      'export_failed':
+          'Impossible d’exporter le fichier vers l’emplacement choisi. Fichier temporaire :',
+      'download_hint':
+          'Vous pouvez télécharger directement sans analyse : collez un lien m3u8 ou un lien média direct, puis lancez le téléchargement.',
     },
     'de': {
       'app_title': 'FerrisLoad',
       'app_subtitle':
-          'Analysiere Seiten, finde abspielbare Medien und lade den besten offengelegten Stream herunter.',
+          'Analysiere Seiten, finde abspielbare Medien und lade den besten freigelegten Stream herunter.',
       'input_source': 'Quell-URL',
       'source_hint':
           'Webseite, m3u8, mp4, YouTube- oder Bilibili-Link einfügen',
@@ -619,6 +996,45 @@ class AppLocalizations {
       'ready': 'Kandidat bereit',
       'inspector': 'Inspektor',
       'stream': 'Stream',
+      'authorization': 'Autorisierter Anfragekontext',
+      'authorization_hint':
+          'Für eigene oder berechtigt genutzte Websites: Cookie, User-Agent, Referer, Origin und benutzerdefinierte Header',
+      'cookie_hint': 'name=value; another=value',
+      'headers_hint':
+          'Authorization: Bearer ...\nX-Requested-With: XMLHttpRequest',
+      'core': 'Kern',
+      'score': 'Bewertung',
+      'segments': 'Segmente',
+      'auth_browser_open': 'Autorisierungsbrowser öffnen',
+      'auth_browser_title': 'Browser für autorisierte Sitzungen',
+      'auth_browser_hint':
+          'Öffne die Zielseite hier, erledige Anmeldung oder menschliche Verifikation selbst und importiere danach die aktuelle Sitzung zurück in FerrisLoad.',
+      'auth_browser_hint_inline':
+          'Verwende den Autorisierungsbrowser, wenn die Seite eine Anmeldung, Cookie-gebundene Wiedergabe oder eine menschliche Verifikation verlangt.',
+      'auth_browser_address': 'Browseradresse',
+      'auth_browser_go': 'Öffnen',
+      'auth_browser_import': 'Aktuelle Sitzung importieren',
+      'auth_browser_no_session':
+          'Auf der aktuellen Seite wurde weder ein wiederverwendbares Cookie noch eine nutzbare Browsersitzung gefunden.',
+      'auth_session_imported':
+          'Die autorisierte Sitzung wurde importiert. Du kannst jetzt mit dem aktualisierten Anfragekontext erneut analysieren oder herunterladen.',
+      'auth_challenge_detected': 'Zugriffshürde erkannt',
+      'auth_challenge_help':
+          'FerrisLoad kann eine von dir selbst bestätigte Sitzung wiederverwenden, umgeht aber weder Cloudflare noch CAPTCHA, Sperren, DRM, Signaturen oder Vorschaugrenzen.',
+      'auth_auto_open':
+          'Autorisierungsbrowser bei Zugriffshürde automatisch öffnen',
+      'auth_auto_open_hint':
+          'Wenn Analyse oder Download auf Anmeldung, Ratenbegrenzung, Cloudflare oder menschliche Verifikation stoßen, öffnet FerrisLoad automatisch den Autorisierungsbrowser.',
+      'auth_redirecting':
+          'Eine autorisierte Sitzung wird benötigt. Autorisierungsbrowser wird geöffnet…',
+      'clear_auth_context': 'Importierte Sitzung löschen',
+      'preparing': 'Download wird vorbereitet…',
+      'output_not_created':
+          'Der Download ist beendet, aber es wurde keine Ausgabedatei erzeugt. Prüfe Quell-URL, Anfragekontext oder versuche es erneut.',
+      'export_failed':
+          'Die Datei konnte nicht an den gewählten Speicherort exportiert werden. Temporäre Ausgabe:',
+      'download_hint':
+          'Du kannst auch ohne Analyse direkt herunterladen: m3u8- oder Direktlink einfügen und starten.',
     },
     'pt': {
       'app_title': 'FerrisLoad',
@@ -812,9 +1228,7 @@ class AppLocalizations {
   }
 
   String localeLabel(Locale locale) {
-    final key = locale.scriptCode == null
-        ? locale.languageCode
-        : '${locale.languageCode}_${locale.scriptCode}';
+    final key = localeKeyOf(locale);
     return localeLabels[key] ?? localeLabels[locale.languageCode] ?? key;
   }
 
@@ -839,15 +1253,13 @@ class _AppLocalizationsDelegate
   @override
   bool isSupported(Locale locale) {
     return AppLocalizations.supportedLocales.any(
-      (item) =>
-          item.languageCode == locale.languageCode &&
-          (item.scriptCode == null || item.scriptCode == locale.scriptCode),
+      (item) => item.languageCode == locale.languageCode,
     );
   }
 
   @override
   Future<AppLocalizations> load(Locale locale) async {
-    return AppLocalizations(locale);
+    return AppLocalizations(AppLocalizations.resolveLocale(locale));
   }
 
   @override

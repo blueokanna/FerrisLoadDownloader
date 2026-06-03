@@ -11,12 +11,13 @@ use log::{error, info, warn};
 use m3u8_rs::{parse_playlist, Playlist};
 use regex::Regex;
 use reqwest::{header, Client};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(target_os = "android")]
-use std::sync::OnceLock;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 #[cfg(target_os = "android")]
 use std::env;
@@ -24,9 +25,12 @@ use tokio::sync::Semaphore;
 use tokio::{fs, process::Command, sync::Mutex};
 use url::Url;
 use crate::frb_generated::StreamSink;
+use crate::api::site_adapters::{extractor_name_for_host, inspect_page_candidates, SiteWarning};
 
 #[cfg(target_os = "android")]
 use jni::objects::{GlobalRef, JClass, JObject, JValue};
+#[cfg(target_os = "android")]
+use jni::JNIEnv;
 #[cfg(target_os = "android")]
 use jni::JavaVM;
 
@@ -118,7 +122,18 @@ pub(crate) fn emit_progress(reporter: &ProgressReporter, message: impl Into<Stri
 }
 
 #[cfg(target_os = "android")]
+macro_rules! jni_string {
+    ($env:expr, $value:expr, $label:literal) => {
+        $env.new_string($value)
+            .map_err(|e| anyhow!("JNI new_string failed for {}: {}", $label, e))?
+    };
+}
+
+#[cfg(target_os = "android")]
 static ANDROID_HW_TRANSCODER: OnceLock<Arc<AndroidMediaCodecTranscoder>> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+static ANDROID_TRANSCODE_GATE: OnceLock<Arc<StdMutex<()>>> = OnceLock::new();
 
 #[cfg(target_os = "android")]
 static ANDROID_CONTEXT: OnceLock<AndroidContextData> = OnceLock::new();
@@ -138,6 +153,29 @@ impl AndroidMediaCodecTranscoder {
         Self { jvm }
     }
 
+    async fn with_media_transcoder<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut JNIEnv, JClass) -> Result<T> + Send + 'static,
+    {
+        let jvm = self.jvm.clone();
+        let gate = ANDROID_TRANSCODE_GATE
+            .get_or_init(|| Arc::new(StdMutex::new(())))
+            .clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = gate
+                .lock()
+                .map_err(|_| anyhow!("Android transcode gate acquire failed"))?;
+            let mut env = jvm
+                .attach_current_thread()
+                .map_err(|e| anyhow!("JNI attach thread failed: {}", e))?;
+            let class = media_transcoder_class(&mut env)?;
+            operation(&mut env, class)
+        })
+        .await
+        .map_err(|e| anyhow!("tokio spawn_blocking failed: {}", e))?
+    }
+
     pub async fn transcode(
         &self,
         input_ts: &str,
@@ -145,65 +183,12 @@ impl AndroidMediaCodecTranscoder {
         video_bitrate: u32,
         audio_bitrate: u32,
     ) -> Result<()> {
-        let jvm = self.jvm.clone();
         let input_ts = input_ts.to_string();
         let output_mp4 = output_mp4.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| anyhow!("JNI attach thread failed: {}", e))?;
-
-            // Try to get cached class first, otherwise load it using app ClassLoader
-            let class: JClass = if let Some(class_ref) = MEDIA_TRANSCODER_CLASS.get() {
-                // SAFETY: GlobalRef was created from a JClass, so it's safe to cast back
-                unsafe { JClass::from_raw(class_ref.as_obj().as_raw()) }
-            } else {
-                // Load class using app context's ClassLoader (works from any thread)
-                let ctx = get_android_context()
-                    .map_err(|e| anyhow!("Failed to get Android context: {}", e))?;
-                
-                // Get ClassLoader from app context
-                let class_loader = env
-                    .call_method(ctx.app_context.as_obj(), "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-                    .map_err(|e| anyhow!("Failed to get ClassLoader: {:?}", e))?
-                    .l()
-                    .map_err(|e| anyhow!("ClassLoader is not an object: {:?}", e))?;
-                
-                // Use ClassLoader.loadClass() to load MediaTranscoder
-                let class_name = env
-                    .new_string("com.bluevale.m3u8_downloader.MediaTranscoder")
-                    .map_err(|e| anyhow!("Failed to create class name string: {:?}", e))?;
-                
-                let loaded_class = env
-                    .call_method(
-                        &class_loader,
-                        "loadClass",
-                        "(Ljava/lang/String;)Ljava/lang/Class;",
-                        &[JValue::Object(&class_name)],
-                    )
-                    .map_err(|e| anyhow!("Failed to load MediaTranscoder class: {:?}", e))?
-                    .l()
-                    .map_err(|e| anyhow!("loadClass did not return a Class: {:?}", e))?;
-                
-                info!("✅ MediaTranscoder class loaded via ClassLoader");
-                
-                // Cache the class for future use
-                if let Ok(global_ref) = env.new_global_ref(&loaded_class) {
-                    let _ = MEDIA_TRANSCODER_CLASS.set(global_ref);
-                }
-                
-                // SAFETY: loaded_class is a java.lang.Class object
-                unsafe { JClass::from_raw(loaded_class.as_raw()) }
-            };
-
-            let input_ts_jstring = env
-                .new_string(&input_ts)
-                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
-
-            let output_mp4_jstring = env
-                .new_string(&output_mp4)
-                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
+        self.with_media_transcoder(move |env, class| {
+            let input_ts_jstring = jni_string!(env, &input_ts, "input_ts");
+            let output_mp4_jstring = jni_string!(env, &output_mp4, "output_mp4");
 
             let result = env
                 .call_static_method(
@@ -230,7 +215,6 @@ impl AndroidMediaCodecTranscoder {
             }
         })
         .await
-        .map_err(|e| anyhow!("tokio spawn_blocking failed: {}", e))?
     }
 
     pub async fn mux(
@@ -239,54 +223,14 @@ impl AndroidMediaCodecTranscoder {
         audio_path: &str,
         output_mp4: &str,
     ) -> Result<()> {
-        let jvm = self.jvm.clone();
         let video_path = video_path.to_string();
         let audio_path = audio_path.to_string();
         let output_mp4 = output_mp4.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| anyhow!("JNI attach thread failed: {}", e))?;
-
-            let class: JClass = if let Some(class_ref) = MEDIA_TRANSCODER_CLASS.get() {
-                unsafe { JClass::from_raw(class_ref.as_obj().as_raw()) }
-            } else {
-                let ctx = get_android_context()
-                    .map_err(|e| anyhow!("Failed to get Android context: {}", e))?;
-                let class_loader = env
-                    .call_method(ctx.app_context.as_obj(), "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-                    .map_err(|e| anyhow!("Failed to get ClassLoader: {:?}", e))?
-                    .l()
-                    .map_err(|e| anyhow!("ClassLoader is not an object: {:?}", e))?;
-                let class_name = env
-                    .new_string("com.bluevale.m3u8_downloader.MediaTranscoder")
-                    .map_err(|e| anyhow!("Failed to create class name string: {:?}", e))?;
-                let loaded_class = env
-                    .call_method(
-                        &class_loader,
-                        "loadClass",
-                        "(Ljava/lang/String;)Ljava/lang/Class;",
-                        &[JValue::Object(&class_name)],
-                    )
-                    .map_err(|e| anyhow!("Failed to load MediaTranscoder class: {:?}", e))?
-                    .l()
-                    .map_err(|e| anyhow!("loadClass did not return a Class: {:?}", e))?;
-                if let Ok(global_ref) = env.new_global_ref(&loaded_class) {
-                    let _ = MEDIA_TRANSCODER_CLASS.set(global_ref);
-                }
-                unsafe { JClass::from_raw(loaded_class.as_raw()) }
-            };
-
-            let video_jstring = env
-                .new_string(&video_path)
-                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
-            let audio_jstring = env
-                .new_string(&audio_path)
-                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
-            let output_jstring = env
-                .new_string(&output_mp4)
-                .map_err(|e| anyhow!("JNI new_string failed: {}", e))?;
+        self.with_media_transcoder(move |env, class| {
+            let video_jstring = jni_string!(env, &video_path, "video_path");
+            let audio_jstring = jni_string!(env, &audio_path, "audio_path");
+            let output_jstring = jni_string!(env, &output_mp4, "output_mp4");
 
             let result = env
                 .call_static_method(
@@ -312,8 +256,46 @@ impl AndroidMediaCodecTranscoder {
             }
         })
         .await
-        .map_err(|e| anyhow!("tokio spawn_blocking failed: {}", e))?
     }
+}
+
+#[cfg(target_os = "android")]
+fn media_transcoder_class<'local>(env: &mut JNIEnv<'local>) -> Result<JClass<'local>> {
+    if let Some(class_ref) = MEDIA_TRANSCODER_CLASS.get() {
+        let local_ref = env
+            .new_local_ref(class_ref.as_obj())
+            .map_err(|e| anyhow!("Failed to create local MediaTranscoder ref: {}", e))?;
+        return Ok(JClass::from(local_ref));
+    }
+
+    let ctx = get_android_context().map_err(|e| anyhow!("Failed to get Android context: {}", e))?;
+    let class_loader = env
+        .call_method(
+            ctx.app_context.as_obj(),
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        )
+        .map_err(|e| anyhow!("Failed to get ClassLoader: {:?}", e))?
+        .l()
+        .map_err(|e| anyhow!("ClassLoader is not an object: {:?}", e))?;
+    let class_name = jni_string!(env, "com.bluevale.m3u8_downloader.MediaTranscoder", "class_name");
+    let loaded_class = env
+        .call_method(
+            &class_loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&class_name)],
+        )
+        .map_err(|e| anyhow!("Failed to load MediaTranscoder class: {:?}", e))?
+        .l()
+        .map_err(|e| anyhow!("loadClass did not return a Class: {:?}", e))?;
+
+    if let Ok(global_ref) = env.new_global_ref(&loaded_class) {
+        let _ = MEDIA_TRANSCODER_CLASS.set(global_ref);
+    }
+
+    Ok(JClass::from(loaded_class))
 }
 
 #[cfg(target_os = "android")]
@@ -328,7 +310,7 @@ pub fn register_android_mediacodec_transcoder(jvm: Arc<JavaVM>) -> Result<()> {
         .set(Arc::new(transcoder))
         .map_err(|_| anyhow!("Failed to register Android MediaCodec transcoder"))?;
 
-    info!("鉁� Android MediaCodec transcoder registered");
+    info!("Android MediaCodec transcoder registered");
     Ok(())
 }
 
@@ -646,13 +628,14 @@ pub async fn inspect_media_with_context(
     let html = response.text().await?;
     let mut warnings = Vec::new();
     if let Some(reason) = detect_access_challenge(status.as_u16(), &html) {
-        warnings.push(reason.clone());
+        warnings.push(SiteWarning::auth("challenge-detected", reason.clone()));
         return Ok(MediaInspectionResult {
             page_url: url,
-            page_title: extract_page_title(&html).unwrap_or_else(|| "Authorization required".to_string()),
+            page_title: crate::api::site_adapters::extract_page_title(&html)
+                .unwrap_or_else(|| "Authorization required".to_string()),
             extractor: extractor_name_for_host(page_url.domain()),
             candidates: Vec::new(),
-            warnings,
+            warnings: warnings.into_iter().map(SiteWarning::into_display).collect(),
             auth_required: true,
             challenge_reason: reason,
         });
@@ -660,25 +643,34 @@ pub async fn inspect_media_with_context(
     if !status.is_success() {
         bail!("Failed to inspect page: HTTP {}", status);
     }
-    let page_title = extract_page_title(&html).unwrap_or_else(|| infer_title_from_url(&url));
+    let page_title = crate::api::site_adapters::extract_page_title(&html)
+        .unwrap_or_else(|| infer_title_from_url(&url));
     let extractor = extractor_name_for_host(page_url.domain());
     let mut collector = CandidateCollector::new(page_url.as_str(), &page_title, &extractor);
 
-    match page_url.domain() {
-        Some(domain) if domain.contains("youtube.com") || domain.contains("youtu.be") => {
-            extract_youtube_candidates(&page_url, &html, &mut collector, &mut warnings)?;
-        }
-        Some(domain) if domain.contains("bilibili.com") || domain.contains("b23.tv") => {
-            extract_bilibili_candidates(&page_url, &html, &mut collector, &mut warnings)?;
-        }
-        _ => {}
-    }
-
-    extract_generic_candidates(&page_url, &html, &mut collector)?;
+    inspect_page_candidates(&page_url, &html, &mut collector, &mut warnings)?;
     let candidates = score_candidates(collector.finish(), &request_context).await;
 
     if candidates.is_empty() {
-        warnings.push("No downloadable media candidates were found in the current page source".to_string());
+        if let Some(auth_warning) = warnings.iter().find(|warning| warning.scope() == "auth") {
+            let challenge_reason = auth_warning.message().to_string();
+            return Ok(MediaInspectionResult {
+                page_url: url,
+                page_title,
+                extractor,
+                candidates,
+                warnings: warnings.into_iter().map(SiteWarning::into_display).collect(),
+                auth_required: true,
+                challenge_reason,
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        warnings.push(SiteWarning::media(
+            "no-candidates",
+            "No downloadable media candidates were found in the current page source",
+        ));
     }
 
     Ok(MediaInspectionResult {
@@ -686,7 +678,7 @@ pub async fn inspect_media_with_context(
         page_title,
         extractor,
         candidates,
-        warnings,
+        warnings: warnings.into_iter().map(SiteWarning::into_display).collect(),
         auth_required: false,
         challenge_reason: String::new(),
     })
@@ -766,6 +758,45 @@ pub(crate) async fn download_media_with_context_core(
 ) -> Result<()> {
     init_runtime_logging();
 
+    if should_auto_inspect_download_target(&page_url, &media_url, audio_url.as_deref()) {
+        emit_progress(&reporter, "Resolving page media candidate...", 0.01);
+
+        let inspection = inspect_media_with_context(page_url.clone(), request_context.clone()).await?;
+        if inspection.auth_required {
+            let reason = if inspection.challenge_reason.trim().is_empty() {
+                "Authorization required before download".to_string()
+            } else {
+                inspection.challenge_reason.clone()
+            };
+            bail!("Authorization required before download: {}", reason);
+        }
+
+        let selected_candidate = inspection
+            .candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No downloadable media candidates were found for the page URL"))?;
+
+        if selected_candidate.media_url == media_url && selected_candidate.audio_url == audio_url {
+            bail!("Resolved page candidate did not expose a downloadable media stream");
+        }
+
+        return Box::pin(download_media_with_context_core(
+            reporter,
+            selected_candidate.page_url,
+            selected_candidate.media_url,
+            selected_candidate.audio_url,
+            output,
+            concurrency,
+            retries,
+            video_bitrate,
+            audio_bitrate,
+            keep_temp,
+            request_context,
+        ))
+        .await;
+    }
+
     if is_hls_like(&media_url) {
         return run_hls_pipeline(
             reporter,
@@ -781,20 +812,25 @@ pub(crate) async fn download_media_with_context_core(
         .await;
     }
 
+    if protocol_from_url(&media_url) == "dash" {
+        return run_dash_pipeline(
+            reporter,
+            &media_url,
+            &request_context,
+            &output,
+            retries,
+            video_bitrate,
+            audio_bitrate,
+            keep_temp,
+        )
+        .await;
+    }
+
     emit_progress(&reporter, "Preparing direct media download...", 0.02);
 
     let page_url = Url::parse(&page_url).ok();
     let client = create_http_client_for_context(page_url.as_ref().map(Url::as_str), &request_context)?;
-    let output_path = PathBuf::from(&output);
-    let temp_dir = output_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    if !temp_dir.exists() {
-        std::fs::create_dir_all(&temp_dir)
-            .with_context(|| format!("Failed to create output directory: {}", temp_dir.display()))?;
-    }
+    let (output_path, temp_dir) = prepare_output_path(&output)?;
 
     match audio_url {
         Some(audio) => {
@@ -815,10 +851,7 @@ pub(crate) async fn download_media_with_context_core(
             )
             .await?;
 
-            if !keep_temp {
-                let _ = fs::remove_file(video_temp).await;
-                let _ = fs::remove_file(audio_temp).await;
-            }
+            cleanup_temp_files(keep_temp, [&video_temp, &audio_temp]).await;
         }
         None => {
             let extension = container_from_url(&media_url);
@@ -829,25 +862,107 @@ pub(crate) async fn download_media_with_context_core(
                 let temp_input = temp_dir.join(format!("direct_input.{}", extension));
                 download_to_file(&client, &media_url, &temp_input, 0.72, &reporter, "Downloading media")
                     .await?;
-                convert_to_mp4(
-                    temp_input.to_string_lossy().as_ref(),
+                transcode_input_to_output(
+                    &temp_input,
                     &output,
                     video_bitrate.max(0) as u32,
                     audio_bitrate.max(0) as u32,
-                    &MultiProgress::new(),
-                    select_transcoder_backend().await?,
                     reporter.clone(),
                 )
                 .await?;
-                if !keep_temp {
-                    let _ = fs::remove_file(temp_input).await;
-                }
+                cleanup_temp_files(keep_temp, [&temp_input]).await;
             }
         }
     }
 
+    ensure_output_file_ready(&output_path)?;
     emit_progress(&reporter, "All tasks completed", 1.0);
 
+    Ok(())
+}
+
+async fn run_dash_pipeline(
+    reporter: ProgressReporter,
+    manifest_url: &str,
+    request_context: &RequestContext,
+    output: &str,
+    retries: i32,
+    video_bitrate: i32,
+    audio_bitrate: i32,
+    keep_temp: bool,
+) -> Result<()> {
+    emit_progress(&reporter, "Resolving DASH manifest...", 0.02);
+
+    let plan = resolve_dash_download_plan(manifest_url, request_context).await?;
+    let (output_path, temp_dir) = prepare_output_path(output)?;
+
+    let client = create_http_client_for_context(Some(&plan.video_url), request_context)?;
+    let retries = retries.max(1) as u8;
+
+    let video_extension = container_from_url(&plan.video_url);
+    let video_temp = temp_dir.join(format!("dash_video_input.{}", video_extension));
+    download_with_retries(
+        &client,
+        &plan.video_url,
+        &video_temp,
+        retries,
+        0.46,
+        &reporter,
+        "Downloading DASH video",
+    )
+    .await?;
+
+    match plan.audio_url {
+        Some(audio_url) => {
+            let audio_extension = container_from_url(&audio_url);
+            let audio_temp = temp_dir.join(format!("dash_audio_input.{}", audio_extension));
+
+            download_with_retries(
+                &client,
+                &audio_url,
+                &audio_temp,
+                retries,
+                0.78,
+                &reporter,
+                "Downloading DASH audio",
+            )
+            .await?;
+
+            merge_media_streams(
+                &video_temp,
+                &audio_temp,
+                output,
+                video_bitrate.max(0) as u32,
+                audio_bitrate.max(0) as u32,
+            )
+            .await?;
+
+            cleanup_temp_files(keep_temp, [&video_temp, &audio_temp]).await;
+        }
+        None => {
+            if video_extension == "mp4" && video_bitrate <= 0 && audio_bitrate <= 0 {
+                if fs::rename(&video_temp, &output_path).await.is_err() {
+                    fs::copy(&video_temp, &output_path)
+                        .await
+                        .with_context(|| format!("Failed to copy DASH output to {}", output_path.display()))?;
+                }
+                cleanup_temp_files(keep_temp, [&video_temp]).await;
+            } else {
+                transcode_input_to_output(
+                    &video_temp,
+                    output,
+                    video_bitrate.max(0) as u32,
+                    audio_bitrate.max(0) as u32,
+                    reporter.clone(),
+                )
+                .await?;
+                cleanup_temp_files(keep_temp, [&video_temp]).await;
+            }
+        }
+    }
+
+    ensure_output_file_ready(&output_path)?;
+    emit_progress(&reporter, "All tasks completed", 1.0);
     Ok(())
 }
 
@@ -1026,6 +1141,7 @@ pub(crate) async fn run_hls_pipeline(
         let _ = fs::remove_file(&temp_ts_str).await;
     }
 
+    ensure_output_file_ready(Path::new(output))?;
     emit_progress(&reporter, "All tasks completed", 1.0);
 
     Ok(())
@@ -1044,7 +1160,7 @@ fn init_runtime_logging() {
         .ok();
 }
 
-struct CandidateCollector {
+pub(crate) struct CandidateCollector {
     page_url: String,
     default_title: String,
     extractor: String,
@@ -1053,7 +1169,7 @@ struct CandidateCollector {
 }
 
 impl CandidateCollector {
-    fn new(page_url: &str, default_title: &str, extractor: &str) -> Self {
+    pub(crate) fn new(page_url: &str, default_title: &str, extractor: &str) -> Self {
         Self {
             page_url: page_url.to_string(),
             default_title: default_title.to_string(),
@@ -1063,7 +1179,7 @@ impl CandidateCollector {
         }
     }
 
-    fn push(
+    pub(crate) fn push(
         &mut self,
         media_url: String,
         audio_url: Option<String>,
@@ -1106,22 +1222,13 @@ impl CandidateCollector {
         });
     }
 
-    fn finish(mut self) -> Vec<MediaCandidate> {
+    pub(crate) fn finish(mut self) -> Vec<MediaCandidate> {
         self.candidates.sort_by(|left, right| {
             let left_score = (left.height.max(0), left.width.max(0), left.quality_label.clone());
             let right_score = (right.height.max(0), right.width.max(0), right.quality_label.clone());
             right_score.cmp(&left_score)
         });
         self.candidates
-    }
-}
-
-fn extractor_name_for_host(host: Option<&str>) -> String {
-    match host {
-        Some(domain) if domain.contains("youtube.com") || domain.contains("youtu.be") => "youtube".to_string(),
-        Some(domain) if domain.contains("bilibili.com") || domain.contains("b23.tv") => "bilibili".to_string(),
-        Some(domain) => domain.to_string(),
-        None => "generic".to_string(),
     }
 }
 
@@ -1174,6 +1281,14 @@ fn is_supported_media_like(url: &str) -> bool {
         || url.contains(".mpd")
 }
 
+fn should_auto_inspect_download_target(
+    page_url: &str,
+    media_url: &str,
+    audio_url: Option<&str>,
+) -> bool {
+    audio_url.is_none() && page_url == media_url && !is_supported_media_like(media_url)
+}
+
 fn is_hls_like(url: &str) -> bool {
     url.contains(".m3u8") || url.contains("application/vnd.apple.mpegurl")
 }
@@ -1217,353 +1332,6 @@ fn mime_from_urls(split_streams: bool) -> &'static str {
     }
 }
 
-fn extract_page_title(html: &str) -> Option<String> {
-    let patterns = [
-        r#"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']"#,
-        r#"<meta[^>]+name=[\"']twitter:title[\"'][^>]+content=[\"']([^\"']+)[\"']"#,
-        r#"<title>([^<]+)</title>"#,
-    ];
-
-    for pattern in patterns {
-        let regex = Regex::new(pattern).ok()?;
-        if let Some(caps) = regex.captures(html) {
-            if let Some(value) = caps.get(1) {
-                let cleaned = html_unescape(value.as_str()).trim().to_string();
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn html_unescape(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&quot;", '"'.to_string().as_str())
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-}
-
-fn normalize_exposed_media_url(page_url: &Url, raw: &str) -> Option<String> {
-    let normalized = html_unescape(raw)
-        .replace("\\u002F", "/")
-        .replace("\\u002f", "/")
-        .replace("\\u003A", ":")
-        .replace("\\u003a", ":")
-        .replace("\\u0026", "&")
-        .replace("\\u0026", "&")
-        .replace("\\/", "/")
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
-
-    if normalized.is_empty() {
-        return None;
-    }
-
-    let normalized = if normalized.starts_with("//") {
-        format!("https:{}", normalized)
-    } else {
-        normalized
-    };
-
-    let resolved = page_url
-        .join(&normalized)
-        .map(|url| url.to_string())
-        .or_else(|_| Url::parse(&normalized).map(|url| url.to_string()))
-        .ok()?;
-
-    if is_supported_media_like(&resolved) {
-        Some(resolved)
-    } else {
-        None
-    }
-}
-
-fn push_generic_candidate(
-    page_url: &Url,
-    raw: &str,
-    quality_label: &str,
-    collector: &mut CandidateCollector,
-) {
-    if let Some(resolved) = normalize_exposed_media_url(page_url, raw) {
-        collector.push(
-            resolved,
-            None,
-            None,
-            Some(quality_label.to_string()),
-            None,
-            None,
-            None,
-            Some("generic"),
-        );
-    }
-}
-
-fn extract_generic_candidates(
-    page_url: &Url,
-    html: &str,
-    collector: &mut CandidateCollector,
-) -> Result<()> {
-    let absolute_url_regex = Regex::new(r#"https?:\\?/\\?/[^\"'<>\s]+?(?:m3u8|mp4|webm|m4v|m4a|mpd)(?:\?[^\"'<>\s]*)?"#)?;
-    let relative_url_regex = Regex::new(r#"(?:src|href|content|data-src|data-url|data-video|data-hls|data-mp4)\s*=\s*[\"']([^\"']+?(?:m3u8|mp4|webm|m4v|m4a|mpd)(?:\?[^\"']*)?)[\"']"#)?;
-    let content_url_regex = Regex::new(r#"\"(?:contentUrl|embedUrl|playbackUrl|streamUrl|videoUrl|video_url|playUrl|play_url|hlsUrl|hls_url|dashUrl|dash_url|mp4Url|mp4_url)\"\s*:\s*\"([^\"]+)\""#)?;
-    let meta_url_regex = Regex::new(r#"<meta[^>]+(?:property|name)=[\"'](?:og:video|og:video:url|og:video:secure_url|twitter:player:stream|twitter:player:stream:content_type)[\"'][^>]+content=[\"']([^\"']+)[\"']"#)?;
-    let source_tag_regex = Regex::new(r#"<source[^>]+src=[\"']([^\"']+?(?:m3u8|mp4|webm|m4v|m4a|mpd)(?:\?[^\"']*)?)[\"']"#)?;
-
-    for capture in absolute_url_regex.captures_iter(html) {
-        if let Some(raw) = capture.get(0) {
-            push_generic_candidate(page_url, raw.as_str(), "Detected", collector);
-        }
-    }
-
-    for capture in relative_url_regex.captures_iter(html) {
-        if let Some(raw) = capture.get(1) {
-            push_generic_candidate(page_url, raw.as_str(), "Detected", collector);
-        }
-    }
-
-    for capture in content_url_regex.captures_iter(html) {
-        if let Some(raw) = capture.get(1) {
-            push_generic_candidate(page_url, raw.as_str(), "Content URL", collector);
-        }
-    }
-
-    for capture in meta_url_regex.captures_iter(html) {
-        if let Some(raw) = capture.get(1) {
-            push_generic_candidate(page_url, raw.as_str(), "Open Graph", collector);
-        }
-    }
-
-    for capture in source_tag_regex.captures_iter(html) {
-        if let Some(raw) = capture.get(1) {
-            push_generic_candidate(page_url, raw.as_str(), "Video Source", collector);
-        }
-    }
-
-    Ok(())
-}
-
-fn extract_bilibili_candidates(
-    page_url: &Url,
-    html: &str,
-    collector: &mut CandidateCollector,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    let Some(json) = extract_json_object_after(html, "__playinfo__=") else {
-        warnings.push("Bilibili playinfo JSON was not exposed in the page source".to_string());
-        return Ok(());
-    };
-
-    let value: Value = serde_json::from_str(&json).context("Failed to parse bilibili playinfo JSON")?;
-    let title = extract_page_title(html);
-
-    if let Some(durl_list) = value.pointer("/data/durl").and_then(Value::as_array) {
-        for (index, item) in durl_list.iter().enumerate() {
-            if let Some(media_url) = item.get("url").and_then(Value::as_str) {
-                collector.push(
-                    media_url.to_string(),
-                    None,
-                    title.clone(),
-                    Some(format!("Part {}", index + 1)),
-                    Some("video/mp4".to_string()),
-                    None,
-                    None,
-                    Some("bilibili"),
-                );
-            }
-        }
-    }
-
-    let best_audio = value
-        .pointer("/data/dash/audio")
-        .and_then(Value::as_array)
-        .and_then(|audios| {
-            audios
-                .iter()
-                .filter_map(|audio| {
-                    Some((
-                        audio.get("bandwidth")?.as_i64().unwrap_or_default(),
-                        audio.get("baseUrl")
-                            .or_else(|| audio.get("base_url"))?
-                            .as_str()?
-                            .to_string(),
-                    ))
-                })
-                .max_by_key(|entry| entry.0)
-                .map(|entry| entry.1)
-        });
-
-    if let Some(videos) = value.pointer("/data/dash/video").and_then(Value::as_array) {
-        for video in videos {
-            let Some(media_url) = video
-                .get("baseUrl")
-                .or_else(|| video.get("base_url"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-
-            collector.push(
-                media_url.to_string(),
-                best_audio.clone(),
-                title.clone(),
-                video
-                    .get("height")
-                    .and_then(Value::as_i64)
-                    .map(|height| format!("{}p", height)),
-                video.get("mimeType").and_then(Value::as_str).map(str::to_string),
-                video.get("width").and_then(Value::as_i64).map(|value| value as i32),
-                video.get("height").and_then(Value::as_i64).map(|value| value as i32),
-                Some("bilibili"),
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn extract_youtube_candidates(
-    page_url: &Url,
-    html: &str,
-    collector: &mut CandidateCollector,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    let json = extract_json_object_after(html, "ytInitialPlayerResponse = ")
-        .or_else(|| extract_json_object_after(html, "var ytInitialPlayerResponse = "));
-
-    let Some(json) = json else {
-        warnings.push("YouTube player JSON was not exposed in the page source".to_string());
-        return Ok(());
-    };
-
-    let value: Value = serde_json::from_str(&json).context("Failed to parse youtube player JSON")?;
-    let title = value
-        .pointer("/videoDetails/title")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| extract_page_title(html))
-        .or_else(|| Some(infer_title_from_url(page_url.as_str())));
-
-    if let Some(manifest) = value
-        .pointer("/streamingData/hlsManifestUrl")
-        .and_then(Value::as_str)
-    {
-        collector.push(
-            manifest.to_string(),
-            None,
-            title.clone(),
-            Some("HLS".to_string()),
-            Some("application/vnd.apple.mpegurl".to_string()),
-            None,
-            None,
-            Some("youtube"),
-        );
-    }
-
-    let best_audio = value
-        .pointer("/streamingData/adaptiveFormats")
-        .and_then(Value::as_array)
-        .and_then(|formats| {
-            formats
-                .iter()
-                .filter(|item| {
-                    item.get("mimeType")
-                        .and_then(Value::as_str)
-                        .map(|mime| mime.starts_with("audio/"))
-                        .unwrap_or(false)
-                })
-                .filter_map(|item| {
-                    Some((
-                        item.get("bitrate")?.as_i64().unwrap_or_default(),
-                        item.get("url")?.as_str()?.to_string(),
-                    ))
-                })
-                .max_by_key(|entry| entry.0)
-                .map(|entry| entry.1)
-        });
-
-    let mut saw_cipher_only = false;
-
-    for path in ["/streamingData/formats", "/streamingData/adaptiveFormats"] {
-        if let Some(formats) = value.pointer(path).and_then(Value::as_array) {
-            for item in formats {
-                let mime_type = item.get("mimeType").and_then(Value::as_str).unwrap_or_default();
-                let Some(media_url) = item.get("url").and_then(Value::as_str) else {
-                    if item.get("signatureCipher").is_some() {
-                        saw_cipher_only = true;
-                    }
-                    continue;
-                };
-                let is_video_only = mime_type.starts_with("video/") && path.ends_with("adaptiveFormats");
-                collector.push(
-                    media_url.to_string(),
-                    if is_video_only { best_audio.clone() } else { None },
-                    title.clone(),
-                    item.get("qualityLabel").and_then(Value::as_str).map(str::to_string),
-                    Some(mime_type.to_string()),
-                    item.get("width").and_then(Value::as_i64).map(|value| value as i32),
-                    item.get("height").and_then(Value::as_i64).map(|value| value as i32),
-                    Some("youtube"),
-                );
-            }
-        }
-    }
-
-    if saw_cipher_only {
-        warnings.push("Some YouTube streams require signature resolution and were intentionally skipped".to_string());
-    }
-
-    Ok(())
-}
-
-fn extract_json_object_after(haystack: &str, marker: &str) -> Option<String> {
-    let start = haystack.find(marker)? + marker.len();
-    let remainder = &haystack[start..];
-    let json_start = remainder.find('{')?;
-    let bytes = remainder.as_bytes();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut end_index = None;
-
-    for (offset, byte) in bytes.iter().enumerate().skip(json_start) {
-        let ch = *byte as char;
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end_index = Some(offset + 1);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    end_index.map(|end| remainder[json_start..end].to_string())
-}
-
 async fn download_to_file(
     client: &Client,
     url: &str,
@@ -1579,6 +1347,374 @@ async fn download_to_file(
         .await
         .with_context(|| format!("Failed to write downloaded media: {}", path.display()))?;
     Ok(())
+}
+
+fn prepare_output_path(output: &str) -> Result<(PathBuf, PathBuf)> {
+    let output_path = PathBuf::from(output);
+    let temp_dir = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    if !temp_dir.exists() {
+        std::fs::create_dir_all(&temp_dir)
+            .with_context(|| format!("Failed to create output directory: {}", temp_dir.display()))?;
+    }
+
+    Ok((output_path, temp_dir))
+}
+
+async fn cleanup_temp_files<'a, I>(keep_temp: bool, paths: I)
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    if keep_temp {
+        return;
+    }
+
+    for path in paths {
+        let _ = fs::remove_file(path).await;
+    }
+}
+
+async fn transcode_input_to_output(
+    input_path: &Path,
+    output: &str,
+    video_bitrate: u32,
+    audio_bitrate: u32,
+    reporter: ProgressReporter,
+) -> Result<()> {
+    convert_to_mp4(
+        input_path.to_string_lossy().as_ref(),
+        output,
+        video_bitrate,
+        audio_bitrate,
+        &MultiProgress::new(),
+        select_transcoder_backend().await?,
+        reporter,
+    )
+    .await
+}
+
+fn ensure_output_file_ready(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("Output file not found after download: {}", path.display()))?;
+    if metadata.len() == 0 {
+        bail!("Output file was created but empty: {}", path.display());
+    }
+    Ok(())
+}
+
+async fn download_with_retries(
+    client: &Client,
+    url: &str,
+    path: &Path,
+    retries: u8,
+    progress: f64,
+    reporter: &ProgressReporter,
+    label: &str,
+) -> Result<()> {
+    emit_progress(reporter, label, progress);
+
+    for attempt in 1..=retries {
+        match client.get(url).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    if attempt == retries {
+                        return Err(anyhow!("Failed to download media: HTTP {}", status));
+                    }
+                    let delay = retry_backoff_delay(attempt, Some(status.as_u16()));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                let bytes = response.bytes().await?;
+                fs::write(path, &bytes)
+                    .await
+                    .with_context(|| format!("Failed to write downloaded media: {}", path.display()))?;
+                return Ok(());
+            }
+            Err(error) => {
+                if attempt == retries {
+                    return Err(error).with_context(|| format!("Failed to download media: {}", url));
+                }
+                let delay = retry_backoff_delay(attempt, None);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
+    bail!("Failed to download media after retries: {}", url)
+}
+
+#[derive(Debug, Deserialize)]
+struct DashMpd {
+    #[serde(rename = "BaseURL", default)]
+    base_urls: Vec<String>,
+    #[serde(rename = "Period", default)]
+    periods: Vec<DashPeriod>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashPeriod {
+    #[serde(rename = "AdaptationSet", default)]
+    adaptation_sets: Vec<DashAdaptationSet>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashAdaptationSet {
+    #[serde(rename = "@mimeType")]
+    mime_type: Option<String>,
+    #[serde(rename = "@contentType")]
+    content_type: Option<String>,
+    #[serde(rename = "@lang")]
+    lang: Option<String>,
+    #[serde(rename = "BaseURL", default)]
+    base_urls: Vec<String>,
+    #[serde(rename = "Representation", default)]
+    representations: Vec<DashRepresentation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashRepresentation {
+    #[serde(rename = "@id")]
+    id: Option<String>,
+    #[serde(rename = "@mimeType")]
+    mime_type: Option<String>,
+    #[serde(rename = "@bandwidth")]
+    bandwidth: Option<i64>,
+    #[serde(rename = "@width")]
+    width: Option<i32>,
+    #[serde(rename = "@height")]
+    height: Option<i32>,
+    #[serde(rename = "BaseURL", default)]
+    base_urls: Vec<String>,
+}
+
+struct DashDownloadPlan {
+    video_url: String,
+    audio_url: Option<String>,
+}
+
+#[derive(Clone)]
+struct DashRepresentationCandidate {
+    url: String,
+    bandwidth: i64,
+    width: i32,
+    height: i32,
+}
+
+async fn resolve_dash_download_plan(
+    manifest_url: &str,
+    request_context: &RequestContext,
+) -> Result<DashDownloadPlan> {
+    let manifest_bytes = download_playlist(manifest_url, request_context).await?;
+    let manifest = String::from_utf8(manifest_bytes).context("DASH manifest is not valid UTF-8")?;
+    resolve_dash_download_plan_from_manifest(manifest_url, &manifest)
+}
+
+fn resolve_dash_download_plan_from_manifest(
+    manifest_url: &str,
+    manifest: &str,
+) -> Result<DashDownloadPlan> {
+    let mpd: DashMpd = quick_xml::de::from_str(manifest).context("Failed to parse DASH manifest")?;
+    let manifest_base = Url::parse(manifest_url).context("Invalid DASH manifest URL")?;
+
+    let mut best_video: Option<DashRepresentationCandidate> = None;
+    let mut best_audio: Option<DashRepresentationCandidate> = None;
+
+    for period in &mpd.periods {
+        for adaptation in &period.adaptation_sets {
+            let content_type = adaptation
+                .content_type
+                .as_deref()
+                .or(adaptation.mime_type.as_deref())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            for representation in &adaptation.representations {
+                let representation_type = representation
+                    .mime_type
+                    .as_deref()
+                    .unwrap_or(&content_type)
+                    .to_ascii_lowercase();
+                let Some(url) = resolve_dash_representation_url(
+                    &manifest_base,
+                    &mpd.base_urls,
+                    &adaptation.base_urls,
+                    &representation.base_urls,
+                )
+                else {
+                    continue;
+                };
+
+                let candidate = DashRepresentationCandidate {
+                    url,
+                    bandwidth: representation.bandwidth.unwrap_or_default(),
+                    width: representation.width.unwrap_or_default(),
+                    height: representation.height.unwrap_or_default(),
+                };
+
+                if representation_type.starts_with("video/") || content_type.starts_with("video") {
+                    let replace = best_video.as_ref().map(|current| {
+                        (candidate.height, candidate.width, candidate.bandwidth)
+                            > (current.height, current.width, current.bandwidth)
+                    }).unwrap_or(true);
+                    if replace {
+                        best_video = Some(candidate);
+                    }
+                } else if representation_type.starts_with("audio/") || content_type.starts_with("audio") {
+                    let replace = best_audio
+                        .as_ref()
+                        .map(|current| candidate.bandwidth > current.bandwidth)
+                        .unwrap_or(true);
+                    if replace {
+                        best_audio = Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    let video_url = best_video
+        .map(|candidate| candidate.url)
+        .ok_or_else(|| anyhow!("DASH manifest did not expose a reusable video representation"))?;
+
+    Ok(DashDownloadPlan {
+        video_url,
+        audio_url: best_audio.map(|candidate| candidate.url),
+    })
+}
+
+fn resolve_dash_representation_url(
+    manifest_base: &Url,
+    mpd_base_urls: &[String],
+    adaptation_base_urls: &[String],
+    representation_base_urls: &[String],
+) -> Option<String> {
+    representation_base_urls
+        .iter()
+        .find_map(|base| join_manifest_url(manifest_base, mpd_base_urls, adaptation_base_urls, base))
+        .or_else(|| {
+            adaptation_base_urls
+                .iter()
+                .find_map(|base| join_manifest_url(manifest_base, mpd_base_urls, &[], base))
+        })
+}
+
+fn join_manifest_url(
+    manifest_base: &Url,
+    mpd_base_urls: &[String],
+    adaptation_base_urls: &[String],
+    leaf: &str,
+) -> Option<String> {
+    let mut current = manifest_base.clone();
+
+    for base in mpd_base_urls {
+        current = current.join(base).ok()?;
+    }
+    for base in adaptation_base_urls {
+        current = current.join(base).ok()?;
+    }
+
+    current.join(leaf).ok().map(|url| url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_dash_download_plan_from_manifest, should_auto_inspect_download_target};
+
+    #[test]
+    fn resolves_dash_download_plan_from_youtube_style_manifest() {
+        let manifest = r#"
+<MPD>
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="135" bandwidth="800000" width="854" height="480">
+        <BaseURL>https://video.example/480.mp4</BaseURL>
+      </Representation>
+      <Representation id="137" bandwidth="2500000" width="1920" height="1080">
+        <BaseURL>https://video.example/1080.mp4</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4">
+      <Representation id="140" bandwidth="128000">
+        <BaseURL>https://audio.example/128.m4a</BaseURL>
+      </Representation>
+      <Representation id="141" bandwidth="256000">
+        <BaseURL>https://audio.example/256.m4a</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#;
+
+        let plan = resolve_dash_download_plan_from_manifest(
+            "https://manifest.example/video.mpd",
+            manifest,
+        )
+        .expect("dash plan should resolve");
+
+        assert_eq!(plan.video_url, "https://video.example/1080.mp4");
+        assert_eq!(plan.audio_url.as_deref(), Some("https://audio.example/256.m4a"));
+    }
+
+    #[test]
+    fn resolves_dash_relative_base_urls() {
+        let manifest = r#"
+<MPD>
+  <BaseURL>media/</BaseURL>
+  <Period>
+    <AdaptationSet contentType="video">
+      <BaseURL>video/</BaseURL>
+      <Representation id="v1" bandwidth="900000" width="1280" height="720">
+        <BaseURL>stream.mp4</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio">
+      <BaseURL>audio/</BaseURL>
+      <Representation id="a1" bandwidth="128000">
+        <BaseURL>track.m4a</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#;
+
+        let plan = resolve_dash_download_plan_from_manifest(
+            "https://manifest.example/root/index.mpd",
+            manifest,
+        )
+        .expect("relative dash plan should resolve");
+
+        assert_eq!(plan.video_url, "https://manifest.example/root/media/video/stream.mp4");
+        assert_eq!(plan.audio_url.as_deref(), Some("https://manifest.example/root/media/audio/track.m4a"));
+    }
+
+    #[test]
+    fn auto_inspects_plain_page_urls_before_download() {
+        assert!(should_auto_inspect_download_target(
+            "https://youtu.be/H3R9dQHhQXs",
+            "https://youtu.be/H3R9dQHhQXs",
+            None,
+        ));
+        assert!(!should_auto_inspect_download_target(
+            "https://cdn.example/video.m3u8",
+            "https://cdn.example/video.m3u8",
+            None,
+        ));
+        assert!(!should_auto_inspect_download_target(
+            "https://example.com/watch",
+            "https://cdn.example/video.mp4",
+            None,
+        ));
+        assert!(!should_auto_inspect_download_target(
+            "https://example.com/watch",
+            "https://cdn.example/video.mp4",
+            Some("https://cdn.example/audio.m4a"),
+        ));
+    }
 }
 
 async fn merge_media_streams(
@@ -1680,69 +1816,90 @@ fn detect_access_challenge(status: u16, body: &str) -> Option<String> {
 }
 
 async fn score_candidates(
-    mut candidates: Vec<MediaCandidate>,
+    candidates: Vec<MediaCandidate>,
     request_context: &RequestContext,
 ) -> Vec<MediaCandidate> {
-    for candidate in &mut candidates {
-        let mut score = 0;
-        let mut reasons = Vec::new();
-        let lower_url = candidate.media_url.to_ascii_lowercase();
-        let lower_quality = candidate.quality_label.to_ascii_lowercase();
-
-        if candidate.protocol == "hls" {
-            score += 300;
-            reasons.push("hls".to_string());
-            if let Ok((segments, duration)) = inspect_hls_metadata(&candidate.media_url, request_context).await {
-                candidate.segment_count = segments as i32;
-                candidate.duration_seconds = duration;
-                score += (duration.min(7200.0) / 6.0) as i32;
-                score += (segments.min(2000) / 4) as i32;
-                if duration >= 60.0 {
-                    reasons.push(format!("{:.0}s", duration));
-                }
-            }
-        }
-
-        if candidate.protocol == "progressive" {
-            score += 120;
-            reasons.push("direct".to_string());
-        }
-        if candidate.audio_url.is_some() {
-            score += 80;
-            reasons.push("audio+video".to_string());
-        }
-        if candidate.height > 0 {
-            score += candidate.height.min(2160) / 3;
-            reasons.push(format!("{}p", candidate.height));
-        }
-        if candidate.width > 0 {
-            score += candidate.width.min(3840) / 24;
-        }
-        if lower_quality.contains("1080") || lower_quality.contains("720") || lower_quality.contains("高") {
-            score += 120;
-        }
-        for marker in ["preview", "试看", "trial", "sample", "ad", "ads", "promo", "trailer", "thumb", "sprite", "teaser"] {
-            if lower_url.contains(marker) || lower_quality.contains(marker) {
-                score -= 500;
-                reasons.push(format!("deprioritized:{}", marker));
-            }
-        }
-        if lower_url.contains("master") || lower_url.contains("index") || lower_url.contains("playlist") {
-            score += 40;
-        }
-        candidate.score = score;
-        candidate.reason = if reasons.is_empty() { "ranked by available metadata".to_string() } else { reasons.join(", ") };
-    }
+    let request_context = request_context.clone();
+    let mut candidates = stream::iter(candidates.into_iter().map(|candidate| {
+        let request_context = request_context.clone();
+        async move { score_candidate(candidate, &request_context).await }
+    }))
+    .buffer_unordered(6)
+    .collect::<Vec<_>>()
+    .await;
 
     candidates.sort_by(|left, right| {
         let left_score = (left.score, left.height.max(0), left.duration_seconds as i64, left.segment_count);
         let right_score = (right.score, right.height.max(0), right.duration_seconds as i64, right.segment_count);
         right_score.cmp(&left_score)
     });
+    for candidate in &mut candidates {
+        candidate.primary = false;
+    }
     if let Some(first) = candidates.first_mut() {
         first.primary = true;
     }
     candidates
+}
+
+async fn score_candidate(
+    mut candidate: MediaCandidate,
+    request_context: &RequestContext,
+) -> MediaCandidate {
+    let mut score = 0;
+    let mut reasons = Vec::new();
+    let lower_url = candidate.media_url.to_ascii_lowercase();
+    let lower_quality = candidate.quality_label.to_ascii_lowercase();
+
+    if candidate.protocol == "hls" {
+        score += 300;
+        reasons.push("hls".to_string());
+        if let Ok((segments, duration)) = inspect_hls_metadata(&candidate.media_url, request_context).await {
+            candidate.segment_count = segments as i32;
+            candidate.duration_seconds = duration;
+            score += (duration.min(7200.0) / 6.0) as i32;
+            score += (segments.min(2000) / 4) as i32;
+            if duration >= 60.0 {
+                reasons.push(format!("{:.0}s", duration));
+            }
+        }
+    }
+
+    if candidate.protocol == "progressive" {
+        score += 120;
+        reasons.push("direct".to_string());
+    }
+    if candidate.audio_url.is_some() {
+        score += 80;
+        reasons.push("audio+video".to_string());
+    }
+    if candidate.height > 0 {
+        score += candidate.height.min(2160) / 3;
+        reasons.push(format!("{}p", candidate.height));
+    }
+    if candidate.width > 0 {
+        score += candidate.width.min(3840) / 24;
+    }
+    if lower_quality.contains("1080") || lower_quality.contains("720") || lower_quality.contains("高") {
+        score += 120;
+    }
+    for marker in ["preview", "试看", "trial", "sample", "ad", "ads", "promo", "trailer", "thumb", "sprite", "teaser"] {
+        if lower_url.contains(marker) || lower_quality.contains(marker) {
+            score -= 500;
+            reasons.push(format!("deprioritized:{}", marker));
+        }
+    }
+    if lower_url.contains("master") || lower_url.contains("index") || lower_url.contains("playlist") {
+        score += 40;
+    }
+
+    candidate.score = score;
+    candidate.reason = if reasons.is_empty() {
+        "ranked by available metadata".to_string()
+    } else {
+        reasons.join(", ")
+    };
+    candidate
 }
 
 fn retry_backoff_delay(attempt: u8, status: Option<u16>) -> Duration {
@@ -1836,6 +1993,11 @@ async fn check_ffmpeg() -> bool {
 }
 
 async fn select_transcoder_backend() -> Result<TranscoderKind> {
+    #[cfg(target_os = "android")]
+    if ANDROID_HW_TRANSCODER.get().is_some() {
+        return Ok(TranscoderKind::AndroidHardware);
+    }
+
     if check_ffmpeg().await {
         let accel = detect_acceleration().await.unwrap_or(AccelType::CPU);
         return Ok(TranscoderKind::Ffmpeg(accel));
@@ -1858,6 +2020,62 @@ async fn select_transcoder_backend() -> Result<TranscoderKind> {
 }
 
 async fn download_and_merge(
+    playlist: m3u8_rs::MediaPlaylist,
+    base_url: Option<Url>,
+    concurrency: usize,
+    retries: u8,
+    output_file: &str,
+    temp_dir: &Path,
+    multi_progress: &MultiProgress,
+    reporter: ProgressReporter,
+    request_context: RequestContext,
+) -> Result<()> {
+    if concurrency > 1 {
+        match download_and_merge_once(
+            playlist.clone(),
+            base_url.clone(),
+            concurrency,
+            retries,
+            output_file,
+            temp_dir,
+            multi_progress,
+            reporter.clone(),
+            request_context.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!(
+                    "Multi-thread segment download failed with concurrency {}. Retrying single-threaded: {}",
+                    concurrency,
+                    error
+                );
+                cleanup_segment_temp_files(temp_dir, playlist.segments.len(), output_file).await;
+                emit_progress(
+                    &reporter,
+                    "Multi-thread download failed. Retrying in single-thread mode...",
+                    0.12,
+                );
+            }
+        }
+    }
+
+    download_and_merge_once(
+        playlist,
+        base_url,
+        1,
+        retries,
+        output_file,
+        temp_dir,
+        multi_progress,
+        reporter,
+        request_context,
+    )
+    .await
+}
+
+async fn download_and_merge_once(
     playlist: m3u8_rs::MediaPlaylist,
     base_url: Option<Url>,
     concurrency: usize,
@@ -2054,6 +2272,14 @@ async fn download_and_merge(
 
     merge_pb.finish_with_message("Merge complete");
     Ok(())
+}
+
+async fn cleanup_segment_temp_files(temp_dir: &Path, total: usize, output_file: &str) {
+    for index in 0..total {
+        let file_name = format!("seg_{:05}.ts", index);
+        let _ = fs::remove_file(temp_dir.join(file_name)).await;
+    }
+    let _ = fs::remove_file(output_file).await;
 }
 
 fn create_http_client() -> Result<Client> {
