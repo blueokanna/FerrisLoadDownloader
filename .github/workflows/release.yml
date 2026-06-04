@@ -100,7 +100,7 @@ jobs:
             -t x86_64 \
             -t x86 \
             -o ../android/app/src/main/jniLibs \
-            build --release --locked
+              build --release --locked --lib
 
       - name: Build split APKs
         run: flutter build apk --release --split-per-abi
