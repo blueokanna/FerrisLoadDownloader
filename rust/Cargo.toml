@@ -21,6 +21,7 @@ hex = "0.4.3"
 indicatif = "0.18.3"
 jni = "0.21.1"
 log = "0.4.28"
+env_logger = "0.11.8"
 
 m3u8-rs = "6.0.0"
 regex = "1.12.2"
@@ -38,9 +39,6 @@ quick-xml = { version = "0.38.4", features = ["serialize"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15.1"
-
-[target.'cfg(not(target_os = "android"))'.dependencies]
-env_logger = "0.11.8"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
