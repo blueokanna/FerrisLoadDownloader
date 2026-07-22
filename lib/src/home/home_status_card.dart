@@ -176,15 +176,11 @@ class HomeStatusCard extends StatelessWidget {
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(20),
-              gradient: LinearGradient(
-                colors: [
-                  cs.surfaceContainerHigh.withValues(alpha: 0.74),
-                  cs.surface.withValues(alpha: 0.94),
-                ],
+              borderRadius: BorderRadius.circular(8),
+              color: cs.surfaceContainerHigh,
+              border: Border.all(
+                color: cs.outlineVariant.withValues(alpha: 0.55),
               ),
-              border:
-                  Border.all(color: cs.outlineVariant.withValues(alpha: 0.18)),
             ),
             child: Row(
               children: [
@@ -207,13 +203,6 @@ class HomeStatusCard extends StatelessWidget {
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           color: _stageTone(cs),
-                          boxShadow: [
-                            BoxShadow(
-                              color: _stageTone(cs).withValues(alpha: 0.32),
-                              blurRadius: running || analyzing ? 20 : 10,
-                              spreadRadius: running || analyzing ? 1 : 0,
-                            ),
-                          ],
                         ),
                         child: Stack(
                           alignment: Alignment.center,
@@ -260,10 +249,7 @@ class HomeStatusCard extends StatelessWidget {
                     ),
                   ),
                 ),
-                StatusBadge(
-                  label: _stageLabel(l),
-                  color: _stageTone(cs),
-                ),
+                StatusBadge(label: _stageLabel(l), color: _stageTone(cs)),
               ],
             ),
           ),
@@ -336,13 +322,14 @@ class HomeStatusCard extends StatelessWidget {
             child: recoveryMessage == null
                 ? const SizedBox.shrink()
                 : Container(
-                    key:
-                        ValueKey('recovery-$recoveryRevision-$recoveryMessage'),
+                    key: ValueKey(
+                      'recovery-$recoveryRevision-$recoveryMessage',
+                    ),
                     width: double.infinity,
                     margin: const EdgeInsets.only(top: 14),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(18),
+                      borderRadius: BorderRadius.circular(8),
                       color: cs.tertiaryContainer.withValues(alpha: 0.72),
                     ),
                     child: Column(
@@ -367,21 +354,9 @@ class HomeStatusCard extends StatelessWidget {
                   ),
           ),
           const SizedBox(height: 16),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(999),
-            child: TweenAnimationBuilder<double?>(
-              tween: Tween<double?>(
-                begin: 0,
-                end: (running || analyzing)
-                    ? (progress > 0 ? progress : null)
-                    : progress.clamp(0.0, 1.0),
-              ),
-              duration: FerrisMotion.medium,
-              curve: FerrisMotion.emphasized,
-              builder: (context, value, _) {
-                return LinearProgressIndicator(minHeight: 8, value: value);
-              },
-            ),
+          SmoothLinearProgressIndicator(
+            minHeight: 8,
+            value: (running || analyzing) && progress <= 0 ? null : progress,
           ),
           const SizedBox(height: 16),
           Wrap(
@@ -432,15 +407,8 @@ class HomeStatusCard extends StatelessWidget {
                     margin: const EdgeInsets.only(top: 14),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(18),
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [
-                          cs.errorContainer,
-                          cs.error.withValues(alpha: 0.92),
-                        ],
-                      ),
+                      borderRadius: BorderRadius.circular(8),
+                      color: cs.errorContainer,
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -543,8 +511,9 @@ class _WorkflowPhasePill extends StatelessWidget {
     final t = Theme.of(context);
     final cs = t.colorScheme;
     final background = switch (state) {
-      _WorkflowPhaseState.idle =>
-        cs.surfaceContainerHigh.withValues(alpha: 0.48),
+      _WorkflowPhaseState.idle => cs.surfaceContainerHigh.withValues(
+          alpha: 0.48,
+        ),
       _WorkflowPhaseState.active => cs.primaryContainer,
       _WorkflowPhaseState.completed => cs.secondaryContainer,
     };

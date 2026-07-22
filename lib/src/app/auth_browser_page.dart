@@ -161,7 +161,8 @@ class _AuthBrowserPageState extends State<AuthBrowserPage> {
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(3),
           child: _loading
-              ? LinearProgressIndicator(value: _progress > 0 && _progress < 1 ? _progress : null)
+              ? LinearProgressIndicator(
+                  value: _progress > 0 && _progress < 1 ? _progress : null)
               : const SizedBox(height: 3),
         ),
       ),
@@ -213,7 +214,8 @@ class _AuthBrowserPageState extends State<AuthBrowserPage> {
                   icon: const Icon(Icons.arrow_back_rounded),
                 ),
                 IconButton(
-                  onPressed: _canGoForward ? () => _controller?.goForward() : null,
+                  onPressed:
+                      _canGoForward ? () => _controller?.goForward() : null,
                   icon: const Icon(Icons.arrow_forward_rounded),
                 ),
                 IconButton(
@@ -289,7 +291,8 @@ class _AuthBrowserPageState extends State<AuthBrowserPage> {
                   Expanded(
                     child: OutlinedButton(
                       onPressed: () => Navigator.of(context).maybePop(),
-                      child: Text(MaterialLocalizations.of(context).cancelButtonLabel),
+                      child: Text(
+                          MaterialLocalizations.of(context).cancelButtonLabel),
                     ),
                   ),
                   const SizedBox(width: 12),

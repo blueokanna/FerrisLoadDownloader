@@ -9,6 +9,13 @@ set(BINARY_NAME "m3u8_downloader")
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
 cmake_policy(VERSION 3.14...3.25)
+if(POLICY CMP0175)
+  # flutter_inappwebview_windows still uses TARGET + DEPENDS in a custom command.
+  cmake_policy(SET CMP0175 OLD)
+  # The plugin starts its own policy scope, so provide the same compatibility
+  # default to subprojects until the upstream custom command is modernized.
+  set(CMAKE_POLICY_DEFAULT_CMP0175 OLD)
+endif()
 
 # Define build configuration option.
 get_property(IS_MULTICONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -31,6 +38,13 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
+
+# Flutter plugins are compiled in parallel by Visual Studio and several of
+# them otherwise write to the same compiler PDB concurrently. /FS serializes
+# those writes and prevents intermittent C1041 failures in plugin builds.
+if(MSVC)
+  add_compile_options(/FS)
+endif()
 
 # Compilation settings that should be applied to most targets.
 #

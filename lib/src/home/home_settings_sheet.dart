@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
 import 'package:m3u8_downloader/src/app/app_settings.dart';
 import 'package:m3u8_downloader/src/app/app_theme.dart';
+import 'package:m3u8_downloader/src/app/runtime_capabilities.dart';
 import 'package:m3u8_downloader/src/home/auth_context_editor.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
 import 'package:m3u8_downloader/src/rust/api/downloader.dart';
@@ -46,6 +47,8 @@ class HomeSettingsSheet extends StatefulWidget {
 
 class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
   late AppSettings _draft = widget.settings;
+  late final Future<PlatformCapabilitySnapshot> _capabilities =
+      RuntimeCapabilityProbe.inspect();
 
   void _updateDraft(AppSettings next) {
     setState(() => _draft = next);
@@ -90,7 +93,12 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
             ),
             const SizedBox(height: 18),
             RevealMotion(
-              delay: const Duration(milliseconds: 120),
+              delay: const Duration(milliseconds: 110),
+              child: RuntimeCapabilitiesPanel(capabilities: _capabilities),
+            ),
+            const SizedBox(height: 18),
+            RevealMotion(
+              delay: const Duration(milliseconds: 140),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -104,7 +112,7 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
                     curve: Curves.easeOutCubic,
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(24),
+                      borderRadius: BorderRadius.circular(8),
                       color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
                     ),
                     child: SegmentedButton<ThemeMode>(
@@ -150,7 +158,7 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
                   ),
                   const SizedBox(height: 10),
                   SizedBox(
-                    height: 142,
+                    height: 172,
                     child: ListView.separated(
                       scrollDirection: Axis.horizontal,
                       itemCount: appThemeProfiles.length,
@@ -202,7 +210,7 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
                 curve: Curves.easeOutCubic,
                 padding: const EdgeInsets.all(18),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(24),
+                  borderRadius: BorderRadius.circular(8),
                   color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
                 ),
                 child: Column(

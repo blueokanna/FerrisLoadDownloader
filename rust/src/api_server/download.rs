@@ -16,13 +16,19 @@ pub async fn run_download_task(task_id: String, req: DownloadRequest, tasks: Tas
     }
 }
 
-async fn execute_download_task(task_id: &str, req: &DownloadRequest, tasks: &TaskStore) -> Result<()> {
+async fn execute_download_task(
+    task_id: &str,
+    req: &DownloadRequest,
+    tasks: &TaskStore,
+) -> Result<()> {
     tasks.update_progress(task_id, "running", "Inspecting source...", Some(1.0), None);
 
     let request_context: RequestContext = req.request_context.clone().unwrap_or_default().into();
-    let (page_url, media_url, audio_url, inferred_name) = resolve_media(req, &request_context).await?;
+    let (page_url, media_url, audio_url, inferred_name) =
+        resolve_media(req, &request_context).await?;
     let file_name = normalized_output_name(req.output_filename.as_deref(), &inferred_name);
-    let download_dir = std::env::var("DOWNLOAD_DIR").unwrap_or_else(|_| "/app/downloads".to_string());
+    let download_dir =
+        std::env::var("DOWNLOAD_DIR").unwrap_or_else(|_| "/app/downloads".to_string());
     let output_path = build_output_path(&download_dir, &file_name)?;
     let output_path_string = output_path.to_string_lossy().to_string();
 
@@ -120,8 +126,12 @@ async fn resolve_media(
 
 fn build_output_path(download_dir: &str, file_name: &str) -> Result<PathBuf> {
     let directory = Path::new(download_dir);
-    std::fs::create_dir_all(directory)
-        .with_context(|| format!("Failed to create download directory: {}", directory.display()))?;
+    std::fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "Failed to create download directory: {}",
+            directory.display()
+        )
+    })?;
     Ok(directory.join(file_name))
 }
 

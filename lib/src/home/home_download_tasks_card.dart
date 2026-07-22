@@ -4,10 +4,7 @@ import 'package:m3u8_downloader/src/home/home_page_controller.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
 
 class HomeDownloadTasksCard extends StatelessWidget {
-  const HomeDownloadTasksCard({
-    super.key,
-    required this.tasks,
-  });
+  const HomeDownloadTasksCard({super.key, required this.tasks});
 
   final List<HomeDownloadTask> tasks;
 
@@ -29,7 +26,8 @@ class HomeDownloadTasksCard extends StatelessWidget {
             ? _EmptyDownloadTasks(key: const ValueKey('empty-download-tasks'))
             : Column(
                 key: ValueKey(
-                    'download-tasks-${tasks.length}-${tasks.first.id}'),
+                  'download-tasks-${tasks.length}-${tasks.first.id}',
+                ),
                 children: [
                   for (final entry in tasks.indexed)
                     Padding(
@@ -61,14 +59,12 @@ class _EmptyDownloadTasks extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(8),
         color: cs.surfaceContainerHigh.withValues(alpha: 0.48),
       ),
       child: Text(
         l.text('no_active_downloads'),
-        style: t.textTheme.bodyMedium?.copyWith(
-          color: cs.onSurfaceVariant,
-        ),
+        style: t.textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
       ),
     );
   }
@@ -100,7 +96,7 @@ class _DownloadTaskTile extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(8),
         color: tone,
         border: Border.all(color: foreground.withValues(alpha: 0.08)),
       ),
@@ -109,11 +105,7 @@ class _DownloadTaskTile extends StatelessWidget {
         children: [
           Row(
             children: [
-              StatusPulseDot(
-                active: task.running,
-                color: foreground,
-                size: 10,
-              ),
+              StatusPulseDot(active: task.running, color: foreground, size: 10),
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
@@ -136,14 +128,10 @@ class _DownloadTaskTile extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 10),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(999),
-            child: LinearProgressIndicator(
-              minHeight: 6,
-              value:
-                  task.running ? task.progress.clamp(0.0, 1.0) : task.progress,
-              backgroundColor: foreground.withValues(alpha: 0.16),
-            ),
+          SmoothLinearProgressIndicator(
+            value: task.progress,
+            color: foreground,
+            backgroundColor: foreground.withValues(alpha: 0.16),
           ),
           const SizedBox(height: 10),
           Text(
@@ -155,6 +143,33 @@ class _DownloadTaskTile extends StatelessWidget {
               height: 1.35,
             ),
           ),
+          if (task.backend != null) ...[
+            const SizedBox(height: 8),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  task.backend == 'yt-dlp'
+                      ? Icons.hub_rounded
+                      : Icons.memory_rounded,
+                  size: 16,
+                  color: foreground,
+                ),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    task.backend!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: t.textTheme.labelMedium?.copyWith(
+                      color: foreground,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
           const SizedBox(height: 6),
           Text(
             task.resultPath ?? task.sourcePage,

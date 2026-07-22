@@ -74,7 +74,10 @@ mod tests {
             .expect("fixture inspection should succeed");
         (
             collector.finish(),
-            warnings.into_iter().map(SiteWarning::into_display).collect(),
+            warnings
+                .into_iter()
+                .map(SiteWarning::into_display)
+                .collect(),
         )
     }
 
@@ -218,7 +221,8 @@ mod tests {
     #[test]
     fn bilibili_json_parse_fixture_supports_flac_audio_and_progressive() {
         let html = include_str!("fixtures/bilibili_json_parse.html");
-        let (candidates, warnings) = inspect_fixture("https://www.bilibili.com/video/BV1parse", html);
+        let (candidates, warnings) =
+            inspect_fixture("https://www.bilibili.com/video/BV1parse", html);
 
         assert!(warnings.is_empty());
         assert!(candidates.iter().any(|candidate| {
@@ -256,7 +260,8 @@ mod tests {
         assert!(warnings.is_empty());
         assert!(candidates.iter().any(|candidate| {
             candidate.extractor == "bilibili"
-                && candidate.audio_url.as_deref() == Some("https://collection.example/audio-128.m4a")
+                && candidate.audio_url.as_deref()
+                    == Some("https://collection.example/audio-128.m4a")
                 && candidate.title == "Fixture Collection · Part 03"
                 && candidate.height == 720
         }));

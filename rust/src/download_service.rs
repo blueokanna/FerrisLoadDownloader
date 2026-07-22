@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::api::downloader::{
-    self, ProgressUpdate, RequestContext,
-};
+use crate::api::downloader::{self, ProgressUpdate, RequestContext};
 
 pub type DownloadProgressHandler = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 

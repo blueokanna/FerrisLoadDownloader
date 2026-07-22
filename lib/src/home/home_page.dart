@@ -14,6 +14,7 @@ import 'package:m3u8_downloader/src/home/home_input_card.dart';
 import 'package:m3u8_downloader/src/home/home_settings_sheet.dart';
 import 'package:m3u8_downloader/src/home/home_status_card.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
+import 'package:m3u8_downloader/src/home/source_input.dart';
 import 'package:m3u8_downloader/src/rust/api/downloader.dart';
 
 class HomePage extends StatefulWidget {
@@ -222,7 +223,8 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     final l = AppLocalizations.of(context);
-    final targetUrl = _urlCtrl.text.trim();
+    final targetUrl = extractSourceUrl(_urlCtrl.text)!;
+    _replaceSourceText(targetUrl);
     if (targetUrl.isEmpty) {
       _pageController.setError(l.text('input_source'));
       return;
@@ -285,6 +287,9 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) {
         return;
       }
+      if (inspection.pageUrl.isNotEmpty) {
+        _replaceSourceText(inspection.pageUrl);
+      }
       final selectedCandidate =
           inspection.candidates.isNotEmpty ? inspection.candidates.first : null;
       _pageController.completeAnalyze(
@@ -335,7 +340,8 @@ class _HomePageState extends State<HomePage> {
     var shouldAutoOpenAuthBrowser = false;
 
     var vm = _pageController.value;
-    final enteredUrl = _urlCtrl.text.trim();
+    final enteredUrl = extractSourceUrl(_urlCtrl.text)!;
+    _replaceSourceText(enteredUrl);
     final selectedCandidate = vm.selectedCandidate;
     final candidateMatchesInput = selectedCandidate != null &&
         (selectedCandidate.pageUrl == enteredUrl ||
@@ -381,7 +387,10 @@ class _HomePageState extends State<HomePage> {
           return;
         }
         _pageController.updateDownloadTask(
-            taskId, event.message, event.progress);
+          taskId,
+          event.message,
+          event.progress,
+        );
         await MediaStoreBridge.updateForegroundProgress(
           (event.progress * 100).round(),
           event.message,
@@ -412,8 +421,10 @@ class _HomePageState extends State<HomePage> {
             fileName,
           );
         } else {
-          savedPath =
-              await MediaStoreBridge.saveViaMediaStore(output, fileName);
+          savedPath = await MediaStoreBridge.saveViaMediaStore(
+            output,
+            fileName,
+          );
         }
         if (savedPath == null) {
           _pageController.failDownloadTask(
@@ -492,6 +503,16 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  void _replaceSourceText(String source) {
+    if (_urlCtrl.text == source) {
+      return;
+    }
+    _urlCtrl.value = TextEditingValue(
+      text: source,
+      selection: TextSelection.collapsed(offset: source.length),
+    );
+  }
+
   Future<void> _retryCurrentAction(HomeRetryAction action) async {
     switch (action) {
       case HomeRetryAction.none:
@@ -538,20 +559,8 @@ class _HomePageState extends State<HomePage> {
               ),
             ],
           ),
-          body: DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  Theme.of(context).brightness == Brightness.light
-                      ? widget.settings.themeProfile.canvasLight
-                      : cs.surfaceContainerLow,
-                  cs.surface,
-                  cs.surfaceContainerLowest,
-                ],
-              ),
-            ),
+          body: ColoredBox(
+            color: cs.surface,
             child: SafeArea(
               child: LayoutBuilder(
                 builder: (context, constraints) {
@@ -567,8 +576,12 @@ class _HomePageState extends State<HomePage> {
                               context,
                               vm: vm,
                               scrollable: true,
-                              padding:
-                                  const EdgeInsets.fromLTRB(16, 10, 16, 28),
+                              padding: const EdgeInsets.fromLTRB(
+                                16,
+                                10,
+                                16,
+                                28,
+                              ),
                             ),
                           ),
                         ),

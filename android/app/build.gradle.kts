@@ -1,7 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+val keystoreProperties = Properties()
+val keystorePropertiesFile = rootProject.file("key.properties")
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.inputStream().use(keystoreProperties::load)
 }
 
 android {
@@ -35,16 +43,24 @@ android {
         versionName = flutter.versionName
 
         ndk {
-            // Filter ABIs to match installed Rust targets
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            // Flutter supports ARMv7, ARM64, and x86_64 on current Android releases.
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            keyAlias = keystoreProperties["keyAlias"] as String?
+            keyPassword = keystoreProperties["keyPassword"] as String?
+            storeFile =
+                (keystoreProperties["storeFile"] as String?)?.let(rootProject::file)
+            storePassword = keystoreProperties["storePassword"] as String?
         }
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.findByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             
             // Keep MediaTranscoder class from being stripped by R8
             proguardFiles(

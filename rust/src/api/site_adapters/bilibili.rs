@@ -94,8 +94,14 @@ pub(crate) fn extract_bilibili_candidates(
                                 .or_else(|| video.get("mime_type"))
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
-                            video.get("width").and_then(Value::as_i64).map(|value| value as i32),
-                            video.get("height").and_then(Value::as_i64).map(|value| value as i32),
+                            video
+                                .get("width")
+                                .and_then(Value::as_i64)
+                                .map(|value| value as i32),
+                            video
+                                .get("height")
+                                .and_then(Value::as_i64)
+                                .map(|value| value as i32),
                             Some("bilibili"),
                         );
                     }
@@ -112,8 +118,14 @@ pub(crate) fn extract_bilibili_candidates(
                         .or_else(|| video.get("mime_type"))
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    video.get("width").and_then(Value::as_i64).map(|value| value as i32),
-                    video.get("height").and_then(Value::as_i64).map(|value| value as i32),
+                    video
+                        .get("width")
+                        .and_then(Value::as_i64)
+                        .map(|value| value as i32),
+                    video
+                        .get("height")
+                        .and_then(Value::as_i64)
+                        .map(|value| value as i32),
                     Some("bilibili"),
                 );
             }
@@ -156,16 +168,10 @@ fn extract_bilibili_title(html: &str) -> Option<String> {
         );
         let episode_from_list = extract_bilibili_episode_from_lists(&value);
         let page_part = extract_bilibili_current_page_part(&value);
-        let episode_title = first_string_pointer(
-            &value,
-            &[
-                "/epInfo/title",
-                "/videoData/title",
-                "/h1Title",
-            ],
-        )
-        .or(episode_from_list)
-        .or(page_part);
+        let episode_title =
+            first_string_pointer(&value, &["/epInfo/title", "/videoData/title", "/h1Title"])
+                .or(episode_from_list)
+                .or(page_part);
         let episode_subtitle = first_string_pointer(
             &value,
             &[
@@ -247,17 +253,27 @@ fn collect_bilibili_audio_tracks(value: &Value) -> Vec<BilibiliAudioTrack> {
             let Some(media_url) = first_media_url(audio) else {
                 continue;
             };
-            if tracks.iter().any(|track: &BilibiliAudioTrack| track.url == media_url) {
+            if tracks
+                .iter()
+                .any(|track: &BilibiliAudioTrack| track.url == media_url)
+            {
                 continue;
             }
 
             tracks.push(BilibiliAudioTrack {
                 url: media_url,
-                label: first_string_pointer(audio, &["/lang_text", "/lang", "/codecs"])
-                    .or_else(|| {
-                        audio.get("id").and_then(Value::as_i64).map(|id| format!("Audio {}", id))
-                    }),
-                bandwidth: audio.get("bandwidth").and_then(Value::as_i64).unwrap_or_default(),
+                label: first_string_pointer(audio, &["/lang_text", "/lang", "/codecs"]).or_else(
+                    || {
+                        audio
+                            .get("id")
+                            .and_then(Value::as_i64)
+                            .map(|id| format!("Audio {}", id))
+                    },
+                ),
+                bandwidth: audio
+                    .get("bandwidth")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
             });
         }
     }
@@ -307,15 +323,8 @@ fn extract_bilibili_episode_from_lists(value: &Value) -> Option<String> {
 }
 
 fn extract_bilibili_current_page_part(value: &Value) -> Option<String> {
-    let current_page = first_i64_pointer(
-        value,
-        &[
-            "/videoData/p",
-            "/p",
-            "/page/p",
-            "/pageData/page",
-        ],
-    )?;
+    let current_page =
+        first_i64_pointer(value, &["/videoData/p", "/p", "/page/p", "/pageData/page"])?;
     let pages = first_array_pointer(value, &["/videoData/pages", "/pages"])?;
 
     for page in pages {
@@ -437,7 +446,10 @@ fn push_unique_segment(segments: &mut Vec<String>, value: Option<&str>) {
         return;
     };
 
-    if segments.iter().any(|segment| segment == value || segment.contains(value) || value.contains(segment)) {
+    if segments
+        .iter()
+        .any(|segment| segment == value || segment.contains(value) || value.contains(segment))
+    {
         return;
     }
 

@@ -59,7 +59,7 @@ class HomeCandidatesCard extends StatelessWidget {
                 width: double.infinity,
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(20),
+                  borderRadius: BorderRadius.circular(8),
                   color: cs.errorContainer,
                 ),
                 child: Column(
@@ -112,14 +112,10 @@ class HomeCandidatesCard extends StatelessWidget {
                     margin: const EdgeInsets.only(bottom: 14),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(22),
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [
-                          cs.primaryContainer,
-                          cs.tertiaryContainer,
-                        ],
+                      borderRadius: BorderRadius.circular(8),
+                      color: cs.primaryContainer,
+                      border: Border.all(
+                        color: cs.primary.withValues(alpha: 0.35),
                       ),
                     ),
                     child: Column(
@@ -177,7 +173,7 @@ class HomeCandidatesCard extends StatelessWidget {
                     width: double.infinity,
                     padding: const EdgeInsets.all(20),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(22),
+                      borderRadius: BorderRadius.circular(8),
                       color: cs.surfaceContainerHigh.withValues(alpha: 0.55),
                     ),
                     child: Text(
@@ -189,7 +185,8 @@ class HomeCandidatesCard extends StatelessWidget {
                   )
                 : Column(
                     key: ValueKey(
-                        'candidate-list-${inspection!.candidates.length}'),
+                      'candidate-list-${inspection!.candidates.length}',
+                    ),
                     children: [
                       for (final entry in inspection!.candidates.indexed)
                         Padding(

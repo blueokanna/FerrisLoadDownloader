@@ -45,7 +45,7 @@ class AuthorizationSettingsPanel extends StatelessWidget {
       curve: Curves.easeOutCubic,
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(24),
+        borderRadius: BorderRadius.circular(8),
         color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
         border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.22)),
       ),
@@ -61,10 +61,7 @@ class AuthorizationSettingsPanel extends StatelessWidget {
                   shape: BoxShape.circle,
                   color: cs.secondaryContainer.withValues(alpha: 0.72),
                 ),
-                child: Icon(
-                  Icons.verified_user_outlined,
-                  color: cs.secondary,
-                ),
+                child: Icon(Icons.verified_user_outlined, color: cs.secondary),
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -95,17 +92,11 @@ class AuthorizationSettingsPanel extends StatelessWidget {
             curve: FerrisMotion.emphasized,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(20),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  cs.surface.withValues(alpha: 0.94),
-                  cs.secondaryContainer.withValues(alpha: 0.26),
-                ],
+              borderRadius: BorderRadius.circular(8),
+              color: cs.surfaceContainer,
+              border: Border.all(
+                color: cs.outlineVariant.withValues(alpha: 0.18),
               ),
-              border:
-                  Border.all(color: cs.outlineVariant.withValues(alpha: 0.18)),
             ),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -202,10 +193,11 @@ class AuthorizationSettingsPanel extends StatelessWidget {
             curve: FerrisMotion.emphasized,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(20),
+              borderRadius: BorderRadius.circular(8),
               color: cs.surface.withValues(alpha: 0.76),
-              border:
-                  Border.all(color: cs.outlineVariant.withValues(alpha: 0.16)),
+              border: Border.all(
+                color: cs.outlineVariant.withValues(alpha: 0.16),
+              ),
             ),
             child: AuthContextEditor(
               enabled: enabled,

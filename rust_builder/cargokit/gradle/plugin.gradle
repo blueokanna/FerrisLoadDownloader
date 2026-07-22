@@ -133,15 +133,6 @@ class CargoKitPlugin implements Plugin<Project> {
             jniLibs.srcDir(new File(cargoOutputDir))
 
             def platforms = com.flutter.gradle.FlutterPluginUtils.getTargetPlatforms(project).collect()
-            
-            // Workaround: Remove android-x64 because the Rust target x86_64-linux-android is missing
-            platforms.remove("android-x64")
-
-            // Same thing addFlutterDependencies does in flutter.gradle
-            if (buildType == "debug") {
-                platforms.add("android-x86")
-                // platforms.add("android-x64")
-            }
 
             // The task name depends on plugin properties, which are not available
             // at this point

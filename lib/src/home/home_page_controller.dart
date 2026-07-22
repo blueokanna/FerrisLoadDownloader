@@ -19,11 +19,7 @@ enum HomeWorkflowStage {
   failed,
 }
 
-enum HomeRetryAction {
-  none,
-  analyze,
-  download,
-}
+enum HomeRetryAction { none, analyze, download }
 
 class HomePageViewModel {
   const HomePageViewModel({
@@ -166,6 +162,7 @@ class HomeDownloadTask {
     required this.running,
     this.error,
     this.resultPath,
+    this.backend,
   });
 
   final String id;
@@ -178,6 +175,7 @@ class HomeDownloadTask {
   final bool running;
   final String? error;
   final String? resultPath;
+  final String? backend;
 
   HomeDownloadTask copyWith({
     String? status,
@@ -186,6 +184,7 @@ class HomeDownloadTask {
     bool? running,
     Object? error = HomePageViewModel._sentinel,
     Object? resultPath = HomePageViewModel._sentinel,
+    Object? backend = HomePageViewModel._sentinel,
   }) {
     return HomeDownloadTask(
       id: id,
@@ -202,6 +201,9 @@ class HomeDownloadTask {
       resultPath: identical(resultPath, HomePageViewModel._sentinel)
           ? this.resultPath
           : resultPath as String?,
+      backend: identical(backend, HomePageViewModel._sentinel)
+          ? this.backend
+          : backend as String?,
     );
   }
 }
@@ -239,7 +241,12 @@ class HomePageController extends ChangeNotifier {
     if (lower.contains('authorization challenge')) {
       return HomeWorkflowStage.authRedirect;
     }
-    if (lower.contains('selecting transcoder backend')) {
+    if (lower.contains('transcoder backend') ||
+        lower.contains('selected site engine') ||
+        lower.contains('selected hardware encoder') ||
+        lower.contains('selected ffmpeg stream copy') ||
+        lower.contains('selected android mediamuxer') ||
+        lower.contains('using ') && lower.contains(' backend')) {
       return HomeWorkflowStage.backend;
     }
     if (lower.contains('downloading m3u8 playlist')) {
@@ -248,10 +255,13 @@ class HomePageController extends ChangeNotifier {
     if (lower.contains('downloading segments')) {
       return HomeWorkflowStage.segments;
     }
-    if (lower.contains('merging segments')) {
+    if (lower.contains('merging segments') ||
+        lower.contains('merging streams')) {
       return HomeWorkflowStage.merge;
     }
-    if (lower.contains('converting to mp4') || lower.contains('transcode')) {
+    if (lower.contains('converting to mp4') ||
+        lower.contains('transcode') ||
+        lower.contains(' encoder')) {
       return HomeWorkflowStage.transcode;
     }
     if (lower.contains('export')) {
@@ -266,6 +276,7 @@ class HomePageController extends ChangeNotifier {
     if (lower.contains('downloading video stream') ||
         lower.contains('downloading audio stream') ||
         lower.contains('downloading media') ||
+        lower.contains('yt-dlp download') ||
         lower.contains('direct media')) {
       return HomeWorkflowStage.transfer;
     }
@@ -279,6 +290,43 @@ class HomePageController extends ChangeNotifier {
       return HomeWorkflowStage.ready;
     }
     return HomeWorkflowStage.idle;
+  }
+
+  String? _backendFromStatus(String status) {
+    for (final prefix in <String>[
+      'Selected site engine: ',
+      'Selected transcoder backend: ',
+      'Selected hardware encoder: ',
+    ]) {
+      if (status.startsWith(prefix)) {
+        return status.substring(prefix.length).trim();
+      }
+    }
+    if (status.contains('unavailable; retrying') &&
+        status.contains('CPU libx264')) {
+      return 'CPU libx264';
+    }
+    if (status.startsWith('Selected FFmpeg stream copy') ||
+        status.startsWith('Remuxing with FFmpeg stream copy') ||
+        status.startsWith('Merging streams with FFmpeg stream copy')) {
+      return 'FFmpeg stream copy';
+    }
+    if (status.startsWith('Selected Android MediaMuxer') ||
+        status.startsWith('Remuxing with Android MediaMuxer') ||
+        status.startsWith('Merging streams with Android MediaMuxer')) {
+      return 'Android MediaMuxer';
+    }
+    if (status.startsWith('Using ') && status.endsWith(' backend')) {
+      return status.substring(6, status.length - 8).trim();
+    }
+    if (status.startsWith('Using ') && status.endsWith(' encoder')) {
+      return status.substring(6, status.length - 8).trim();
+    }
+    const mergeEncodeSuffix = ' to merge and encode streams';
+    if (status.startsWith('Using ') && status.endsWith(mergeEncodeSuffix)) {
+      return status.substring(6, status.length - mergeEncodeSuffix.length);
+    }
+    return null;
   }
 
   List<HomeDownloadTask> _replaceTask(
@@ -448,22 +496,21 @@ class HomePageController extends ChangeNotifier {
 
   void updateProgress(String status, double progress) {
     _apply(
-      _value.copyWith(
-        status: status,
-        progress: progress.clamp(0.0, 1.0),
-      ),
+      _value.copyWith(status: status, progress: progress.clamp(0.0, 1.0)),
       stage: _classifyProgressStage(status),
     );
   }
 
   void updateDownloadTask(String id, String status, double progress) {
     final stage = _classifyProgressStage(status);
+    final backend = _backendFromStatus(status);
     final tasks = _replaceTask(
       id,
       (task) => task.copyWith(
         status: status,
         progress: progress.clamp(0.0, 1.0),
         stage: stage,
+        backend: backend ?? task.backend,
       ),
     );
     _apply(

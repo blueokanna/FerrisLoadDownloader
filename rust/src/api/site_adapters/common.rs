@@ -11,7 +11,7 @@ pub(crate) struct SiteWarning {
 }
 
 impl SiteWarning {
-    pub (crate) fn auth(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn auth(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             scope: "auth",
             code,
@@ -19,7 +19,7 @@ impl SiteWarning {
         }
     }
 
-    pub (crate) fn site(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn site(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             scope: "site",
             code,
@@ -27,7 +27,7 @@ impl SiteWarning {
         }
     }
 
-    pub (crate) fn media(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn media(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             scope: "media",
             code,
@@ -35,11 +35,11 @@ impl SiteWarning {
         }
     }
 
-    pub (crate) fn into_display(self) -> String {
+    pub(crate) fn into_display(self) -> String {
         format!("[{}:{}] {}", self.scope, self.code, self.message)
     }
 
-    pub (crate) fn scope(&self) -> &'static str {
+    pub(crate) fn scope(&self) -> &'static str {
         self.scope
     }
 
@@ -48,7 +48,7 @@ impl SiteWarning {
     }
 }
 
-pub (crate) fn extract_page_title(html: &str) -> Option<String> {
+pub(crate) fn extract_page_title(html: &str) -> Option<String> {
     let patterns = [
         r#"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']"#,
         r#"<meta[^>]+name=[\"']twitter:title[\"'][^>]+content=[\"']([^\"']+)[\"']"#,
@@ -70,7 +70,7 @@ pub (crate) fn extract_page_title(html: &str) -> Option<String> {
     None
 }
 
-pub (crate) fn html_unescape(value: &str) -> String {
+pub(crate) fn html_unescape(value: &str) -> String {
     value
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
@@ -79,7 +79,7 @@ pub (crate) fn html_unescape(value: &str) -> String {
         .replace("&gt;", ">")
 }
 
-pub (crate)fn normalize_exposed_media_url(page_url: &Url, raw: &str) -> Option<String> {
+pub(crate) fn normalize_exposed_media_url(page_url: &Url, raw: &str) -> Option<String> {
     let normalized = html_unescape(raw)
         .replace("\\u002F", "/")
         .replace("\\u002f", "/")
@@ -115,7 +115,7 @@ pub (crate)fn normalize_exposed_media_url(page_url: &Url, raw: &str) -> Option<S
     }
 }
 
-pub (crate) fn is_supported_media_like(url: &str) -> bool {
+pub(crate) fn is_supported_media_like(url: &str) -> bool {
     url.contains(".m3u8")
         || url.contains("application/vnd.apple.mpegurl")
         || url.contains(".mp4")
@@ -125,7 +125,7 @@ pub (crate) fn is_supported_media_like(url: &str) -> bool {
         || url.contains(".mpd")
 }
 
-pub (crate) fn first_array_pointer<'a>(
+pub(crate) fn first_array_pointer<'a>(
     value: &'a Value,
     pointers: &[&str],
 ) -> Option<&'a Vec<Value>> {
@@ -145,7 +145,7 @@ pub(crate) fn first_string_pointer(value: &Value, pointers: &[&str]) -> Option<S
     })
 }
 
-pub (crate) fn extract_text_runs_pointer(value: &Value, pointer: &str) -> Option<String> {
+pub(crate) fn extract_text_runs_pointer(value: &Value, pointer: &str) -> Option<String> {
     let runs = value.pointer(pointer).and_then(Value::as_array)?;
     let text = runs
         .iter()
@@ -160,11 +160,11 @@ pub (crate) fn extract_text_runs_pointer(value: &Value, pointer: &str) -> Option
     }
 }
 
-pub (crate) fn first_media_url(value: &Value) -> Option<String> {
+pub(crate) fn first_media_url(value: &Value) -> Option<String> {
     collect_media_urls(value).into_iter().next()
 }
 
-pub (crate) fn collect_media_urls(value: &Value) -> Vec<String> {
+pub(crate) fn collect_media_urls(value: &Value) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
 
@@ -185,7 +185,12 @@ pub (crate) fn collect_media_urls(value: &Value) -> Vec<String> {
         }
     }
 
-    for field in ["backupUrl", "backup_url", "backupPlayUrl", "backup_play_url"] {
+    for field in [
+        "backupUrl",
+        "backup_url",
+        "backupPlayUrl",
+        "backup_play_url",
+    ] {
         if let Some(entries) = value.get(field).and_then(Value::as_array) {
             for entry in entries {
                 if let Some(raw) = entry.as_str() {
@@ -201,7 +206,7 @@ pub (crate) fn collect_media_urls(value: &Value) -> Vec<String> {
     urls
 }
 
-pub (crate) fn extract_json_object_after_any(haystack: &str, markers: &[&str]) -> Option<String> {
+pub(crate) fn extract_json_object_after_any(haystack: &str, markers: &[&str]) -> Option<String> {
     markers
         .iter()
         .find_map(|marker| extract_json_object_after(haystack, marker))
@@ -249,13 +254,13 @@ pub(crate) fn extract_json_object_after(haystack: &str, marker: &str) -> Option<
     end_index.map(|end| remainder[json_start..end].to_string())
 }
 
-pub (crate) fn extract_json_string_after_any(haystack: &str, markers: &[&str]) -> Option<String> {
+pub(crate) fn extract_json_string_after_any(haystack: &str, markers: &[&str]) -> Option<String> {
     markers
         .iter()
         .find_map(|marker| extract_json_string_after(haystack, marker))
 }
 
-pub (crate) fn extract_json_string_after(haystack: &str, marker: &str) -> Option<String> {
+pub(crate) fn extract_json_string_after(haystack: &str, marker: &str) -> Option<String> {
     let start = haystack.find(marker)? + marker.len();
     let remainder = &haystack[start..];
     let skip = remainder.find(|ch: char| !ch.is_whitespace())?;
@@ -293,7 +298,7 @@ pub (crate) fn extract_json_string_after(haystack: &str, marker: &str) -> Option
     }
 }
 
-pub (crate) fn decode_js_string_literal(value: &str) -> Option<String> {
+pub(crate) fn decode_js_string_literal(value: &str) -> Option<String> {
     let mut result = String::new();
     let mut chars = value.chars();
 

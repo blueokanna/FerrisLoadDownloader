@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
+import 'package:m3u8_downloader/src/home/source_input.dart';
 
 class HomeInputCard extends StatelessWidget {
   const HomeInputCard({
@@ -54,20 +56,58 @@ class HomeInputCard extends StatelessWidget {
         key: formKey,
         child: Column(
           children: [
-            TextFormField(
-              controller: urlController,
-              enabled: !analyzing,
-              decoration: InputDecoration(
-                labelText: l.text('input_source'),
-                hintText: l.text('source_hint'),
-                prefixIcon: const Icon(Icons.language_rounded),
+            ValueListenableBuilder<TextEditingValue>(
+              valueListenable: urlController,
+              builder: (context, value, _) => TextFormField(
+                controller: urlController,
+                enabled: !analyzing,
+                minLines: 1,
+                maxLines: 2,
+                keyboardType: TextInputType.url,
+                textInputAction: TextInputAction.done,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: l.text('input_source'),
+                  hintText: l.text('source_hint'),
+                  prefixIcon: const Icon(Icons.link_rounded),
+                  suffixIcon: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (value.text.isNotEmpty)
+                        IconButton(
+                          onPressed: analyzing ? null : urlController.clear,
+                          icon: const Icon(Icons.close_rounded),
+                          tooltip: l.text('clear'),
+                        ),
+                      IconButton(
+                        onPressed: analyzing
+                            ? null
+                            : () async {
+                                final clipboard = await Clipboard.getData(
+                                  Clipboard.kTextPlain,
+                                );
+                                final text = clipboard?.text?.trim();
+                                if (text == null || text.isEmpty) {
+                                  return;
+                                }
+                                urlController.value = TextEditingValue(
+                                  text: text,
+                                  selection: TextSelection.collapsed(
+                                    offset: text.length,
+                                  ),
+                                );
+                              },
+                        icon: const Icon(Icons.content_paste_rounded),
+                        tooltip: l.text('paste'),
+                      ),
+                    ],
+                  ),
+                ),
+                validator: (value) => extractSourceUrl(value ?? '') == null
+                    ? l.text('source_invalid')
+                    : null,
               ),
-              validator: (value) {
-                if (value == null || value.trim().isEmpty) {
-                  return l.text('input_source');
-                }
-                return null;
-              },
             ),
             const SizedBox(height: 14),
             TextFormField(
@@ -86,14 +126,16 @@ class HomeInputCard extends StatelessWidget {
             ),
             const SizedBox(height: 14),
             InkWell(
-              borderRadius: BorderRadius.circular(18),
+              borderRadius: BorderRadius.circular(8),
               onTap: analyzing ? null : onPickDir,
               child: Ink(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 14,
+                ),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(18),
-                  color: cs.surfaceContainerHigh.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(8),
+                  color: cs.surfaceContainerHigh,
                   border: Border.all(color: cs.outlineVariant),
                 ),
                 child: Row(
@@ -188,8 +230,11 @@ class HomeInputCard extends StatelessWidget {
             const SizedBox(height: 12),
             Row(
               children: [
-                Icon(Icons.info_outline_rounded,
-                    size: 16, color: cs.onSurfaceVariant),
+                Icon(
+                  Icons.info_outline_rounded,
+                  size: 16,
+                  color: cs.onSurfaceVariant,
+                ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
@@ -207,14 +252,10 @@ class HomeInputCard extends StatelessWidget {
               curve: FerrisMotion.emphasized,
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(22),
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    cs.primaryContainer.withValues(alpha: 0.46),
-                    cs.secondaryContainer.withValues(alpha: 0.28),
-                  ],
+                borderRadius: BorderRadius.circular(8),
+                color: cs.surfaceContainer,
+                border: Border.all(
+                  color: cs.outlineVariant.withValues(alpha: 0.6),
                 ),
               ),
               child: Column(
@@ -333,12 +374,15 @@ class HomeInputCard extends StatelessWidget {
                     },
                   ),
                   const SizedBox(height: 10),
-                  SwitchListTile.adaptive(
-                    value: keepTemp,
-                    contentPadding: EdgeInsets.zero,
-                    title: Text(l.text('keep_temp')),
-                    subtitle: Text(l.text('keep_temp_hint')),
-                    onChanged: analyzing ? null : onKeepTempChanged,
+                  Material(
+                    type: MaterialType.transparency,
+                    child: SwitchListTile.adaptive(
+                      value: keepTemp,
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(l.text('keep_temp')),
+                      subtitle: Text(l.text('keep_temp_hint')),
+                      onChanged: analyzing ? null : onKeepTempChanged,
+                    ),
                   ),
                 ],
               ),

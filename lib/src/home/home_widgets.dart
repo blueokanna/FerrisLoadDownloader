@@ -1,22 +1,29 @@
 import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
 import 'package:m3u8_downloader/src/app/app_theme.dart';
+import 'package:m3u8_downloader/src/app/runtime_capabilities.dart';
 import 'package:m3u8_downloader/src/rust/api/downloader.dart';
 
 class FerrisMotion {
-  static const Duration fast = Duration(milliseconds: 180);
-  static const Duration medium = Duration(milliseconds: 260);
-  static const Duration slow = Duration(milliseconds: 420);
+  static const Duration fast = Duration(milliseconds: 200);
+  static const Duration medium = Duration(milliseconds: 300);
+  static const Duration slow = Duration(milliseconds: 500);
+  static const Curve linear = Curves.linear;
+  static const Curve standard = Cubic(0.2, 0, 0, 1);
+  static const Curve standardDecelerate = Cubic(0, 0, 0, 1);
+  static const Curve standardAccelerate = Cubic(0.3, 0, 1, 1);
   static const Curve emphasized = Curves.easeInOutCubicEmphasized;
-  static const Curve decelerate = Curves.easeOutCubic;
-  static const Curve accelerate = Curves.easeInCubic;
+  static const Curve emphasizedDecelerate = Cubic(0.05, 0.7, 0.1, 1);
+  static const Curve emphasizedAccelerate = Cubic(0.3, 0, 0.8, 0.15);
+  static const Curve decelerate = emphasizedDecelerate;
+  static const Curve accelerate = emphasizedAccelerate;
 }
 
 Widget ferrisFadeScaleTransition(Widget child, Animation<double> animation) {
   final curved = CurvedAnimation(
     parent: animation,
-    curve: FerrisMotion.decelerate,
-    reverseCurve: FerrisMotion.accelerate,
+    curve: FerrisMotion.standardDecelerate,
+    reverseCurve: FerrisMotion.standardAccelerate,
   );
   return FadeTransition(
     opacity: curved,
@@ -24,6 +31,24 @@ Widget ferrisFadeScaleTransition(Widget child, Animation<double> animation) {
       scale: Tween<double>(begin: 0.985, end: 1).animate(curved),
       child: child,
     ),
+  );
+}
+
+Widget ferrisSharedAxisTransition(Widget child, Animation<double> animation) {
+  final fade = CurvedAnimation(
+    parent: animation,
+    curve: FerrisMotion.standardDecelerate,
+    reverseCurve: FerrisMotion.standardAccelerate,
+  );
+  final slide = Tween<Offset>(
+    begin: const Offset(0, 0.045),
+    end: Offset.zero,
+  ).animate(
+    CurvedAnimation(parent: animation, curve: FerrisMotion.emphasized),
+  );
+  return FadeTransition(
+    opacity: fade,
+    child: SlideTransition(position: slide, child: child),
   );
 }
 
@@ -49,33 +74,13 @@ class SectionCard extends StatelessWidget {
       duration: FerrisMotion.medium,
       curve: FerrisMotion.emphasized,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(30),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            cs.surface.withValues(alpha: 0.94),
-            cs.surfaceContainerLow.withValues(alpha: 0.92),
-            cs.surfaceContainerHigh.withValues(alpha: 0.88),
-          ],
-        ),
-        border: Border.all(
-          color: cs.outlineVariant.withValues(alpha: 0.22),
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: cs.shadow.withValues(
-              alpha:
-                  Theme.of(context).brightness == Brightness.dark ? 0.22 : 0.08,
-            ),
-            blurRadius: 28,
-            offset: const Offset(0, 16),
-          ),
-        ],
+        borderRadius: BorderRadius.circular(8),
+        color: cs.surfaceContainerLow,
+        border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.55)),
       ),
       child: Material(
         color: Colors.transparent,
-        borderRadius: BorderRadius.circular(30),
+        borderRadius: BorderRadius.circular(8),
         clipBehavior: Clip.antiAlias,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(22, 22, 22, 24),
@@ -85,21 +90,13 @@ class SectionCard extends StatelessWidget {
               Row(
                 children: [
                   Container(
-                    width: 42,
-                    height: 42,
+                    width: 40,
+                    height: 40,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      gradient: LinearGradient(
-                        colors: [
-                          cs.primaryContainer.withValues(alpha: 0.95),
-                          cs.secondaryContainer.withValues(alpha: 0.92),
-                        ],
-                      ),
-                      border: Border.all(
-                        color: cs.onSurface.withValues(alpha: 0.06),
-                      ),
+                      color: cs.primaryContainer,
                     ),
-                    child: Icon(icon, color: cs.primary),
+                    child: Icon(icon, color: cs.onPrimaryContainer),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
@@ -162,43 +159,21 @@ class CandidateTile extends StatelessWidget {
         curve: FerrisMotion.emphasized,
         scale: selected ? 1 : 0.986,
         child: InkWell(
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(8),
           onTap: onTap,
           child: AnimatedContainer(
             duration: FerrisMotion.medium,
             curve: FerrisMotion.emphasized,
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(24),
+              borderRadius: BorderRadius.circular(8),
               border: Border.all(
                 color: selected
                     ? cs.primary
                     : cs.outlineVariant.withValues(alpha: 0.62),
-                width: selected ? 1.6 : 1,
+                width: selected ? 2 : 1,
               ),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: selected
-                    ? [
-                        cs.primaryContainer.withValues(alpha: 0.72),
-                        cs.secondaryContainer.withValues(alpha: 0.4),
-                        cs.surface.withValues(alpha: 0.94),
-                      ]
-                    : [
-                        cs.surfaceContainerHigh.withValues(alpha: 0.52),
-                        cs.surface.withValues(alpha: 0.92),
-                      ],
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: selected
-                      ? cs.primary.withValues(alpha: 0.18)
-                      : cs.shadow.withValues(alpha: 0.05),
-                  blurRadius: selected ? 28 : 12,
-                  offset: Offset(0, selected ? 16 : 6),
-                ),
-              ],
+              color: selected ? cs.secondaryContainer : cs.surfaceContainerHigh,
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -312,10 +287,7 @@ class _RevealMotionState extends State<RevealMotion>
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: FerrisMotion.slow,
-    );
+    _controller = AnimationController(vsync: this, duration: FerrisMotion.slow);
     _configureAnimations();
     _schedule();
   }
@@ -323,8 +295,8 @@ class _RevealMotionState extends State<RevealMotion>
   void _configureAnimations() {
     final curve = CurvedAnimation(
       parent: _controller,
-      curve: FerrisMotion.decelerate,
-      reverseCurve: FerrisMotion.accelerate,
+      curve: FerrisMotion.emphasizedDecelerate,
+      reverseCurve: FerrisMotion.emphasizedAccelerate,
     );
     _opacity = CurvedAnimation(
       parent: _controller,
@@ -400,6 +372,250 @@ class MiniChip extends StatelessWidget {
   }
 }
 
+class RuntimeCapabilitiesPanel extends StatelessWidget {
+  const RuntimeCapabilitiesPanel({
+    super.key,
+    required this.capabilities,
+  });
+
+  final Future<PlatformCapabilitySnapshot> capabilities;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context);
+    final t = Theme.of(context);
+    final cs = t.colorScheme;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
+        border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.5)),
+      ),
+      child: FutureBuilder<PlatformCapabilitySnapshot>(
+        future: capabilities,
+        builder: (context, snapshot) {
+          final report = snapshot.data;
+          return AnimatedSize(
+            duration: FerrisMotion.medium,
+            curve: FerrisMotion.emphasized,
+            alignment: Alignment.topCenter,
+            child: AnimatedSwitcher(
+              duration: FerrisMotion.medium,
+              switchInCurve: FerrisMotion.emphasizedDecelerate,
+              switchOutCurve: FerrisMotion.emphasizedAccelerate,
+              transitionBuilder: ferrisSharedAxisTransition,
+              child: report == null
+                  ? Row(
+                      key: const ValueKey('capabilities-loading'),
+                      children: [
+                        SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.4,
+                            color: cs.primary,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            l.text('probing_capabilities'),
+                            style: t.textTheme.bodyMedium,
+                          ),
+                        ),
+                      ],
+                    )
+                  : _RuntimeCapabilityContent(
+                      key: const ValueKey('capabilities-ready'),
+                      report: report,
+                    ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _RuntimeCapabilityContent extends StatelessWidget {
+  const _RuntimeCapabilityContent({
+    super.key,
+    required this.report,
+  });
+
+  final PlatformCapabilitySnapshot report;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context);
+    final t = Theme.of(context);
+    final cs = t.colorScheme;
+    final encoders = report.videoEncoders.take(4).toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.memory_rounded, color: cs.primary),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    l.text('runtime_capabilities'),
+                    style: t.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  Text(
+                    '${report.platform.toUpperCase()} · ${report.transcoderBackend}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: t.textTheme.bodySmall?.copyWith(
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _CapabilityIndicator(
+              label: 'FFmpeg',
+              available: report.ffmpegAvailable,
+            ),
+            _CapabilityIndicator(
+              label: 'yt-dlp',
+              available: report.ytdlpAvailable,
+            ),
+            _CapabilityIndicator(
+              label: l.text('hardware_encoder'),
+              available: report.hardwareAccelerated,
+            ),
+            const MiniChip(label: 'HLS · DASH'),
+            const MiniChip(label: 'YouTube · Bilibili'),
+          ],
+        ),
+        if (encoders.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          Text(
+            l.text('video_encoders'),
+            style: t.textTheme.labelLarge?.copyWith(
+              color: cs.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 6),
+          for (final encoder in encoders)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.check_circle_rounded, size: 16, color: cs.primary),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(encoder, style: t.textTheme.bodySmall),
+                  ),
+                ],
+              ),
+            ),
+        ],
+        if (report.videoDecoders.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          Text(
+            '${l.text('video_decoders')}: ${report.videoDecoders.length}',
+            style: t.textTheme.bodySmall?.copyWith(
+              color: cs.onSurfaceVariant,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+        for (final note in report.notes) ...[
+          const SizedBox(height: 10),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                Icons.info_outline_rounded,
+                size: 16,
+                color: cs.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  note,
+                  style: t.textTheme.bodySmall?.copyWith(
+                    color: cs.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _CapabilityIndicator extends StatelessWidget {
+  const _CapabilityIndicator({
+    required this.label,
+    required this.available,
+  });
+
+  final String label;
+  final bool available;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context);
+    final cs = Theme.of(context).colorScheme;
+    final background = available ? cs.primaryContainer : cs.errorContainer;
+    final foreground = available ? cs.onPrimaryContainer : cs.onErrorContainer;
+    return AnimatedContainer(
+      duration: FerrisMotion.fast,
+      curve: FerrisMotion.standard,
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            available ? Icons.check_rounded : Icons.close_rounded,
+            size: 15,
+            color: foreground,
+          ),
+          const SizedBox(width: 5),
+          Flexible(
+            child: Text(
+              '$label · ${l.text(available ? 'available' : 'not_available')}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: foreground,
+                    fontWeight: FontWeight.w800,
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class DisplayPreviewCard extends StatelessWidget {
   const DisplayPreviewCard({
     super.key,
@@ -426,166 +642,77 @@ class DisplayPreviewCard extends StatelessWidget {
       height: 234,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(30),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            cs.surface,
-            cs.primaryContainer.withValues(alpha: isDark ? 0.52 : 0.76),
-            cs.secondaryContainer.withValues(alpha: isDark ? 0.46 : 0.72),
-          ],
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: cs.shadow.withValues(alpha: isDark ? 0.22 : 0.12),
-            blurRadius: 28,
-            offset: const Offset(0, 16),
-          ),
-        ],
+        borderRadius: BorderRadius.circular(8),
+        color: cs.surfaceContainer,
+        border: Border.all(color: cs.outlineVariant),
       ),
-      child: Stack(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Positioned(
-            top: -24,
-            left: -12,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 320),
-              width: 118,
-              height: 118,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: cs.primary.withValues(alpha: isDark ? 0.16 : 0.22),
-              ),
-            ),
-          ),
-          Positioned(
-            right: -10,
-            top: 18,
-            child: Transform.rotate(
-              angle: -0.26,
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 320),
-                width: 126,
-                height: 126,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(34),
-                  gradient: LinearGradient(
-                    colors: [
-                      cs.tertiaryContainer.withValues(alpha: 0.92),
-                      cs.primary.withValues(alpha: 0.34),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-          Positioned(
-            left: 22,
-            bottom: 72,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 320),
-              width: 84,
-              height: 84,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(
-                  color: cs.onSurface.withValues(alpha: 0.18),
-                  width: 10,
-                ),
-              ),
-            ),
-          ),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          Row(
             children: [
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(999),
-                      color: cs.surface.withValues(alpha: 0.72),
-                    ),
-                    child: Text(
-                      profile.name,
-                      style: previewTheme.textTheme.labelLarge?.copyWith(
-                        color: cs.onSurface,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
+              Expanded(
+                child: Text(
+                  profile.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: previewTheme.textTheme.labelLarge?.copyWith(
+                    color: cs.onSurface,
+                    fontWeight: FontWeight.w800,
                   ),
-                  const Spacer(),
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 220),
-                    child: Icon(
-                      isDark
-                          ? Icons.dark_mode_rounded
-                          : Icons.light_mode_rounded,
-                      key: ValueKey(isDark),
-                      color: cs.onSurface,
-                    ),
-                  ),
-                ],
-              ),
-              const Spacer(),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(22),
-                  color: cs.surface.withValues(alpha: isDark ? 0.72 : 0.84),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'FerrisLoad',
-                      style: previewTheme.textTheme.titleMedium?.copyWith(
-                        color: cs.onSurface,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      localeLabel,
-                      style: previewTheme.textTheme.bodySmall?.copyWith(
-                        color: cs.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        PreviewMiniSwatch(color: profile.seed),
-                        const SizedBox(width: 8),
-                        PreviewMiniSwatch(color: profile.accent),
-                        const Spacer(),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(999),
-                            color: cs.primaryContainer,
-                          ),
-                          child: Text(
-                            isDark ? 'Dark' : 'Light',
-                            style: previewTheme.textTheme.labelMedium?.copyWith(
-                              color: cs.onPrimaryContainer,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+              ),
+              AnimatedSwitcher(
+                duration: FerrisMotion.fast,
+                transitionBuilder: ferrisFadeScaleTransition,
+                child: Icon(
+                  isDark ? Icons.dark_mode_rounded : Icons.light_mode_rounded,
+                  key: ValueKey(isDark),
+                  color: cs.onSurface,
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 16),
+          Expanded(
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(8),
+                color: cs.surface,
+                border: Border.all(color: cs.outlineVariant),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'FerrisLoad',
+                    style: previewTheme.textTheme.titleMedium?.copyWith(
+                      color: cs.onSurface,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    localeLabel,
+                    style: previewTheme.textTheme.bodySmall?.copyWith(
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                  const Spacer(),
+                  Row(
+                    children: [
+                      PreviewMiniSwatch(color: profile.seed),
+                      const SizedBox(width: 8),
+                      PreviewMiniSwatch(color: profile.accent),
+                      const Spacer(),
+                      Icon(Icons.check_circle_rounded, color: cs.primary),
+                    ],
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),
@@ -618,7 +745,7 @@ class ThemePaletteCard extends StatelessWidget {
         curve: FerrisMotion.emphasized,
         scale: selected ? 1 : 0.972,
         child: InkWell(
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(8),
           onTap: onTap,
           child: AnimatedContainer(
             duration: FerrisMotion.medium,
@@ -626,33 +753,12 @@ class ThemePaletteCard extends StatelessWidget {
             width: 172,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(24),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: selected
-                    ? [
-                        cs.primaryContainer.withValues(alpha: 0.72),
-                        cs.surface.withValues(alpha: 0.94),
-                      ]
-                    : [
-                        cs.surfaceContainerHigh.withValues(alpha: 0.58),
-                        cs.surface.withValues(alpha: 0.88),
-                      ],
-              ),
+              borderRadius: BorderRadius.circular(8),
+              color: selected ? cs.primaryContainer : cs.surfaceContainerHigh,
               border: Border.all(
                 color: selected ? cs.primary : cs.outlineVariant,
-                width: selected ? 1.6 : 1,
+                width: selected ? 2 : 1,
               ),
-              boxShadow: [
-                BoxShadow(
-                  color: selected
-                      ? cs.primary.withValues(alpha: 0.16)
-                      : cs.shadow.withValues(alpha: 0.05),
-                  blurRadius: selected ? 22 : 10,
-                  offset: Offset(0, selected ? 14 : 6),
-                ),
-              ],
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -660,14 +766,8 @@ class ThemePaletteCard extends StatelessWidget {
                 Container(
                   height: 58,
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(18),
-                    gradient: LinearGradient(
-                      colors: [
-                        profile.canvasLight,
-                        profile.seed.withValues(alpha: 0.88),
-                        profile.accent.withValues(alpha: 0.92),
-                      ],
-                    ),
+                    borderRadius: BorderRadius.circular(8),
+                    color: profile.canvasLight,
                   ),
                   child: Row(
                     children: [
@@ -696,8 +796,9 @@ class ThemePaletteCard extends StatelessWidget {
                   profile.name,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: t.textTheme.labelLarge
-                      ?.copyWith(fontWeight: FontWeight.w800),
+                  style: t.textTheme.labelLarge?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
                 const SizedBox(height: 4),
                 Text(
@@ -718,10 +819,7 @@ class ThemePaletteCard extends StatelessWidget {
 }
 
 class InspectionWarningTile extends StatelessWidget {
-  const InspectionWarningTile({
-    super.key,
-    required this.warning,
-  });
+  const InspectionWarningTile({super.key, required this.warning});
 
   final String warning;
 
@@ -735,16 +833,8 @@ class InspectionWarningTile extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            parsed.background,
-            Color.alphaBlend(
-                parsed.accent.withValues(alpha: 0.08), parsed.background),
-          ],
-        ),
+        borderRadius: BorderRadius.circular(8),
+        color: parsed.background,
         border: Border.all(color: parsed.border),
       ),
       child: Row(
@@ -875,10 +965,7 @@ class PreviewMiniSwatch extends StatelessWidget {
     return Container(
       width: 18,
       height: 18,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: color,
-      ),
+      decoration: BoxDecoration(shape: BoxShape.circle, color: color),
     );
   }
 }
@@ -947,6 +1034,51 @@ class StatusPulseDot extends StatefulWidget {
   State<StatusPulseDot> createState() => _StatusPulseDotState();
 }
 
+class SmoothLinearProgressIndicator extends StatelessWidget {
+  const SmoothLinearProgressIndicator({
+    super.key,
+    required this.value,
+    this.color,
+    this.backgroundColor,
+    this.minHeight = 6,
+  });
+
+  final double? value;
+  final Color? color;
+  final Color? backgroundColor;
+  final double minHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    final target = value?.clamp(0.0, 1.0);
+    if (target == null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: LinearProgressIndicator(
+          minHeight: minHeight,
+          color: color,
+          backgroundColor: backgroundColor,
+        ),
+      );
+    }
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(end: target),
+      duration: FerrisMotion.medium,
+      curve: FerrisMotion.linear,
+      builder: (context, animatedValue, _) => ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: LinearProgressIndicator(
+          minHeight: minHeight,
+          value: animatedValue,
+          color: color,
+          backgroundColor: backgroundColor,
+        ),
+      ),
+    );
+  }
+}
+
 class _StatusPulseDotState extends State<StatusPulseDot>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
@@ -1005,7 +1137,8 @@ class _StatusPulseDotState extends State<StatusPulseDot>
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
                       color: widget.color.withValues(
-                          alpha: widget.active ? 0.16 - (t * 0.08) : 0),
+                        alpha: widget.active ? 0.16 - (t * 0.08) : 0,
+                      ),
                     ),
                   ),
                 ),
@@ -1017,8 +1150,9 @@ class _StatusPulseDotState extends State<StatusPulseDot>
                     color: widget.color,
                     boxShadow: [
                       BoxShadow(
-                        color: widget.color
-                            .withValues(alpha: widget.active ? 0.34 : 0.12),
+                        color: widget.color.withValues(
+                          alpha: widget.active ? 0.34 : 0.12,
+                        ),
                         blurRadius: widget.active ? 12 + (t * 6) : 6,
                       ),
                     ],
@@ -1055,16 +1189,8 @@ class BatteryBanner extends StatelessWidget {
       duration: FerrisMotion.medium,
       curve: FerrisMotion.emphasized,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(26),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            cs.tertiaryContainer,
-            Color.alphaBlend(
-                cs.primary.withValues(alpha: 0.08), cs.tertiaryContainer),
-          ],
-        ),
+        borderRadius: BorderRadius.circular(8),
+        color: cs.tertiaryContainer,
       ),
       child: Padding(
         padding: const EdgeInsets.all(18),
@@ -1073,8 +1199,10 @@ class BatteryBanner extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(Icons.battery_saver_rounded,
-                    color: cs.onTertiaryContainer),
+                Icon(
+                  Icons.battery_saver_rounded,
+                  color: cs.onTertiaryContainer,
+                ),
                 const SizedBox(width: 8),
                 Text(
                   title,

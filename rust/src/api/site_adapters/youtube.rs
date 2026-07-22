@@ -103,10 +103,7 @@ pub(crate) fn extract_youtube_candidates(
                 })
                 .filter_map(|item| {
                     let media_url = first_media_url(item)?;
-                    Some((
-                        item.get("bitrate")?.as_i64().unwrap_or_default(),
-                        media_url,
-                    ))
+                    Some((item.get("bitrate")?.as_i64().unwrap_or_default(), media_url))
                 })
                 .max_by_key(|entry| entry.0)
                 .map(|entry| entry.1)
@@ -132,7 +129,11 @@ pub(crate) fn extract_youtube_candidates(
                     mime_type.starts_with("video/") && path.ends_with("adaptiveFormats");
                 collector.push(
                     media_url,
-                    if is_video_only { best_audio.clone() } else { None },
+                    if is_video_only {
+                        best_audio.clone()
+                    } else {
+                        None
+                    },
                     title.clone(),
                     item.get("qualityLabel")
                         .or_else(|| item.get("audioQuality"))
@@ -140,8 +141,12 @@ pub(crate) fn extract_youtube_candidates(
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     Some(mime_type.to_string()),
-                    item.get("width").and_then(Value::as_i64).map(|value| value as i32),
-                    item.get("height").and_then(Value::as_i64).map(|value| value as i32),
+                    item.get("width")
+                        .and_then(Value::as_i64)
+                        .map(|value| value as i32),
+                    item.get("height")
+                        .and_then(Value::as_i64)
+                        .map(|value| value as i32),
                     Some("youtube"),
                 );
             }
@@ -212,8 +217,10 @@ fn push_playability_warnings(value: &Value, warnings: &mut Vec<SiteWarning>) {
         || lower_reason.contains("membership")
     {
         Some("youtube-membership-required")
-    } else if matches!(status, "LOGIN_REQUIRED" | "AGE_CHECK_REQUIRED" | "CONTENT_CHECK_REQUIRED")
-        || ((status == "UNPLAYABLE" || status == "ERROR") && lower_reason.contains("age"))
+    } else if matches!(
+        status,
+        "LOGIN_REQUIRED" | "AGE_CHECK_REQUIRED" | "CONTENT_CHECK_REQUIRED"
+    ) || ((status == "UNPLAYABLE" || status == "ERROR") && lower_reason.contains("age"))
     {
         Some("youtube-age-gate")
     } else {
@@ -270,31 +277,11 @@ fn extract_direct_manifest_urls(
     let mut manifests = Vec::new();
 
     for (field, label, mime_type) in [
-        (
-            "hlsManifestUrl",
-            "HLS",
-            "application/vnd.apple.mpegurl",
-        ),
-        (
-            "manifestUrl",
-            "HLS",
-            "application/vnd.apple.mpegurl",
-        ),
-        (
-            "dashManifestUrl",
-            "DASH",
-            "application/dash+xml",
-        ),
-        (
-            "hlsvp",
-            "HLS",
-            "application/vnd.apple.mpegurl",
-        ),
-        (
-            "dashmpd",
-            "DASH",
-            "application/dash+xml",
-        ),
+        ("hlsManifestUrl", "HLS", "application/vnd.apple.mpegurl"),
+        ("manifestUrl", "HLS", "application/vnd.apple.mpegurl"),
+        ("dashManifestUrl", "DASH", "application/dash+xml"),
+        ("hlsvp", "HLS", "application/vnd.apple.mpegurl"),
+        ("dashmpd", "DASH", "application/dash+xml"),
     ] {
         let pattern = format!(r#"\"{}\"\s*:\s*\"([^\"]+)\""#, regex::escape(field));
         let regex = Regex::new(&pattern)?;
@@ -305,11 +292,7 @@ fn extract_direct_manifest_urls(
             let Some(resolved) = normalize_exposed_media_url(page_url, raw) else {
                 continue;
             };
-            manifests.push((
-                label.to_string(),
-                mime_type.to_string(),
-                resolved,
-            ));
+            manifests.push((label.to_string(), mime_type.to_string(), resolved));
         }
     }
 

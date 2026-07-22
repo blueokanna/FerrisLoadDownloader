@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart' show CupertinoPageTransitionsBuilder;
 import 'package:flutter/material.dart';
 
 class AppThemeProfile {
@@ -162,11 +163,30 @@ ThemeData buildAppTheme(
     surfaceContainerHigh: surfaceHigh,
     surfaceContainerHighest: surfaceHighest,
   );
+  final baseTextTheme = ThemeData(brightness: brightness).textTheme;
+  final textTheme = baseTextTheme.copyWith(
+    displayLarge: baseTextTheme.displayLarge?.copyWith(letterSpacing: 0),
+    displayMedium: baseTextTheme.displayMedium?.copyWith(letterSpacing: 0),
+    displaySmall: baseTextTheme.displaySmall?.copyWith(letterSpacing: 0),
+    headlineLarge: baseTextTheme.headlineLarge?.copyWith(letterSpacing: 0),
+    headlineMedium: baseTextTheme.headlineMedium?.copyWith(letterSpacing: 0),
+    headlineSmall: baseTextTheme.headlineSmall?.copyWith(letterSpacing: 0),
+    titleLarge: baseTextTheme.titleLarge?.copyWith(letterSpacing: 0),
+    titleMedium: baseTextTheme.titleMedium?.copyWith(letterSpacing: 0),
+    titleSmall: baseTextTheme.titleSmall?.copyWith(letterSpacing: 0),
+    bodyLarge: baseTextTheme.bodyLarge?.copyWith(letterSpacing: 0),
+    bodyMedium: baseTextTheme.bodyMedium?.copyWith(letterSpacing: 0),
+    bodySmall: baseTextTheme.bodySmall?.copyWith(letterSpacing: 0),
+    labelLarge: baseTextTheme.labelLarge?.copyWith(letterSpacing: 0),
+    labelMedium: baseTextTheme.labelMedium?.copyWith(letterSpacing: 0),
+    labelSmall: baseTextTheme.labelSmall?.copyWith(letterSpacing: 0),
+  );
 
   return ThemeData(
     useMaterial3: true,
     brightness: brightness,
     colorScheme: scheme,
+    textTheme: textTheme,
     scaffoldBackgroundColor: canvas,
     canvasColor: canvas,
     appBarTheme: AppBarTheme(
@@ -180,36 +200,45 @@ ThemeData buildAppTheme(
         color: scheme.onSurface,
         fontSize: 20,
         fontWeight: FontWeight.w700,
-        letterSpacing: 0.1,
+        letterSpacing: 0,
       ),
     ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       isDense: true,
       fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(18)),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
       enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(12),
         borderSide: BorderSide(color: scheme.outlineVariant),
       ),
       focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(18),
-        borderSide: BorderSide(color: scheme.primary, width: 1.4),
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide(color: scheme.primary, width: 2),
+      ),
+      errorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide(color: scheme.error),
+      ),
+      focusedErrorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide(color: scheme.error, width: 2),
       ),
     ),
     cardTheme: CardThemeData(
-      color: scheme.surface
-          .withValues(alpha: brightness == Brightness.light ? 0.86 : 0.9),
+      color: scheme.surface.withValues(
+        alpha: brightness == Brightness.light ? 0.86 : 0.9,
+      ),
       surfaceTintColor: Colors.transparent,
       margin: EdgeInsets.zero,
       elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(26)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
     ),
     filledButtonTheme: FilledButtonThemeData(
       style: FilledButton.styleFrom(
         minimumSize: const Size.fromHeight(54),
         animationDuration: const Duration(milliseconds: 220),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        shape: const StadiumBorder(),
         textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
       ),
     ),
@@ -217,20 +246,19 @@ ThemeData buildAppTheme(
       style: OutlinedButton.styleFrom(
         minimumSize: const Size.fromHeight(52),
         animationDuration: const Duration(milliseconds: 220),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        shape: const StadiumBorder(),
       ),
     ),
     iconButtonTheme: IconButtonThemeData(
       style: IconButton.styleFrom(
-        backgroundColor: scheme.surfaceContainerHigh.withValues(alpha: 0.42),
         foregroundColor: scheme.onSurface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        shape: const CircleBorder(),
       ),
     ),
     segmentedButtonTheme: SegmentedButtonThemeData(
       style: ButtonStyle(
         shape: WidgetStatePropertyAll(
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
       ),
     ),
@@ -247,7 +275,7 @@ ThemeData buildAppTheme(
       behavior: SnackBarBehavior.floating,
       backgroundColor: scheme.surfaceContainerHigh,
       contentTextStyle: TextStyle(color: scheme.onSurface),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
     ),
     bottomSheetTheme: BottomSheetThemeData(
       backgroundColor: scheme.surface,
@@ -266,10 +294,7 @@ ThemeData buildAppTheme(
       backgroundColor: scheme.surface,
       indicatorColor: scheme.primaryContainer,
       labelTextStyle: WidgetStatePropertyAll(
-        TextStyle(
-          color: scheme.onSurface,
-          fontWeight: FontWeight.w700,
-        ),
+        TextStyle(color: scheme.onSurface, fontWeight: FontWeight.w700),
       ),
     ),
     progressIndicatorTheme: ProgressIndicatorThemeData(
@@ -280,15 +305,16 @@ ThemeData buildAppTheme(
     chipTheme: ChipThemeData(
       backgroundColor: scheme.surfaceContainerHigh,
       selectedColor: scheme.primaryContainer,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+      shape: const StadiumBorder(),
       side: BorderSide.none,
       labelStyle: TextStyle(color: scheme.onSurface),
     ),
     listTileTheme: ListTileThemeData(
       iconColor: scheme.onSurfaceVariant,
       tileColor: elevatedSurface.withValues(
-          alpha: brightness == Brightness.dark ? 0.7 : 0.56),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        alpha: brightness == Brightness.dark ? 0.7 : 0.56,
+      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
     ),
     textSelectionTheme: TextSelectionThemeData(
       cursorColor: scheme.primary,
@@ -301,8 +327,9 @@ ThemeData buildAppTheme(
         TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
       },
     ),
-    splashFactory: InkRipple.splashFactory,
-    dividerTheme:
-        DividerThemeData(color: scheme.outlineVariant.withValues(alpha: 0.35)),
+    splashFactory: InkSparkle.splashFactory,
+    dividerTheme: DividerThemeData(
+      color: scheme.outlineVariant.withValues(alpha: 0.35),
+    ),
   );
 }

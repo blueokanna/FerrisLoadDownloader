@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.media.*
 import android.os.Build
 import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -11,6 +13,38 @@ import java.nio.ByteBuffer
 @SuppressLint("LogNotTimber")
 object MediaTranscoder {
     private const val TAG = "MediaTranscoder"
+
+    @JvmStatic
+    fun capabilityReport(): String {
+        val codecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+        val hardwareEncoders = codecs
+            .asSequence()
+            .filter { it.isEncoder && !isSoftwareCodec(it) }
+            .flatMap { codec ->
+                codec.supportedTypes.asSequence()
+                    .filter { it.startsWith("video/", ignoreCase = true) }
+                    .map { mime -> "${codec.name} | ${mime.lowercase()}" }
+            }
+            .distinct()
+            .sorted()
+            .toList()
+        val hardwareDecoders = codecs
+            .asSequence()
+            .filter { !it.isEncoder && !isSoftwareCodec(it) }
+            .flatMap { codec ->
+                codec.supportedTypes.asSequence()
+                    .filter { it.startsWith("video/", ignoreCase = true) }
+                    .map { mime -> "${codec.name} | ${mime.lowercase()}" }
+            }
+            .distinct()
+            .sorted()
+            .toList()
+
+        return JSONObject()
+            .put("hardwareVideoEncoders", JSONArray(hardwareEncoders))
+            .put("hardwareVideoDecoders", JSONArray(hardwareDecoders))
+            .toString()
+    }
 
     private const val TIMEOUT_US = 10_000L        // 10ms per poll
     private const val MAX_STALL_MS = 30_000L       // 30s stall → abort
@@ -118,7 +152,22 @@ object MediaTranscoder {
 
     private fun verifyOutput(path: String): Boolean {
         val f = File(path)
-        return f.exists() && f.length() > 1024 // 至少 1KB 才算有效
+        if (!f.exists() || f.length() <= 1024) return false
+
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(path)
+            (0 until extractor.trackCount).any { index ->
+                extractor.getTrackFormat(index)
+                    .getString(MediaFormat.KEY_MIME)
+                    ?.startsWith("video/") == true
+            }
+        } catch (error: Exception) {
+            Log.e(TAG, "verifyOutput could not read media tracks: ${error.message}", error)
+            false
+        } finally {
+            extractor.release()
+        }
     }
 
     private data class TrackInfo(val index: Int, val format: MediaFormat, val mime: String)
@@ -307,20 +356,19 @@ object MediaTranscoder {
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
-            val encoderInfo = selectCodec("video/avc", encoder = true)
-            encoder = if (encoderInfo != null) {
-                Log.i(TAG, "Using encoder ${encoderInfo.name}")
-                MediaCodec.createByCodecName(encoderInfo.name)
-            } else {
-                Log.w(TAG, "No preferred hardware AVC encoder found, using system default")
-                MediaCodec.createEncoderByType("video/avc")
+            val encoderInfo = selectCodec("video/avc", encoder = true, hardwareOnly = true)
+            if (encoderInfo == null) {
+                Log.e(TAG, "No hardware AVC encoder is available on this device")
+                return false
             }
+            Log.i(TAG, "Using hardware encoder ${encoderInfo.name}")
+            encoder = MediaCodec.createByCodecName(encoderInfo.name)
             encoder.configure(encFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surface = encoder.createInputSurface()
             encoder.start()
 
             // ── 解码器 ──
-            val decoderInfo = selectCodec(vMime, encoder = false)
+            val decoderInfo = selectCodec(vMime, encoder = false, hardwareOnly = false)
             decoder = if (decoderInfo != null) {
                 Log.i(TAG, "Using decoder ${decoderInfo.name}")
                 MediaCodec.createByCodecName(decoderInfo.name)
@@ -483,11 +531,16 @@ object MediaTranscoder {
         }
     }
 
-    private fun selectCodec(mime: String, encoder: Boolean): MediaCodecInfo? {
+    private fun selectCodec(
+        mime: String,
+        encoder: Boolean,
+        hardwareOnly: Boolean
+    ): MediaCodecInfo? {
         val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
             .filter { codec ->
                 codec.isEncoder == encoder &&
-                    codec.supportedTypes.any { it.equals(mime, ignoreCase = true) }
+                    codec.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
+                    (!hardwareOnly || !isSoftwareCodec(codec))
             }
             .sortedByDescending { scoreCodec(it) }
         val selected = codecs.firstOrNull()

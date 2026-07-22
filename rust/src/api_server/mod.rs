@@ -51,7 +51,12 @@ pub async fn run_server() {
         .and(with_tasks(list_tasks))
         .and_then(handle_list);
 
-    let routes = health.or(download).or(status).or(list).with(cors).with(warp::log("api"));
+    let routes = health
+        .or(download)
+        .or(status)
+        .or(list)
+        .with(cors)
+        .with(warp::log("api"));
 
     let host = std::env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port = std::env::var("API_PORT")
@@ -66,9 +71,7 @@ pub async fn run_server() {
     warp::serve(routes).run((bind_ip, port)).await;
 }
 
-fn with_tasks(
-    tasks: TaskStore,
-) -> impl Filter<Extract = (TaskStore,), Error = Infallible> + Clone {
+fn with_tasks(tasks: TaskStore) -> impl Filter<Extract = (TaskStore,), Error = Infallible> + Clone {
     warp::any().map(move || tasks.clone())
 }
 

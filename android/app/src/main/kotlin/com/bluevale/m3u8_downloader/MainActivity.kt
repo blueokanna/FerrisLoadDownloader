@@ -10,6 +10,7 @@ import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
 
@@ -37,6 +38,39 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "getRuntimeCapabilities" -> {
+                        try {
+                            val report = JSONObject(MediaTranscoder.capabilityReport())
+                            val encoders = report.getJSONArray("hardwareVideoEncoders")
+                            val decoders = report.getJSONArray("hardwareVideoDecoders")
+                            result.success(
+                                mapOf(
+                                    "platform" to "android",
+                                    "transcoderBackend" to if (encoders.length() > 0) {
+                                        "Android MediaCodec / MediaMuxer"
+                                    } else {
+                                        "Android MediaMuxer only"
+                                    },
+                                    "hardwareAccelerated" to (encoders.length() > 0),
+                                    "videoEncoders" to List(encoders.length()) { index ->
+                                        encoders.getString(index)
+                                    },
+                                    "videoDecoders" to List(decoders.length()) { index ->
+                                        decoders.getString(index)
+                                    },
+                                    "ffmpegAvailable" to false,
+                                    "ytdlpAvailable" to false,
+                                )
+                            )
+                        } catch (error: Exception) {
+                            result.error(
+                                "CAPABILITY_PROBE_FAILED",
+                                "MediaCodec capability probe failed",
+                                error.message,
+                            )
+                        }
+                    }
+
                     "saveToDownloads" -> {
                         val srcPath = call.argument<String>("srcPath")
                         val fileName = call.argument<String>("fileName")
