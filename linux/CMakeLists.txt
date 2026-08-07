@@ -74,6 +74,12 @@ set_target_properties(${BINARY_NAME}
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# The FFI plugin exposes a path for install(FILES), which does not create a
+# target dependency by itself. Build the Rust shared library before bundling.
+if(TARGET rust_lib_m3u8_downloader_cargokit)
+  add_dependencies(${BINARY_NAME} rust_lib_m3u8_downloader_cargokit)
+endif()
+
 
 # === Installation ===
 # By default, "installing" just makes a relocatable bundle in the build

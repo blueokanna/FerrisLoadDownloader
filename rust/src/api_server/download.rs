@@ -166,7 +166,7 @@ fn infer_name_from_url(url: &str) -> String {
         .and_then(|parsed| {
             parsed
                 .path_segments()
-                .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last())
+                .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
                 .map(|segment| segment.to_string())
         })
         .filter(|name| !name.trim().is_empty())

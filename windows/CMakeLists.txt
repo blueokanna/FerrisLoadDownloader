@@ -71,6 +71,13 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# FFI plugins only contribute their native library path to the install bundle;
+# CMake does not infer a build dependency from install(FILES). Ensure the Rust
+# DLL exists before the runner's install step copies bundled libraries.
+if(TARGET rust_lib_m3u8_downloader_cargokit)
+  add_dependencies(${BINARY_NAME} rust_lib_m3u8_downloader_cargokit)
+endif()
+
 
 # === Installation ===
 # Support files are copied into place next to the executable, so that it can

@@ -11,9 +11,17 @@ val keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
     keystorePropertiesFile.inputStream().use(keystoreProperties::load)
 }
+val releaseStoreFile = keystoreProperties.getProperty("storeFile")
+    ?.takeIf(String::isNotBlank)
+    ?.let(rootProject::file)
+    ?.takeIf { it.isFile }
+val hasReleaseSigning = releaseStoreFile != null &&
+    listOf("keyAlias", "keyPassword", "storePassword").all {
+        !keystoreProperties.getProperty(it).isNullOrBlank()
+    }
 
 android {
-    namespace = "com.blue.ferrisload"
+    namespace = "com.bluevale.m3u8_downloader"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -42,25 +50,24 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-        ndk {
-            // Flutter supports ARMv7, ARM64, and x86_64 on current Android releases.
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
-        }
     }
 
     signingConfigs {
-        create("release") {
-            keyAlias = keystoreProperties["keyAlias"] as String?
-            keyPassword = keystoreProperties["keyPassword"] as String?
-            storeFile =
-                (keystoreProperties["storeFile"] as String?)?.let(rootProject::file)
-            storePassword = keystoreProperties["storePassword"] as String?
+        if (hasReleaseSigning) {
+            create("release") {
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                storeFile = releaseStoreFile
+                storePassword = keystoreProperties.getProperty("storePassword")
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = signingConfigs.getByName(
+                if (hasReleaseSigning) "release" else "debug"
+            )
             
             // Keep MediaTranscoder class from being stripped by R8
             proguardFiles(

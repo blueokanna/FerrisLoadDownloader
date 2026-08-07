@@ -278,7 +278,7 @@ fn collect_bilibili_audio_tracks(value: &Value) -> Vec<BilibiliAudioTrack> {
         }
     }
 
-    tracks.sort_by(|left, right| right.bandwidth.cmp(&left.bandwidth));
+    tracks.sort_by_key(|track| std::cmp::Reverse(track.bandwidth));
     tracks
 }
 

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.media.*
 import android.os.Build
 import android.util.Log
+import android.view.Surface
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -19,7 +20,11 @@ object MediaTranscoder {
         val codecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
         val hardwareEncoders = codecs
             .asSequence()
-            .filter { it.isEncoder && !isSoftwareCodec(it) }
+            .filter {
+                it.isEncoder &&
+                    !isSoftwareCodec(it) &&
+                    supportsSurfaceInput(it, "video/avc")
+            }
             .flatMap { codec ->
                 codec.supportedTypes.asSequence()
                     .filter { it.startsWith("video/", ignoreCase = true) }
@@ -49,6 +54,8 @@ object MediaTranscoder {
     private const val TIMEOUT_US = 10_000L        // 10ms per poll
     private const val MAX_STALL_MS = 30_000L       // 30s stall → abort
 
+    private data class EncoderSession(val codec: MediaCodec, val surface: Surface)
+
     @JvmStatic
     fun transcode(
         inputPath: String?,
@@ -58,6 +65,10 @@ object MediaTranscoder {
     ): Boolean {
         if (inputPath == null || outputPath == null) {
             Log.e(TAG, "transcode: input or output is null")
+            return false
+        }
+        if (aBitrate > 0) {
+            Log.e(TAG, "Audio bitrate conversion is not supported by the Android backend")
             return false
         }
         try {
@@ -251,7 +262,10 @@ object MediaTranscoder {
 
             if (audioIdx >= 0) {
                 val aMime = extractor.getTrackFormat(audioIdx).getString(MediaFormat.KEY_MIME) ?: ""
-                if (aMime != "audio/mp4a-latm" && aMime != "audio/aac") audioIdx = -1
+                if (aMime != "audio/mp4a-latm" && aMime != "audio/aac") {
+                    Log.w(TAG, "Cannot preserve non-AAC audio while remuxing to MP4: $aMime")
+                    return false
+                }
             }
 
             extractor.release(); extractor = null
@@ -326,6 +340,7 @@ object MediaTranscoder {
         var muxer: MediaMuxer? = null
         var decoder: MediaCodec? = null
         var encoder: MediaCodec? = null
+        var encoderSurface: Surface? = null
 
         try {
             extractor.setDataSource(inputPath)
@@ -348,7 +363,16 @@ object MediaTranscoder {
             Log.i(TAG, "Input video: $vMime ${w}x${h}@${fps}fps")
 
             // ── 编码器 ──
-            val targetBitrate = if (vBitrate > 0) vBitrate * 1000 else 2_500_000
+            val targetBitrate = if (vBitrate > 0) {
+                try {
+                    Math.multiplyExact(vBitrate, 1000)
+                } catch (error: ArithmeticException) {
+                    Log.e(TAG, "Video bitrate is too large for MediaCodec: $vBitrate kbit/s")
+                    return false
+                }
+            } else {
+                2_500_000
+            }
             val encFmt = MediaFormat.createVideoFormat("video/avc", w, h).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -356,16 +380,13 @@ object MediaTranscoder {
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
-            val encoderInfo = selectCodec("video/avc", encoder = true, hardwareOnly = true)
-            if (encoderInfo == null) {
+            val encoderSession = createHardwareAvcEncoder(encFmt, w, h, fps, targetBitrate)
+            if (encoderSession == null) {
                 Log.e(TAG, "No hardware AVC encoder is available on this device")
                 return false
             }
-            Log.i(TAG, "Using hardware encoder ${encoderInfo.name}")
-            encoder = MediaCodec.createByCodecName(encoderInfo.name)
-            encoder.configure(encFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            val surface = encoder.createInputSurface()
-            encoder.start()
+            encoder = encoderSession.codec
+            encoderSurface = encoderSession.surface
 
             // ── 解码器 ──
             val decoderInfo = selectCodec(vMime, encoder = false, hardwareOnly = false)
@@ -376,7 +397,7 @@ object MediaTranscoder {
                 Log.w(TAG, "No preferred hardware decoder found for $vMime, using system default")
                 MediaCodec.createDecoderByType(vMime)
             }
-            decoder.configure(vFmt, surface, null, 0)
+            decoder.configure(vFmt, encoderSurface, null, 0)
             decoder.start()
 
             // ── Muxer ──
@@ -390,8 +411,8 @@ object MediaTranscoder {
                 if (aMime == "audio/mp4a-latm" || aMime == "audio/aac") {
                     audioMuxIdx = muxer.addTrack(aFmt)
                 } else {
-                    Log.w(TAG, "Skipping non-AAC audio: $aMime")
-                    audioIdx = -1
+                    Log.e(TAG, "Cannot preserve non-AAC audio in MP4: $aMime")
+                    return false
                 }
             }
 
@@ -498,9 +519,66 @@ object MediaTranscoder {
         } finally {
             runCatching { decoder?.stop(); decoder?.release() }
             runCatching { encoder?.stop(); encoder?.release() }
+            runCatching { encoderSurface?.release() }
             runCatching { muxer?.release() }
             extractor.release()
         }
+    }
+
+    private fun createHardwareAvcEncoder(
+        format: MediaFormat,
+        width: Int,
+        height: Int,
+        frameRate: Int,
+        bitrate: Int
+    ): EncoderSession? {
+        val candidates = codecCandidates("video/avc", encoder = true, hardwareOnly = true)
+        for (codecInfo in candidates) {
+            val capabilities = try {
+                codecInfo.getCapabilitiesForType("video/avc")
+            } catch (error: Exception) {
+                Log.w(TAG, "Cannot query ${codecInfo.name}: ${error.message}")
+                continue
+            }
+            if (!capabilities.colorFormats.contains(
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                )
+            ) {
+                continue
+            }
+
+            val videoCapabilities = capabilities.videoCapabilities ?: continue
+            val supported = runCatching {
+                videoCapabilities.isSizeSupported(width, height) &&
+                    videoCapabilities.areSizeAndRateSupported(
+                        width,
+                        height,
+                        frameRate.coerceAtLeast(1).toDouble()
+                    ) &&
+                    videoCapabilities.bitrateRange.contains(bitrate)
+            }.getOrDefault(false)
+            if (!supported) {
+                Log.i(
+                    TAG,
+                    "Skipping ${codecInfo.name}: unsupported ${width}x$height@$frameRate or $bitrate bps"
+                )
+                continue
+            }
+
+            var codec: MediaCodec? = null
+            try {
+                codec = MediaCodec.createByCodecName(codecInfo.name)
+                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                val surface = codec.createInputSurface()
+                codec.start()
+                Log.i(TAG, "Using hardware encoder ${codecInfo.name}")
+                return EncoderSession(codec, surface)
+            } catch (error: Exception) {
+                Log.w(TAG, "Encoder ${codecInfo.name} rejected the format: ${error.message}")
+                runCatching { codec?.release() }
+            }
+        }
+        return null
     }
 
     private fun writeAudioPassthrough(
@@ -536,19 +614,33 @@ object MediaTranscoder {
         encoder: Boolean,
         hardwareOnly: Boolean
     ): MediaCodecInfo? {
-        val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+        val selected = codecCandidates(mime, encoder, hardwareOnly).firstOrNull()
+        if (selected != null) {
+            Log.i(TAG, "Selected ${if (encoder) "encoder" else "decoder"} ${selected.name} for $mime")
+        }
+        return selected
+    }
+
+    private fun codecCandidates(
+        mime: String,
+        encoder: Boolean,
+        hardwareOnly: Boolean
+    ): List<MediaCodecInfo> =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
             .filter { codec ->
                 codec.isEncoder == encoder &&
                     codec.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
                     (!hardwareOnly || !isSoftwareCodec(codec))
             }
             .sortedByDescending { scoreCodec(it) }
-        val selected = codecs.firstOrNull()
-        if (selected != null) {
-            Log.i(TAG, "Selected ${if (encoder) "encoder" else "decoder"} ${selected.name} for $mime")
-        }
-        return selected
-    }
+
+    private fun supportsSurfaceInput(codec: MediaCodecInfo, mime: String): Boolean =
+        runCatching {
+            codec.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
+                codec.getCapabilitiesForType(mime).colorFormats.contains(
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                )
+        }.getOrDefault(false)
 
     private fun scoreCodec(codec: MediaCodecInfo): Int {
         val name = codec.name.lowercase()

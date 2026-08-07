@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 #![allow(unused_imports, unused_variables)]
-
 use crate::api::site_adapters::{extractor_name_for_host, inspect_page_candidates, SiteWarning};
 use crate::frb_generated::StreamSink;
 use aes::Aes128;
 use anyhow::{anyhow, bail, Context, Result};
 use block_modes::block_padding::Pkcs7;
 use block_modes::{BlockMode, Cbc};
+use ferrisload_core::{DownloadPlan, DOWNLOAD_PLAN_VERSION};
 use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, info, warn};
@@ -45,38 +45,38 @@ pub(crate) type ProgressReporter = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccelType {
     Nvidia,
-    AMD,
+    Amd,
     IntelQuickSync,
     LinuxVaapi,
     AppleVideoToolbox,
-    CPU,
+    Cpu,
 }
 
 impl AccelType {
     fn label(self) -> &'static str {
         match self {
             Self::Nvidia => "NVIDIA NVENC",
-            Self::AMD => "AMD AMF",
+            Self::Amd => "AMD AMF",
             Self::IntelQuickSync => "Intel Quick Sync",
             Self::LinuxVaapi => "Linux VAAPI",
             Self::AppleVideoToolbox => "Apple VideoToolbox",
-            Self::CPU => "CPU libx264",
+            Self::Cpu => "CPU libx264",
         }
     }
 
     fn encoder(self) -> &'static str {
         match self {
             Self::Nvidia => "h264_nvenc",
-            Self::AMD => "h264_amf",
+            Self::Amd => "h264_amf",
             Self::IntelQuickSync => "h264_qsv",
             Self::LinuxVaapi => "h264_vaapi",
             Self::AppleVideoToolbox => "h264_videotoolbox",
-            Self::CPU => "libx264",
+            Self::Cpu => "libx264",
         }
     }
 
     fn hardware_accelerated(self) -> bool {
-        self != Self::CPU
+        self != Self::Cpu
     }
 }
 
@@ -526,6 +526,11 @@ impl AndroidMediaCodecTranscoder {
         video_bitrate: u32,
         audio_bitrate: u32,
     ) -> Result<()> {
+        if audio_bitrate > 0 {
+            bail!(
+                "Android MediaCodec does not currently support audio bitrate conversion; use 0 to preserve AAC audio"
+            );
+        }
         let input_ts = input_ts.to_string();
         let output_mp4 = output_mp4.to_string();
 
@@ -887,6 +892,7 @@ fn select_writable_temp_dir() -> Result<PathBuf> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 #[flutter_rust_bridge::frb()]
 pub async fn hls2mp4_run(
     sink: StreamSink<ProgressUpdate>,
@@ -911,6 +917,7 @@ pub async fn hls2mp4_run(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn hls2mp4_core(
     reporter: ProgressReporter,
     url: String,
@@ -1217,10 +1224,7 @@ async fn augment_youtube_candidates_with_ytdlp(
         .map_err(|_| anyhow!("yt-dlp inspection timed out"))?
         .context("Failed to start yt-dlp")?;
     if !output.status.success() {
-        bail!(
-            "{}",
-            String::from_utf8_lossy(&output.stderr).trim().to_string()
-        );
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
     let metadata: Value =
@@ -1395,6 +1399,7 @@ fn find_ytdlp_output(temp_dir: &Path) -> Option<PathBuf> {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn run_ytdlp_site_pipeline(
     reporter: ProgressReporter,
@@ -1556,15 +1561,15 @@ async fn run_ytdlp_site_pipeline(
         )
         .await?;
         cleanup_temp_files(keep_temp, [&downloaded_path]).await;
-    } else if downloaded_path != output_path {
-        if fs::rename(&downloaded_path, &output_path).await.is_err() {
-            fs::copy(&downloaded_path, &output_path)
-                .await
-                .with_context(|| {
-                    format!("Failed to move yt-dlp output to {}", output_path.display())
-                })?;
-            cleanup_temp_files(keep_temp, [&downloaded_path]).await;
-        }
+    } else if downloaded_path != output_path
+        && fs::rename(&downloaded_path, &output_path).await.is_err()
+    {
+        fs::copy(&downloaded_path, &output_path)
+            .await
+            .with_context(|| {
+                format!("Failed to move yt-dlp output to {}", output_path.display())
+            })?;
+        cleanup_temp_files(keep_temp, [&downloaded_path]).await;
     }
 
     if !keep_temp {
@@ -1575,6 +1580,7 @@ async fn run_ytdlp_site_pipeline(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[flutter_rust_bridge::frb()]
 pub async fn download_media_run(
     sink: StreamSink<ProgressUpdate>,
@@ -1604,6 +1610,7 @@ pub async fn download_media_run(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[flutter_rust_bridge::frb()]
 pub async fn download_media_with_context(
     sink: StreamSink<ProgressUpdate>,
@@ -1634,6 +1641,7 @@ pub async fn download_media_with_context(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_media_with_context_core(
     reporter: ProgressReporter,
     page_url: String,
@@ -1648,6 +1656,25 @@ pub(crate) async fn download_media_with_context_core(
     request_context: RequestContext,
 ) -> Result<()> {
     init_runtime_logging();
+
+    let plan = DownloadPlan {
+        version: DOWNLOAD_PLAN_VERSION,
+        page_url: &page_url,
+        media_url: &media_url,
+        audio_url: audio_url.as_deref(),
+        output_path: &output,
+        concurrency: u16::try_from(concurrency)
+            .map_err(|_| anyhow!("concurrency must be a positive 16-bit value"))?,
+        retries: u8::try_from(retries)
+            .map_err(|_| anyhow!("retries must be a non-negative 8-bit value"))?,
+        video_bitrate_kbps: u32::try_from(video_bitrate)
+            .map_err(|_| anyhow!("video bitrate must not be negative"))?,
+        audio_bitrate_kbps: u32::try_from(audio_bitrate)
+            .map_err(|_| anyhow!("audio bitrate must not be negative"))?,
+        keep_temporary_files: keep_temp,
+    };
+    plan.validate()
+        .map_err(|error| anyhow!("invalid download plan: {error}"))?;
 
     let page_url = normalize_source_url(&page_url)?;
     let media_url = normalize_source_url(&media_url)?;
@@ -1866,6 +1893,7 @@ pub(crate) async fn download_media_with_context_core(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_dash_pipeline(
     reporter: ProgressReporter,
     manifest_url: &str,
@@ -1955,6 +1983,7 @@ async fn run_dash_pipeline(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_hls_pipeline(
     reporter: ProgressReporter,
     url: &str,
@@ -2314,6 +2343,7 @@ impl CandidateCollector {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push(
         &mut self,
         media_url: String,
@@ -2379,10 +2409,9 @@ fn infer_title_from_url(url: &str) -> String {
     Url::parse(url)
         .ok()
         .and_then(|parsed| {
-            parsed.path_segments().and_then(|segments| {
+            parsed.path_segments().and_then(|mut segments| {
                 segments
-                    .filter(|segment| !segment.is_empty())
-                    .last()
+                    .rfind(|segment| !segment.is_empty())
                     .map(str::to_string)
             })
         })
@@ -2774,6 +2803,7 @@ async fn stream_media_response_to_file(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_with_retries(
     client: &Client,
     url: &str,
@@ -3404,7 +3434,7 @@ async fn merge_media_streams(
     let mut selected_accel = if requires_reencode {
         detect_acceleration(&ffmpeg_path).await?
     } else {
-        AccelType::CPU
+        AccelType::Cpu
     };
     if requires_reencode {
         emit_progress(
@@ -3434,7 +3464,7 @@ async fn merge_media_streams(
     )
     .await?;
 
-    if !output.status.success() && requires_reencode && selected_accel != AccelType::CPU {
+    if !output.status.success() && requires_reencode && selected_accel != AccelType::Cpu {
         warn!(
             "{} merge encode failed, retrying with CPU libx264: {}",
             selected_accel.label(),
@@ -3448,7 +3478,7 @@ async fn merge_media_streams(
             ),
             0.94,
         );
-        selected_accel = AccelType::CPU;
+        selected_accel = AccelType::Cpu;
         let _ = fs::remove_file(output_path).await;
         output = run_ffmpeg_merge(
             video_path,
@@ -3515,14 +3545,14 @@ async fn run_ffmpeg_merge(
                 "-rc".to_string(),
                 "vbr".to_string(),
             ]),
-            AccelType::CPU => args.extend(["-preset".to_string(), "medium".to_string()]),
+            AccelType::Cpu => args.extend(["-preset".to_string(), "medium".to_string()]),
             AccelType::LinuxVaapi => args.extend([
                 "-vaapi_device".to_string(),
                 "/dev/dri/renderD128".to_string(),
                 "-vf".to_string(),
                 "format=nv12,hwupload".to_string(),
             ]),
-            AccelType::AMD | AccelType::IntelQuickSync | AccelType::AppleVideoToolbox => {}
+            AccelType::Amd | AccelType::IntelQuickSync | AccelType::AppleVideoToolbox => {}
         }
         if video_bitrate > 0 {
             args.push("-b:v".to_string());
@@ -3838,6 +3868,7 @@ async fn select_transcoder_backend() -> Result<TranscoderKind> {
     bail!("FFmpeg not found and not running on Android; no available transcoder");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_and_merge(
     playlist: m3u8_rs::MediaPlaylist,
     base_url: Option<Url>,
@@ -4040,6 +4071,7 @@ fn decrypt_hls_resource(data: Vec<u8>, crypto: Option<&(Vec<u8>, Vec<u8>)>) -> R
     Ok(cipher.decrypt_vec(&data)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_and_merge_once(
     playlist: m3u8_rs::MediaPlaylist,
     base_url: Option<Url>,
@@ -4343,7 +4375,7 @@ async fn detect_acceleration(ffmpeg_path: &Path) -> Result<AccelType> {
     let list = String::from_utf8_lossy(&output.stdout);
     let candidates = [
         AccelType::Nvidia,
-        AccelType::AMD,
+        AccelType::Amd,
         AccelType::IntelQuickSync,
         AccelType::LinuxVaapi,
         AccelType::AppleVideoToolbox,
@@ -4354,10 +4386,10 @@ async fn detect_acceleration(ffmpeg_path: &Path) -> Result<AccelType> {
             return Ok(candidate);
         }
     }
-    if list.contains(AccelType::CPU.encoder())
-        && probe_ffmpeg_encoder(ffmpeg_path, AccelType::CPU).await
+    if list.contains(AccelType::Cpu.encoder())
+        && probe_ffmpeg_encoder(ffmpeg_path, AccelType::Cpu).await
     {
-        return Ok(AccelType::CPU);
+        return Ok(AccelType::Cpu);
     }
     bail!("FFmpeg is installed but no usable H.264 encoder passed the runtime probe")
 }
@@ -4441,7 +4473,7 @@ async fn convert_to_mp4(
             )
             .await?;
 
-            if !output.status.success() && selected_accel != AccelType::CPU && requires_reencode {
+            if !output.status.success() && selected_accel != AccelType::Cpu && requires_reencode {
                 warn!(
                     "{} failed, retrying with CPU libx264: {}",
                     selected_accel.label(),
@@ -4455,7 +4487,7 @@ async fn convert_to_mp4(
                     ),
                     0.96,
                 );
-                selected_accel = AccelType::CPU;
+                selected_accel = AccelType::Cpu;
                 output = run_ffmpeg_conversion(
                     input_ts,
                     output_path,
@@ -4568,14 +4600,14 @@ async fn run_ffmpeg_conversion(
                 "-rc".to_string(),
                 "vbr".to_string(),
             ]),
-            AccelType::CPU => args.extend(["-preset".to_string(), "medium".to_string()]),
+            AccelType::Cpu => args.extend(["-preset".to_string(), "medium".to_string()]),
             AccelType::LinuxVaapi => args.extend([
                 "-vaapi_device".to_string(),
                 "/dev/dri/renderD128".to_string(),
                 "-vf".to_string(),
                 "format=nv12,hwupload".to_string(),
             ]),
-            AccelType::AMD | AccelType::IntelQuickSync | AccelType::AppleVideoToolbox => {}
+            AccelType::Amd | AccelType::IntelQuickSync | AccelType::AppleVideoToolbox => {}
         }
         if video_bitrate > 0 {
             args.extend(["-b:v".to_string(), format!("{}k", video_bitrate)]);

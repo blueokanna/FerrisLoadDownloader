@@ -10,6 +10,12 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
+    clang \
+    cmake \
+    ninja-build \
+    libgtk-3-dev \
+    libsecret-1-dev \
+    liblzma-dev \
     git \
     unzip \
     xz-utils \
@@ -39,10 +45,10 @@ RUN flutter config --enable-linux-desktop
 RUN flutter pub get
 
 # 生成Rust桥接代码
-RUN flutter_rust_bridge_codegen generate
+RUN test -f lib/src/rust/frb_generated.dart
 
 # 构建Rust库
-RUN cd rust && cargo build --release
+RUN cd rust && cargo build --release --locked
 
 # 构建Linux应用
 RUN flutter build linux --release

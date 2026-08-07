@@ -20,13 +20,57 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FLUTTER_VERSION: '3.27.1'
-  FRB_VERSION: '2.12.0'
   CARGO_TERM_COLOR: always
+  PUB_HOSTED_URL: https://pub.dev
+  FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
 
 jobs:
+  validate:
+    name: Validate sources and packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Rust MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Validate Rust MSRV and no_std core
+        working-directory: rust
+        run: |
+          cargo check --workspace --all-targets --locked
+          cargo check -p ferrisload-core --no-default-features --locked
+
+      - name: Setup stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Validate Rust workspace
+        working-directory: rust
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          cargo package -p ferrisload-core --locked --allow-dirty
+
+      - name: Validate Flutter application
+        run: |
+          flutter analyze
+          flutter test
+
   build-android:
     name: Build Android APKs
+    needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -42,7 +86,6 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
@@ -51,8 +94,7 @@ jobs:
           targets: >-
             aarch64-linux-android,
             armv7-linux-androideabi,
-            x86_64-linux-android,
-            i686-linux-android
+            x86_64-linux-android
 
       - name: Cache Rust dependencies
         uses: actions/cache@v4
@@ -71,38 +113,41 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked || true
-
-      - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --locked || true
-
-      - name: Enable Android desktop targets if needed
+      - name: Configure Flutter
         run: flutter config --no-analytics
 
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Generate bridge code
-        run: flutter_rust_bridge_codegen generate
-
-      - name: Generate launcher icons
-        run: dart run flutter_launcher_icons
-
-      - name: Build Rust JNI libraries
-        working-directory: rust
+      - name: Configure Android release signing
+        shell: bash
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RELEASE_REQUESTED: ${{ startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '' }}
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
         run: |
-          cargo ndk \
-            -t arm64-v8a \
-            -t armeabi-v7a \
-            -t x86_64 \
-            -t x86 \
-            -o ../android/app/src/main/jniLibs \
-              build --release --locked --lib
+          if [[ "$RELEASE_REQUESTED" == "true" ]]; then
+            test -n "$KEYSTORE_BASE64" || { echo "ANDROID_KEYSTORE_BASE64 is required for a release" >&2; exit 1; }
+            test -n "$KEY_ALIAS" || { echo "ANDROID_KEY_ALIAS is required for a release" >&2; exit 1; }
+            test -n "$KEY_PASSWORD" || { echo "ANDROID_KEY_PASSWORD is required for a release" >&2; exit 1; }
+            test -n "$STORE_PASSWORD" || { echo "ANDROID_STORE_PASSWORD is required for a release" >&2; exit 1; }
+          fi
+          if [[ -n "$KEYSTORE_BASE64" ]]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/release.jks
+            {
+              printf 'storeFile=app/release.jks\n'
+              printf 'storePassword=%s\n' "$STORE_PASSWORD"
+              printf 'keyAlias=%s\n' "$KEY_ALIAS"
+              printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+            } > android/key.properties
+          fi
 
       - name: Build split APKs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: flutter build apk --release --split-per-abi
 
       - name: Collect Android artifacts
@@ -112,9 +157,6 @@ jobs:
           cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk dist/android/FerrisLoad-android-arm64-v8a.apk
           cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk dist/android/FerrisLoad-android-armeabi-v7a.apk
           cp build/app/outputs/flutter-apk/app-x86_64-release.apk dist/android/FerrisLoad-android-x86_64.apk
-          if [ -f build/app/outputs/flutter-apk/app-x86-release.apk ]; then
-            cp build/app/outputs/flutter-apk/app-x86-release.apk dist/android/FerrisLoad-android-x86.apk
-          fi
           ls -lah dist/android
 
       - name: Upload Android artifacts
@@ -126,6 +168,7 @@ jobs:
 
   build-windows:
     name: Build Windows x64
+    needs: validate
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -135,7 +178,6 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
@@ -153,15 +195,8 @@ jobs:
           key: rust-windows-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml') }}
           restore-keys: rust-windows-
 
-      - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --locked
-        continue-on-error: true
-
       - name: Flutter pub get
         run: flutter pub get
-
-      - name: Generate bridge code
-        run: flutter_rust_bridge_codegen generate
 
       - name: Build Windows release bundle
         run: flutter build windows --release
@@ -180,13 +215,14 @@ jobs:
 
   build-macos:
     name: Build macOS ${{ matrix.arch }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - runner: macos-15-intel
             arch: x64
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -197,7 +233,6 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
@@ -213,17 +248,11 @@ jobs:
           key: rust-macos-${{ matrix.arch }}-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml') }}
           restore-keys: rust-macos-${{ matrix.arch }}-
 
-      - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --locked || true
-
       - name: Enable macOS desktop
         run: flutter config --enable-macos-desktop
 
       - name: Flutter pub get
         run: flutter pub get
-
-      - name: Generate bridge code
-        run: flutter_rust_bridge_codegen generate
 
       - name: Build macOS app
         run: flutter build macos --release
@@ -245,7 +274,8 @@ jobs:
           retention-days: 7
 
   build-linux:
-    name: Build Linux x64 portable bundle
+    name: Build Linux x64 bundle
+    needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -268,7 +298,6 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
@@ -284,17 +313,11 @@ jobs:
           key: rust-linux-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml') }}
           restore-keys: rust-linux-
 
-      - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --locked || true
-
       - name: Enable Linux desktop
         run: flutter config --enable-linux-desktop
 
       - name: Flutter pub get
         run: flutter pub get
-
-      - name: Generate bridge code
-        run: flutter_rust_bridge_codegen generate
 
       - name: Build Linux release bundle
         run: flutter build linux --release
@@ -303,18 +326,19 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/linux
-          tar -C build/linux/x64/release/bundle -czf dist/linux/FerrisLoad-linux-x64-portable.tar.gz .
+          tar -C build/linux/x64/release/bundle -czf dist/linux/FerrisLoad-linux-x64.tar.gz .
           ls -lah dist/linux
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-x64
-          path: dist/linux/FerrisLoad-linux-x64-portable.tar.gz
+          path: dist/linux/FerrisLoad-linux-x64.tar.gz
           retention-days: 7
 
   docker-api:
     name: Publish Docker API image
+    needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -395,6 +419,15 @@ jobs:
       - name: List release files
         run: find artifacts -type f | sort
 
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          find artifacts -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed -E 's#  artifacts/[^/]+/#  #' > artifacts/SHA256SUMS
+          cat artifacts/SHA256SUMS
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -411,4 +444,5 @@ jobs:
             artifacts/windows-x64/FerrisLoad-windows-x64.zip
             artifacts/macos-x64/FerrisLoad-macos-x64.zip
             artifacts/macos-arm64/FerrisLoad-macos-arm64.zip
-            artifacts/linux-x64/FerrisLoad-linux-x64-portable.tar.gz
+            artifacts/linux-x64/FerrisLoad-linux-x64.tar.gz
+            artifacts/SHA256SUMS

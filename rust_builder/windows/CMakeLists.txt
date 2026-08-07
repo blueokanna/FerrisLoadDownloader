@@ -18,3 +18,18 @@ set(rust_lib_m3u8_downloader_bundled_libraries
   "${${PROJECT_NAME}_cargokit_lib}"
   PARENT_SCOPE
 )
+
+# Flutter builds INSTALL.vcxproj with project references disabled. Build the
+# FFI artifact from the install script itself before the parent project copies
+# the bundled DLL, and fail the install if Cargokit fails.
+install(CODE "
+  execute_process(
+    COMMAND \"${CMAKE_COMMAND}\" --build \"${CMAKE_BINARY_DIR}\"
+      --config \"\${CMAKE_INSTALL_CONFIG_NAME}\"
+      --target ${PROJECT_NAME}_cargokit
+    RESULT_VARIABLE CARGOKIT_BUILD_RESULT
+  )
+  if(NOT CARGOKIT_BUILD_RESULT EQUAL 0)
+    message(FATAL_ERROR \"Cargokit failed with exit code \${CARGOKIT_BUILD_RESULT}\")
+  endif()
+" COMPONENT Runtime)

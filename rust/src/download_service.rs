@@ -6,6 +6,7 @@ use crate::api::downloader::{self, ProgressUpdate, RequestContext};
 
 pub type DownloadProgressHandler = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn hls_to_mp4(
     url: String,
     concurrency: i32,
@@ -29,6 +30,7 @@ pub async fn hls_to_mp4(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn download_media(
     page_url: String,
     media_url: String,

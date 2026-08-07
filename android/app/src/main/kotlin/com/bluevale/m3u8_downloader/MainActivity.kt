@@ -43,15 +43,18 @@ class MainActivity : FlutterActivity() {
                             val report = JSONObject(MediaTranscoder.capabilityReport())
                             val encoders = report.getJSONArray("hardwareVideoEncoders")
                             val decoders = report.getJSONArray("hardwareVideoDecoders")
+                            val hardwareTranscoderReady = rustLibLoaded && encoders.length() > 0
                             result.success(
                                 mapOf(
                                     "platform" to "android",
-                                    "transcoderBackend" to if (encoders.length() > 0) {
+                                    "transcoderBackend" to if (hardwareTranscoderReady) {
                                         "Android MediaCodec / MediaMuxer"
+                                    } else if (rustLibLoaded) {
+                                        "Android MediaMuxer (no hardware AVC encoder)"
                                     } else {
-                                        "Android MediaMuxer only"
+                                        "Unavailable (Rust runtime failed to load)"
                                     },
-                                    "hardwareAccelerated" to (encoders.length() > 0),
+                                    "hardwareAccelerated" to hardwareTranscoderReady,
                                     "videoEncoders" to List(encoders.length()) { index ->
                                         encoders.getString(index)
                                     },
@@ -60,6 +63,7 @@ class MainActivity : FlutterActivity() {
                                     },
                                     "ffmpegAvailable" to false,
                                     "ytdlpAvailable" to false,
+                                    "nativeRuntimeLoaded" to rustLibLoaded,
                                 )
                             )
                         } catch (error: Exception) {
