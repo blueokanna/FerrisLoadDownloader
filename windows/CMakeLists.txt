@@ -71,6 +71,17 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+if(MSVC)
+  foreach(PLUGIN_TARGET
+      flutter_inappwebview_windows_plugin
+      permission_handler_windows_plugin)
+    if(TARGET ${PLUGIN_TARGET})
+      target_compile_definitions(${PLUGIN_TARGET} PRIVATE
+        _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+    endif()
+  endforeach()
+endif()
+
 # FFI plugins only contribute their native library path to the install bundle;
 # CMake does not infer a build dependency from install(FILES). Ensure the Rust
 # DLL exists before the runner's install step copies bundled libraries.

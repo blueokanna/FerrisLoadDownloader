@@ -74,6 +74,8 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 50
+    outputs:
+      release_signed: ${{ steps.android_signing.outputs.release_signed }}
     steps:
       - uses: actions/checkout@v4
 
@@ -120,22 +122,22 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Configure Android release signing
+      - name: Configure Android signing
+        id: android_signing
         shell: bash
         env:
-          RELEASE_REQUESTED: ${{ startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '' }}
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
         run: |
-          if [[ "$RELEASE_REQUESTED" == "true" ]]; then
-            test -n "$KEYSTORE_BASE64" || { echo "ANDROID_KEYSTORE_BASE64 is required for a release" >&2; exit 1; }
-            test -n "$KEY_ALIAS" || { echo "ANDROID_KEY_ALIAS is required for a release" >&2; exit 1; }
-            test -n "$KEY_PASSWORD" || { echo "ANDROID_KEY_PASSWORD is required for a release" >&2; exit 1; }
-            test -n "$STORE_PASSWORD" || { echo "ANDROID_STORE_PASSWORD is required for a release" >&2; exit 1; }
-          fi
-          if [[ -n "$KEYSTORE_BASE64" ]]; then
+          signing_values=("$KEYSTORE_BASE64" "$KEY_ALIAS" "$KEY_PASSWORD" "$STORE_PASSWORD")
+          populated_values=0
+          for value in "${signing_values[@]}"; do
+            [[ -n "$value" ]] && ((populated_values += 1))
+          done
+
+          if [[ "$populated_values" -eq "${#signing_values[@]}" ]]; then
             printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/release.jks
             {
               printf 'storeFile=app/release.jks\n'
@@ -143,6 +145,13 @@ jobs:
               printf 'keyAlias=%s\n' "$KEY_ALIAS"
               printf 'keyPassword=%s\n' "$KEY_PASSWORD"
             } > android/key.properties
+            echo "release_signed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$populated_values" -eq 0 ]]; then
+            echo "::warning::Android signing secrets are not configured. APKs will use the debug signing key and will not be published as a GitHub Release."
+            echo "release_signed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Configure all Android signing secrets or none of them: ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD, ANDROID_STORE_PASSWORD." >&2
+            exit 1
           fi
 
       - name: Build Android APKs
@@ -401,7 +410,7 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != ''
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '') && needs.build-android.outputs.release_signed == 'true'
     needs:
       - build-android
       - build-windows
