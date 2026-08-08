@@ -21,6 +21,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  FLUTTER_VERSION: 3.44.6
   PUB_HOSTED_URL: https://pub.dev
   FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
 
@@ -35,7 +36,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust MSRV toolchain
@@ -85,7 +86,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
@@ -144,19 +145,22 @@ jobs:
             } > android/key.properties
           fi
 
-      - name: Build split APKs
+      - name: Build Android APKs
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: flutter build apk --release --split-per-abi
-
-      - name: Collect Android artifacts
         shell: bash
         run: |
           mkdir -p dist/android
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk dist/android/FerrisLoad-android-arm64-v8a.apk
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk dist/android/FerrisLoad-android-armeabi-v7a.apk
-          cp build/app/outputs/flutter-apk/app-x86_64-release.apk dist/android/FerrisLoad-android-x86_64.apk
+          build_apk() {
+            local target_platform="$1"
+            local artifact_name="$2"
+            flutter build apk --release --target-platform="$target_platform"
+            cp build/app/outputs/flutter-apk/app-release.apk "dist/android/$artifact_name"
+          }
+          build_apk android-arm64 FerrisLoad-android-arm64-v8a.apk
+          build_apk android-arm FerrisLoad-android-armeabi-v7a.apk
+          build_apk android-x64 FerrisLoad-android-x86_64.apk
           ls -lah dist/android
 
       - name: Upload Android artifacts
@@ -177,7 +181,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
@@ -199,7 +203,14 @@ jobs:
         run: flutter pub get
 
       - name: Build Windows release bundle
-        run: flutter build windows --release
+        env:
+          CMAKE_GENERATOR: Visual Studio 17 2022
+          CMAKE_GENERATOR_PLATFORM: x64
+        run: |
+          if (Test-Path build\windows) {
+            Remove-Item -Recurse -Force build\windows
+          }
+          flutter build windows --release
 
       - name: Package Windows artifact
         run: |
@@ -232,7 +243,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
@@ -297,7 +308,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Setup Rust toolchain
