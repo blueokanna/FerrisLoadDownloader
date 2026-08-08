@@ -426,6 +426,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          # docker/build-push-action uploads a build record that is not a
+          # release asset and can make download-artifact fail when fetching all.
+          pattern: '!*.dockerbuild'
 
       - name: Determine release tag
         id: release_tag
@@ -448,7 +451,8 @@ jobs:
           find artifacts -type f -print0 \
             | sort -z \
             | xargs -0 sha256sum \
-            | sed -E 's#  artifacts/[^/]+/#  #' > artifacts/SHA256SUMS
+            | sed -E 's#  artifacts/[^/]+/#  #' > SHA256SUMS
+          mv SHA256SUMS artifacts/SHA256SUMS
           cat artifacts/SHA256SUMS
 
       - name: Publish release
@@ -458,6 +462,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: FerrisLoad ${{ steps.release_tag.outputs.name }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           body: |
             Docker API image: `${{ steps.release_tag.outputs.image }}`
           files: |
