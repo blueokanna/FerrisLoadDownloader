@@ -360,7 +360,8 @@ jobs:
     name: Publish Docker API image
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # QEMU-based arm builds can exceed one hour on a cold Cargo cache.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -407,6 +408,8 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.docker_tags.outputs.tags }}
+          cache-from: type=gha,scope=docker-api
+          cache-to: type=gha,mode=max,scope=docker-api
 
   create-release:
     name: Create GitHub Release
