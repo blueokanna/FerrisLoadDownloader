@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "ferrisload-core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.88"
 authors = ["blueokanna"]
@@ -13,8 +13,8 @@ categories = ["encoding", "multimedia", "no-std"]
 
 [features]
 default = []
-std = ["rustbinary/std", "serde/std"]
+std = ["rustbinary/std", "nextjson/std"]
 
 [dependencies]
-rustbinary = { version = "0.1.4", default-features = false }
-serde = { version = "1", default-features = false, features = ["derive"] }
+rustbinary = { version = "0.1.7", default-features = false, features = ["derive"] }
+nextjson = { version = "0.1.4", default-features = false, features = ["derive"] }

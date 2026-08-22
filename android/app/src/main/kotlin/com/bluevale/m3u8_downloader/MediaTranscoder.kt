@@ -61,7 +61,8 @@ object MediaTranscoder {
         inputPath: String?,
         outputPath: String?,
         vBitrate: Int,
-        aBitrate: Int
+        aBitrate: Int,
+        expectedDurationMs: Long
     ): Boolean {
         if (inputPath == null || outputPath == null) {
             Log.e(TAG, "transcode: input or output is null")
@@ -85,23 +86,29 @@ object MediaTranscoder {
             // 1) 尝试 remux（仅在不需要重新编码时）
             if (vBitrate <= 0 && aBitrate <= 0) {
                 val remuxOk = tryRemux(inputPath, outputPath)
-                if (remuxOk && verifyOutput(outputPath)) {
+                if (remuxOk &&
+                    verifyOutput(outputPath) &&
+                    verifyDuration(outputPath, expectedDurationMs, "remux")
+                ) {
                     Log.i(TAG, "✅ Remux succeeded: ${File(outputPath).length()} bytes")
                     return true
                 }
-                // remux 失败或产出空文件，清理后 fall through
+                // remux 失败、输出为空或时长被截断，清理后 fall through
                 File(outputPath).delete()
-                Log.w(TAG, "Remux failed or empty output, falling back to hardware transcode")
+                Log.w(TAG, "Remux failed, empty or truncated output, falling back to hardware transcode")
             }
 
             // 2) 硬件转码
             val hwOk = hardwareTranscode(inputPath, outputPath, vBitrate, aBitrate)
-            if (hwOk && verifyOutput(outputPath)) {
+            if (hwOk &&
+                verifyOutput(outputPath) &&
+                verifyDuration(outputPath, expectedDurationMs, "transcode")
+            ) {
                 Log.i(TAG, "✅ Hardware transcode succeeded: ${File(outputPath).length()} bytes")
                 return true
             }
             File(outputPath).delete()
-            Log.e(TAG, "Hardware transcode failed or produced empty output")
+            Log.e(TAG, "Hardware transcode failed, produced empty output, or output was truncated")
             return false
 
         } catch (e: Exception) {
@@ -112,7 +119,12 @@ object MediaTranscoder {
     }
 
     @JvmStatic
-    fun mux(videoPath: String?, audioPath: String?, outputPath: String?): Boolean {
+    fun mux(
+        videoPath: String?,
+        audioPath: String?,
+        outputPath: String?,
+        expectedDurationMs: Long
+    ): Boolean {
         if (videoPath == null || audioPath == null || outputPath == null) {
             Log.e(TAG, "mux: input or output is null")
             return false
@@ -148,7 +160,10 @@ object MediaTranscoder {
             val videoSamples = writeTrackSamples(videoPath, videoTrack.index, muxVideoIndex, muxer)
             val audioSamples = writeTrackSamples(audioPath, audioTrack.index, muxAudioIndex, muxer)
             muxer.stop()
-            val ok = videoSamples > 0 && audioSamples > 0 && verifyOutput(outputPath)
+            val ok = videoSamples > 0 &&
+                audioSamples > 0 &&
+                verifyOutput(outputPath) &&
+                verifyDuration(outputPath, expectedDurationMs, "mux")
             if (!ok) File(outputPath).delete()
             Log.i(TAG, "mux done video=$videoSamples audio=$audioSamples ok=$ok")
             return ok
@@ -179,6 +194,35 @@ object MediaTranscoder {
         } finally {
             extractor.release()
         }
+    }
+
+    /**
+     * Rejects outputs that are significantly shorter than the duration expected
+     * from the HLS playlist. Android's MediaExtractor can silently stop early
+     * when reading naively-concatenated TS segments (timestamp discontinuities),
+     * which previously produced a "successful" output containing only the first
+     * few seconds after all the download traffic was already spent. When the
+     * expected duration is unknown (0) this check is skipped.
+     */
+    private fun verifyDuration(path: String, expectedMs: Long, what: String): Boolean {
+        if (expectedMs <= 0) return true
+        val actualMs = runCatching {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(path)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull() ?: 0L
+            } finally {
+                retriever.release()
+            }
+        }.getOrDefault(0L)
+        if (actualMs <= 0) return true // cannot determine; do not block on it
+        val tolerance = (expectedMs * 85L / 100L).coerceAtLeast(expectedMs - 5000L)
+        if (actualMs + 1000L < tolerance) {
+            Log.e(TAG, "$what duration check failed: expected≈${expectedMs}ms got ${actualMs}ms")
+            return false
+        }
+        return true
     }
 
     private data class TrackInfo(val index: Int, val format: MediaFormat, val mime: String)
@@ -434,6 +478,7 @@ object MediaTranscoder {
                 if (!inputDone) {
                     val idx = decoder.dequeueInputBuffer(TIMEOUT_US)
                     if (idx >= 0) {
+                        lastProgressMs = System.currentTimeMillis()
                         val buf = decoder.getInputBuffer(idx)!!
                         val sz = extractor.readSampleData(buf, 0)
                         if (sz < 0) {
@@ -451,6 +496,7 @@ object MediaTranscoder {
                 if (!decoderDone) {
                     val idx = decoder.dequeueOutputBuffer(decInfo, TIMEOUT_US)
                     if (idx >= 0) {
+                        lastProgressMs = System.currentTimeMillis()
                         val eos = (decInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
                         val render = !eos && decInfo.size > 0
                         decoder.releaseOutputBuffer(idx, render)

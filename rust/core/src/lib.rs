@@ -7,7 +7,7 @@
 //! to platform adapters. This crate intentionally stays usable without `std`.
 
 use core::fmt;
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
 /// Current stable version of the download-plan wire schema.
 pub const DOWNLOAD_PLAN_VERSION: u16 = 1;
@@ -23,17 +23,21 @@ pub const MAX_WIRE_SIZE: u64 = 64 * 1024;
 pub const MAX_WIRE_COLLECTIONS: u64 = 128;
 
 /// A borrowed, allocation-free download plan shared by all runtime adapters.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, NsonDeserialize, NsonSerialize, PartialEq)]
 pub struct DownloadPlan<'a> {
     /// Wire schema version.
     pub version: u16,
     /// User-facing page URL used for origin and extractor context.
+    #[njson(borrow)]
     pub page_url: &'a str,
     /// Primary downloadable media URL.
+    #[njson(borrow)]
     pub media_url: &'a str,
     /// Optional separate audio stream URL.
+    #[njson(borrow)]
     pub audio_url: Option<&'a str>,
     /// Destination path selected by the platform adapter.
+    #[njson(borrow)]
     pub output_path: &'a str,
     /// Maximum number of concurrent segment downloads.
     pub concurrency: u16,

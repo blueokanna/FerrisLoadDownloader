@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde_json::Value;
+use nextjson::Value;
 use url::Url;
 
 use crate::api::downloader::CandidateCollector;
@@ -28,7 +28,7 @@ pub(crate) fn extract_bilibili_candidates(
     };
 
     let value: Value =
-        serde_json::from_str(&json).context("Failed to parse bilibili playinfo JSON")?;
+        nextjson::from_str(&json).context("Failed to parse bilibili playinfo JSON")?;
     let title = extract_bilibili_title(html);
     let mut found_progressive = false;
     let mut found_dash = false;
@@ -218,7 +218,7 @@ fn extract_bilibili_access_warning(html: &str) -> Option<SiteWarning> {
 
 fn extract_bilibili_initial_state_value(html: &str) -> Option<Value> {
     let json = extract_bilibili_initial_state_json(html)?;
-    serde_json::from_str(&json).ok()
+    nextjson::from_str(&json).ok()
 }
 
 #[derive(Clone)]

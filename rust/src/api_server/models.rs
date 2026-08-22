@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
+use tzcraft::Zoned;
 
 use crate::api::downloader::{HeaderEntry, RequestContext};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, NsonDeserialize)]
 pub struct DownloadRequest {
     pub url: String,
     pub media_url: Option<String>,
@@ -19,7 +19,7 @@ pub struct DownloadRequest {
     pub request_context: Option<ApiRequestContext>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, NsonDeserialize)]
 pub struct ApiRequestContext {
     pub user_agent: Option<String>,
     pub referer: Option<String>,
@@ -47,7 +47,7 @@ impl From<ApiRequestContext> for RequestContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, NsonSerialize)]
 pub struct DownloadStatus {
     pub task_id: String,
     pub status: String,
@@ -56,12 +56,14 @@ pub struct DownloadStatus {
     pub source_url: String,
     pub output_path: Option<String>,
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: Zoned,
+    pub completed_at: Option<Zoned>,
 }
 
 impl DownloadStatus {
     pub fn queued(task_id: String, source_url: String) -> Self {
+        let now = Zoned::now_utc()
+            .unwrap_or_else(|_| Zoned::from_ticks(tzcraft::Ticks::EPOCH, tzcraft::Zone::Utc));
         Self {
             task_id,
             status: "queued".to_string(),
@@ -70,7 +72,7 @@ impl DownloadStatus {
             source_url,
             output_path: None,
             error: None,
-            created_at: Utc::now(),
+            created_at: now,
             completed_at: None,
         }
     }

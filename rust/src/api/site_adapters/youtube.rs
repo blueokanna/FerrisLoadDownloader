@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
+use nextjson::Value;
 use regex::Regex;
-use serde_json::Value;
 use url::Url;
 
 use crate::api::downloader::CandidateCollector;
@@ -25,8 +25,7 @@ pub(crate) fn extract_youtube_candidates(
         return Ok(());
     };
 
-    let value: Value =
-        serde_json::from_str(&json).context("Failed to parse youtube player JSON")?;
+    let value: Value = nextjson::from_str(&json).context("Failed to parse youtube player JSON")?;
     push_playability_warnings(&value, warnings);
     let title = first_string_pointer(
         &value,

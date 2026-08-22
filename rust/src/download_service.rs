@@ -1,3 +1,9 @@
+//! Synchronous entry points for the download engine.
+//!
+//! These wrap the synchronous `courierust`-backed core so that
+//! non-Flutter callers (the HTTP API server) can drive downloads
+//! without an async runtime.
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -7,7 +13,7 @@ use crate::api::downloader::{self, ProgressUpdate, RequestContext};
 pub type DownloadProgressHandler = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn hls_to_mp4(
+pub fn hls_to_mp4(
     url: String,
     concurrency: i32,
     output: String,
@@ -27,11 +33,10 @@ pub async fn hls_to_mp4(
         audio_bitrate,
         keep_temp,
     )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn download_media(
+pub fn download_media(
     page_url: String,
     media_url: String,
     audio_url: Option<String>,
@@ -57,5 +62,4 @@ pub async fn download_media(
         keep_temp,
         request_context,
     )
-    .await
 }

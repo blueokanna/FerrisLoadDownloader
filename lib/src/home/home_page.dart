@@ -107,12 +107,24 @@ class _HomePageState extends State<HomePage> {
 
   String _normalizeOutputName(String value) {
     final trimmed = value.trim().isEmpty ? 'video.mp4' : value.trim();
-    return trimmed.toLowerCase().endsWith('.mp4') ? trimmed : '$trimmed.mp4';
+    // Strip any directory components so the file name cannot escape the chosen
+    // output directory (path traversal), then replace reserved and control
+    // characters with underscores so it is safe on every platform.
+    final basename = trimmed.split(RegExp(r'[\\/]')).last.trim();
+    final sanitized = basename.replaceAll(
+      RegExp(r'[\\/:*?"<>|\x00-\x1f]'),
+      '_',
+    );
+    final cleaned = (sanitized.isEmpty || sanitized == '.' || sanitized == '..')
+        ? 'video'
+        : sanitized;
+    return cleaned.toLowerCase().endsWith('.mp4') ? cleaned : '$cleaned.mp4';
   }
 
   String _suggestFileName(MediaCandidate candidate) {
-    final raw =
-        candidate.title.trim().isEmpty ? 'video' : candidate.title.trim();
+    final raw = candidate.title.trim().isEmpty
+        ? 'video'
+        : candidate.title.trim();
     final sanitized = raw.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
     return _normalizeOutputName(sanitized);
   }
@@ -290,8 +302,9 @@ class _HomePageState extends State<HomePage> {
       if (inspection.pageUrl.isNotEmpty) {
         _replaceSourceText(inspection.pageUrl);
       }
-      final selectedCandidate =
-          inspection.candidates.isNotEmpty ? inspection.candidates.first : null;
+      final selectedCandidate = inspection.candidates.isNotEmpty
+          ? inspection.candidates.first
+          : null;
       _pageController.completeAnalyze(
         inspection,
         selectedCandidate: selectedCandidate,
@@ -343,13 +356,16 @@ class _HomePageState extends State<HomePage> {
     final enteredUrl = extractSourceUrl(_urlCtrl.text)!;
     _replaceSourceText(enteredUrl);
     final selectedCandidate = vm.selectedCandidate;
-    final candidateMatchesInput = selectedCandidate != null &&
+    final candidateMatchesInput =
+        selectedCandidate != null &&
         (selectedCandidate.pageUrl == enteredUrl ||
             selectedCandidate.mediaUrl == enteredUrl);
-    final pageUrl =
-        candidateMatchesInput ? selectedCandidate.pageUrl : enteredUrl;
-    final mediaUrl =
-        candidateMatchesInput ? selectedCandidate.mediaUrl : enteredUrl;
+    final pageUrl = candidateMatchesInput
+        ? selectedCandidate.pageUrl
+        : enteredUrl;
+    final mediaUrl = candidateMatchesInput
+        ? selectedCandidate.mediaUrl
+        : enteredUrl;
     final audioUrl = candidateMatchesInput ? selectedCandidate.audioUrl : null;
     final sourcePage = pageUrl;
 

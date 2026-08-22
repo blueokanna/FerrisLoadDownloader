@@ -1,36 +1,31 @@
-#![allow(dead_code)]
-#![allow(unused_imports, unused_variables)]
+#![allow(unused_imports, unused_variables, dead_code)]
 use crate::api::site_adapters::{extractor_name_for_host, inspect_page_candidates, SiteWarning};
+use crate::crypto::{aes_128_cbc_decrypt, sha256, Sha256};
 use crate::frb_generated::StreamSink;
-use aes::Aes128;
+use crate::hls::{
+    parse_playlist, AlternativeMedia, AlternativeMediaType, ByteRange, KeyMethod, Map,
+    MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
+};
+use crate::net::SyncHttpClient;
+use crate::xml::{self, Element};
 use anyhow::{anyhow, bail, Context, Result};
-use block_modes::block_padding::Pkcs7;
-use block_modes::{BlockMode, Cbc};
 use ferrisload_core::{DownloadPlan, DOWNLOAD_PLAN_VERSION};
-use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, info, warn};
-use m3u8_rs::{
-    parse_playlist, AlternativeMedia, AlternativeMediaType, ByteRange, KeyMethod, MasterPlaylist,
-    Playlist, VariantStream,
-};
+use nextjson::Value;
 use regex::Regex;
-use reqwest::{header, Client, Response};
-use serde::Deserialize;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 #[cfg(target_os = "android")]
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Semaphore;
-use tokio::{fs, process::Command, sync::Mutex};
 use url::Url;
+use uuid::Uuid;
 
 #[cfg(target_os = "android")]
 use jni::objects::{GlobalRef, JClass, JObject, JValue};
@@ -39,7 +34,6 @@ use jni::JNIEnv;
 #[cfg(target_os = "android")]
 use jni::JavaVM;
 
-type Aes128Cbc = Cbc<Aes128, Pkcs7>;
 pub(crate) type ProgressReporter = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,10 +68,6 @@ impl AccelType {
             Self::Cpu => "libx264",
         }
     }
-
-    fn hardware_accelerated(self) -> bool {
-        self != Self::Cpu
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -100,29 +90,72 @@ impl ExternalCommandSpec {
     }
 }
 
-async fn external_command_works(spec: &ExternalCommandSpec) -> bool {
-    tokio::time::timeout(
-        Duration::from_secs(8),
-        spec.command().arg("--version").output(),
-    )
-    .await
-    .ok()
-    .and_then(|result| result.ok())
-    .is_some_and(|output| output.status.success())
+/// Run a `std::process::Command` with a wall-clock timeout.
+///
+/// The command runs on a worker thread; if it does not finish within
+/// `timeout` the process is killed and `None` is returned. This mirrors
+/// the previous `tokio::time::timeout` semantics for external tools.
+fn command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Option<std::io::Result<std::process::Output>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let child = Arc::new(Mutex::new(Some(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?,
+    )));
+    let child_for_thread = child.clone();
+    let handle = std::thread::Builder::new()
+        .name("ferrisload-command".into())
+        .spawn(move || {
+            let child = child_for_thread.lock().unwrap().take();
+            match child {
+                Some(child) => {
+                    let _ = tx.send(child.wait_with_output());
+                }
+                None => {
+                    let _ = tx.send(Err(std::io::Error::other(
+                        "child was taken by the timeout path",
+                    )));
+                }
+            }
+        })
+        .ok()?;
+    match rx.recv_timeout(timeout) {
+        Ok(output) => {
+            let _ = handle.join();
+            Some(output)
+        }
+        Err(_) => {
+            // Timeout: kill the child if it still exists, then wait for
+            // the worker to finish draining pipes.
+            if let Ok(mut guard) = child.lock() {
+                if let Some(child) = guard.as_mut() {
+                    let _ = child.kill();
+                }
+            }
+            let _ = handle.join();
+            None
+        }
+    }
 }
 
-async fn ffmpeg_command_works(path: &Path) -> bool {
-    tokio::time::timeout(
-        Duration::from_secs(8),
-        Command::new(path).arg("-version").output(),
-    )
-    .await
-    .ok()
-    .and_then(|result| result.ok())
-    .is_some_and(|output| output.status.success())
+fn external_command_works(spec: &ExternalCommandSpec) -> bool {
+    command_with_timeout(spec.command().arg("--version"), Duration::from_secs(8))
+        .and_then(|result| result.ok())
+        .is_some_and(|output| output.status.success())
 }
 
-async fn resolve_ffmpeg_path() -> Option<PathBuf> {
+fn ffmpeg_command_works(path: &Path) -> bool {
+    command_with_timeout(Command::new(path).arg("-version"), Duration::from_secs(8))
+        .and_then(|result| result.ok())
+        .is_some_and(|output| output.status.success())
+}
+
+fn resolve_ffmpeg_path() -> Option<PathBuf> {
     let executable_name = if cfg!(target_os = "windows") {
         "ffmpeg.exe"
     } else {
@@ -141,15 +174,12 @@ async fn resolve_ffmpeg_path() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from(executable_name));
 
-    for candidate in candidates {
-        if ffmpeg_command_works(&candidate).await {
-            return Some(candidate);
-        }
-    }
-    None
+    candidates
+        .into_iter()
+        .find(|candidate| ffmpeg_command_works(candidate))
 }
 
-async fn resolve_ytdlp_command() -> Option<ExternalCommandSpec> {
+fn resolve_ytdlp_command() -> Option<ExternalCommandSpec> {
     let executable_name = if cfg!(target_os = "windows") {
         "yt-dlp.exe"
     } else {
@@ -196,12 +226,7 @@ async fn resolve_ytdlp_command() -> Option<ExternalCommandSpec> {
         prefix_args: vec!["-m".to_string(), "yt_dlp".to_string()],
     }));
 
-    for candidate in candidates {
-        if external_command_works(&candidate).await {
-            return Some(candidate);
-        }
-    }
-    None
+    candidates.into_iter().find(external_command_works)
 }
 
 fn official_ytdlp_asset_name() -> Result<&'static str> {
@@ -274,34 +299,31 @@ fn checksum_for_release_asset(checksums: &str, asset_name: &str) -> Option<Strin
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-async fn provision_ytdlp_command(reporter: &ProgressReporter) -> Result<ExternalCommandSpec> {
+fn provision_ytdlp_command(reporter: &ProgressReporter) -> Result<ExternalCommandSpec> {
     let asset_name = official_ytdlp_asset_name()?;
     let target_path = ytdlp_cache_path()?;
     let target_directory = target_path
         .parent()
         .ok_or_else(|| anyhow!("yt-dlp cache path has no parent directory"))?;
-    fs::create_dir_all(target_directory)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create yt-dlp cache directory: {}",
-                target_directory.display()
-            )
-        })?;
+    std::fs::create_dir_all(target_directory).with_context(|| {
+        format!(
+            "Failed to create yt-dlp cache directory: {}",
+            target_directory.display()
+        )
+    })?;
 
     emit_progress(reporter, "Preparing verified yt-dlp engine...", 0.003);
-    let client = Client::builder()
-        .user_agent("FerrisLoad/1.0 yt-dlp-bootstrap")
-        .timeout(Duration::from_secs(300))
-        .build()?;
+    let client = SyncHttpClient::with_timeouts(Duration::from_secs(30), Duration::from_secs(300))?;
     let release_base = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
-    let checksums = client
-        .get(format!("{}/SHA2-256SUMS", release_base))
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let checksums_url = format!("{}/SHA2-256SUMS", release_base);
+    let (checksums_status, _, checksums_body) = client.get(&checksums_url, &[])?;
+    if !(200..300).contains(&checksums_status) {
+        bail!(
+            "Failed to download yt-dlp checksums: HTTP {}",
+            checksums_status
+        );
+    }
+    let checksums = String::from_utf8_lossy(&checksums_body).into_owned();
     let expected_hash = checksum_for_release_asset(&checksums, asset_name).ok_or_else(|| {
         anyhow!(
             "Official yt-dlp checksum list did not contain {}",
@@ -309,25 +331,24 @@ async fn provision_ytdlp_command(reporter: &ProgressReporter) -> Result<External
         )
     })?;
 
-    let response = client
-        .get(format!("{}/{}", release_base, asset_name))
-        .send()
-        .await?
-        .error_for_status()?;
-    let total = response.content_length();
-    let temporary_path = target_directory.join(format!(
-        ".yt-dlp-download-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut output = fs::File::create(&temporary_path).await?;
-    let mut stream = response.bytes_stream();
+    let asset_url = format!("{}/{}", release_base, asset_name);
+    let (asset_status, asset_headers, asset_body) = client.get(&asset_url, &[])?;
+    if !(200..300).contains(&asset_status) {
+        bail!("Failed to download yt-dlp binary: HTTP {}", asset_status);
+    }
+    let total = asset_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok());
+    let temporary_path =
+        target_directory.join(format!(".yt-dlp-download-{}", Uuid::new_v4().simple()));
+    let mut output = std::fs::File::create(&temporary_path)?;
     let mut hasher = Sha256::new();
     let mut downloaded = 0u64;
     let mut last_reported = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        output.write_all(&chunk).await?;
-        hasher.update(&chunk);
+    for chunk in asset_body.chunks(64 * 1024) {
+        output.write_all(chunk)?;
+        hasher.update(chunk);
         downloaded = downloaded.saturating_add(chunk.len() as u64);
         if downloaded.saturating_sub(last_reported) >= 512 * 1024 {
             let progress = total
@@ -345,12 +366,12 @@ async fn provision_ytdlp_command(reporter: &ProgressReporter) -> Result<External
             last_reported = downloaded;
         }
     }
-    output.flush().await?;
+    output.flush()?;
     drop(output);
 
     let actual_hash = hex::encode(hasher.finalize());
     if actual_hash != expected_hash {
-        let _ = fs::remove_file(&temporary_path).await;
+        let _ = std::fs::remove_file(&temporary_path);
         bail!(
             "yt-dlp SHA-256 verification failed (expected {}, received {})",
             expected_hash,
@@ -359,16 +380,14 @@ async fn provision_ytdlp_command(reporter: &ProgressReporter) -> Result<External
     }
 
     if target_path.exists() {
-        let _ = fs::remove_file(&target_path).await;
+        let _ = std::fs::remove_file(&target_path);
     }
-    fs::rename(&temporary_path, &target_path)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to install verified yt-dlp engine at {}",
-                target_path.display()
-            )
-        })?;
+    std::fs::rename(&temporary_path, &target_path).with_context(|| {
+        format!(
+            "Failed to install verified yt-dlp engine at {}",
+            target_path.display()
+        )
+    })?;
 
     #[cfg(unix)]
     {
@@ -382,7 +401,7 @@ async fn provision_ytdlp_command(reporter: &ProgressReporter) -> Result<External
         program: target_path,
         prefix_args: Vec::new(),
     };
-    if !external_command_works(&command).await {
+    if !external_command_works(&command) {
         bail!("Verified yt-dlp engine was installed but could not be executed");
     }
     emit_progress(reporter, "Verified yt-dlp engine is ready", 0.02);
@@ -496,7 +515,7 @@ impl AndroidMediaCodecTranscoder {
         Self { jvm }
     }
 
-    async fn with_media_transcoder<T, F>(&self, operation: F) -> Result<T>
+    fn with_media_transcoder<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut JNIEnv, JClass) -> Result<T> + Send + 'static,
@@ -505,26 +524,34 @@ impl AndroidMediaCodecTranscoder {
         let gate = ANDROID_TRANSCODE_GATE
             .get_or_init(|| Arc::new(StdMutex::new(())))
             .clone();
-        tokio::task::spawn_blocking(move || {
-            let _guard = gate
-                .lock()
-                .map_err(|_| anyhow!("Android transcode gate acquire failed"))?;
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| anyhow!("JNI attach thread failed: {}", e))?;
-            let class = media_transcoder_class(&mut env)?;
-            operation(&mut env, class)
-        })
-        .await
-        .map_err(|e| anyhow!("tokio spawn_blocking failed: {}", e))?
+        let (tx, rx) = std::sync::mpsc::channel::<Result<T>>();
+        std::thread::Builder::new()
+            .name("ferrisload-jni".into())
+            .spawn(move || {
+                let result = (|| {
+                    let _guard = gate
+                        .lock()
+                        .map_err(|_| anyhow!("Android transcode gate acquire failed"))?;
+                    let mut env = jvm
+                        .attach_current_thread()
+                        .map_err(|e| anyhow!("JNI attach thread failed: {}", e))?;
+                    let class = media_transcoder_class(&mut env)?;
+                    operation(&mut env, class)
+                })();
+                let _ = tx.send(result);
+            })
+            .map_err(|e| anyhow!("JNI thread spawn failed: {}", e))?;
+        rx.recv()
+            .map_err(|_| anyhow!("JNI worker thread terminated unexpectedly"))?
     }
 
-    pub async fn transcode(
+    pub fn transcode(
         &self,
         input_ts: &str,
         output_mp4: &str,
         video_bitrate: u32,
         audio_bitrate: u32,
+        expected_duration: Option<f64>,
     ) -> Result<()> {
         if audio_bitrate > 0 {
             bail!(
@@ -533,6 +560,7 @@ impl AndroidMediaCodecTranscoder {
         }
         let input_ts = input_ts.to_string();
         let output_mp4 = output_mp4.to_string();
+        let expected_duration_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
 
         self.with_media_transcoder(move |env, class| {
             let input_ts_jstring = jni_string!(env, &input_ts, "input_ts");
@@ -542,12 +570,13 @@ impl AndroidMediaCodecTranscoder {
                 .call_static_method(
                     class,
                     "transcode",
-                    "(Ljava/lang/String;Ljava/lang/String;II)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;IIJ)Z",
                     &[
                         JValue::Object(&input_ts_jstring),
                         JValue::Object(&output_mp4_jstring),
                         JValue::Int(video_bitrate as i32),
                         JValue::Int(audio_bitrate as i32),
+                        JValue::Long(expected_duration_ms),
                     ],
                 )
                 .map_err(|e| anyhow!("JNI call_static_method failed: {}", e))?;
@@ -562,13 +591,19 @@ impl AndroidMediaCodecTranscoder {
                 Err(anyhow!("Java MediaCodec transcode failed"))
             }
         })
-        .await
     }
 
-    pub async fn mux(&self, video_path: &str, audio_path: &str, output_mp4: &str) -> Result<()> {
+    pub fn mux(
+        &self,
+        video_path: &str,
+        audio_path: &str,
+        output_mp4: &str,
+        expected_duration: Option<f64>,
+    ) -> Result<()> {
         let video_path = video_path.to_string();
         let audio_path = audio_path.to_string();
         let output_mp4 = output_mp4.to_string();
+        let expected_duration_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
 
         self.with_media_transcoder(move |env, class| {
             let video_jstring = jni_string!(env, &video_path, "video_path");
@@ -579,11 +614,12 @@ impl AndroidMediaCodecTranscoder {
                 .call_static_method(
                     class,
                     "mux",
-                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)Z",
                     &[
                         JValue::Object(&video_jstring),
                         JValue::Object(&audio_jstring),
                         JValue::Object(&output_jstring),
+                        JValue::Long(expected_duration_ms),
                     ],
                 )
                 .map_err(|e| anyhow!("JNI call_static_method mux failed: {}", e))?;
@@ -598,7 +634,6 @@ impl AndroidMediaCodecTranscoder {
                 Err(anyhow!("Java MediaMuxer merge failed"))
             }
         })
-        .await
     }
 }
 
@@ -904,21 +939,28 @@ pub async fn hls2mp4_run(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
-    hls2mp4_core(
-        sink_progress_reporter(sink),
-        url,
-        concurrency,
-        output,
-        retries,
-        video_bitrate,
-        audio_bitrate,
-        keep_temp,
+    let reporter = sink_progress_reporter(sink);
+    flutter_rust_bridge::spawn_blocking_with(
+        move || {
+            hls2mp4_core(
+                reporter,
+                url,
+                concurrency,
+                output,
+                retries,
+                video_bitrate,
+                audio_bitrate,
+                keep_temp,
+            )
+        },
+        (),
     )
     .await
+    .map_err(|e| anyhow!("hls2mp4 background task failed: {e}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn hls2mp4_core(
+pub(crate) fn hls2mp4_core(
     reporter: ProgressReporter,
     url: String,
     concurrency: i32,
@@ -930,7 +972,7 @@ pub(crate) async fn hls2mp4_core(
 ) -> Result<()> {
     let request_context = RequestContext::default();
     run_hls_pipeline(
-        reporter,
+        &reporter,
         &url,
         &request_context,
         concurrency,
@@ -940,16 +982,32 @@ pub(crate) async fn hls2mp4_core(
         audio_bitrate,
         keep_temp,
     )
-    .await
 }
 
 #[flutter_rust_bridge::frb()]
 pub async fn inspect_media_from_url(url: String) -> Result<MediaInspectionResult> {
-    inspect_media_with_context(url, RequestContext::default()).await
+    flutter_rust_bridge::spawn_blocking_with(
+        move || inspect_media_with_context_sync(url, RequestContext::default()),
+        (),
+    )
+    .await
+    .map_err(|e| anyhow!("inspect background task failed: {e}"))?
 }
 
 #[flutter_rust_bridge::frb()]
 pub async fn inspect_media_with_context(
+    url: String,
+    request_context: RequestContext,
+) -> Result<MediaInspectionResult> {
+    flutter_rust_bridge::spawn_blocking_with(
+        move || inspect_media_with_context_sync(url, request_context),
+        (),
+    )
+    .await
+    .map_err(|e| anyhow!("inspect background task failed: {e}"))?
+}
+
+pub(crate) fn inspect_media_with_context_sync(
     url: String,
     request_context: RequestContext,
 ) -> Result<MediaInspectionResult> {
@@ -971,12 +1029,12 @@ pub async fn inspect_media_with_context(
 
     let requested_page_url = Url::parse(&url).context("Invalid inspection URL")?;
     let client = create_http_client_for_context(Some(&url), &request_context)?;
-    let response = client.get(requested_page_url).send().await?;
-    let status = response.status();
-    let page_url = response.url().clone();
-    let html = response.text().await?;
+    let headers = request_headers(&requested_page_url, &request_context)?;
+    let (status, _response_headers, body) = client.get(&url, &headers)?;
+    let page_url = requested_page_url;
+    let html = String::from_utf8_lossy(&body).into_owned();
     let mut warnings = Vec::new();
-    if let Some(reason) = detect_access_challenge(status.as_u16(), &html) {
+    if let Some(reason) = detect_access_challenge(status, &html) {
         warnings.push(SiteWarning::auth("challenge-detected", reason.clone()));
         return Ok(MediaInspectionResult {
             page_url: url,
@@ -992,7 +1050,7 @@ pub async fn inspect_media_with_context(
             challenge_reason: reason,
         });
     }
-    if !status.is_success() {
+    if !(200..300).contains(&status) {
         bail!("Failed to inspect page: HTTP {}", status);
     }
     let page_title = crate::api::site_adapters::extract_page_title(&html)
@@ -1010,9 +1068,7 @@ pub async fn inspect_media_with_context(
             &request_context,
             &mut collector,
             &mut warnings,
-        )
-        .await
-        {
+        ) {
             if !had_candidates {
                 warnings.push(SiteWarning::site(
                     "bilibili-playurl-fallback-failed",
@@ -1031,9 +1087,7 @@ pub async fn inspect_media_with_context(
             page_url.as_str(),
             &request_context,
             &mut collector,
-        )
-        .await
-        {
+        ) {
             Ok(true) => {}
             Ok(false) => warnings.push(SiteWarning::site(
                 "youtube-ytdlp-no-formats",
@@ -1046,7 +1100,7 @@ pub async fn inspect_media_with_context(
         }
     }
 
-    let candidates = score_candidates(collector.finish(), &request_context).await;
+    let candidates = score_candidates(collector.finish(), &request_context);
 
     if candidates.is_empty() {
         if let Some(auth_warning) = warnings.iter().find(|warning| warning.scope() == "auth") {
@@ -1087,7 +1141,7 @@ pub async fn inspect_media_with_context(
     })
 }
 
-async fn augment_bilibili_candidates_with_playurl(
+fn augment_bilibili_candidates_with_playurl(
     page_url: &Url,
     html: &str,
     request_context: &RequestContext,
@@ -1099,14 +1153,13 @@ async fn augment_bilibili_candidates_with_playurl(
     };
 
     let client = create_http_client_for_context(Some(page_url.as_str()), request_context)?;
-    let response = client.get(api_url.clone()).send().await?;
-    let status = response.status();
-    if !status.is_success() {
+    let headers = request_headers(page_url, request_context)?;
+    let (status, _, body) = client.get(api_url.as_str(), &headers)?;
+    if !(200..300).contains(&status) {
         bail!("Bilibili playurl API returned HTTP {}", status);
     }
-    let body = response.text().await?;
     let payload: Value =
-        serde_json::from_str(&body).context("Failed to parse Bilibili playurl API response")?;
+        nextjson::from_slice(&body).context("Failed to parse Bilibili playurl API response")?;
     let code = payload.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 {
         let message = payload
@@ -1118,7 +1171,8 @@ async fn augment_bilibili_candidates_with_playurl(
     }
 
     let before = collector.candidates.len();
-    let synthetic_page = format!("window.__playinfo__={}", body);
+    let body_text = String::from_utf8_lossy(&body).into_owned();
+    let synthetic_page = format!("window.__playinfo__={}", body_text);
     inspect_page_candidates(page_url, &synthetic_page, collector, warnings)?;
     Ok(collector.candidates.len() > before)
 }
@@ -1177,13 +1231,12 @@ fn bilibili_playurl_api_url(page_url: &Url, html: &str) -> Result<Option<Url>> {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-async fn augment_youtube_candidates_with_ytdlp(
+fn augment_youtube_candidates_with_ytdlp(
     page_url: &str,
     request_context: &RequestContext,
     collector: &mut CandidateCollector,
 ) -> Result<bool> {
     let command_spec = resolve_ytdlp_command()
-        .await
         .ok_or_else(|| anyhow!("yt-dlp executable or Python module was not found"))?;
     let mut command = command_spec.command();
     command.args([
@@ -1213,22 +1266,21 @@ async fn augment_youtube_candidates_with_ytdlp(
     for header in &request_context.headers {
         let name = header.name.trim();
         let value = header.value.trim();
-        if !name.is_empty() && !value.is_empty() {
+        if !name.is_empty() && !value.is_empty() && is_safe_ytdlp_header_name(name) {
             command.args(["--add-header", &format!("{}:{}", name, value)]);
         }
     }
     command.arg(page_url);
 
-    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
-        .await
-        .map_err(|_| anyhow!("yt-dlp inspection timed out"))?
+    let output = command_with_timeout(&mut command, Duration::from_secs(60))
+        .ok_or_else(|| anyhow!("yt-dlp inspection timed out"))?
         .context("Failed to start yt-dlp")?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
     let metadata: Value =
-        serde_json::from_slice(&output.stdout).context("Failed to parse yt-dlp metadata")?;
+        nextjson::from_slice(&output.stdout).context("Failed to parse yt-dlp metadata")?;
     let title = metadata
         .get("title")
         .and_then(Value::as_str)
@@ -1385,6 +1437,14 @@ fn ytdlp_error_tail(stderr: &str) -> String {
     tail.trim().to_string()
 }
 
+/// Rejects header names that could smuggle extra headers into yt-dlp's
+/// `--add-header` option (e.g. a `:` inside the name, or control characters).
+fn is_safe_ytdlp_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(':')
+        && name.chars().all(|character| character.is_ascii_graphic())
+}
+
 fn find_ytdlp_output(temp_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(temp_dir)
         .ok()?
@@ -1401,7 +1461,7 @@ fn find_ytdlp_output(temp_dir: &Path) -> Option<PathBuf> {
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-async fn run_ytdlp_site_pipeline(
+fn run_ytdlp_site_pipeline(
     reporter: ProgressReporter,
     command_spec: ExternalCommandSpec,
     page_url: &str,
@@ -1416,7 +1476,7 @@ async fn run_ytdlp_site_pipeline(
 ) -> Result<()> {
     emit_progress(&reporter, "Selected site engine: yt-dlp", 0.02);
 
-    let ffmpeg_path = resolve_ffmpeg_path().await;
+    let ffmpeg_path = resolve_ffmpeg_path();
     let has_ffmpeg = ffmpeg_path.is_some();
     let requires_reencode = video_bitrate > 0 || audio_bitrate > 0;
     if requires_reencode && !has_ffmpeg {
@@ -1496,7 +1556,7 @@ async fn run_ytdlp_site_pipeline(
     for entry in &request_context.headers {
         let name = entry.name.trim();
         let value = entry.value.trim();
-        if !name.is_empty() && !value.is_empty() {
+        if !name.is_empty() && !value.is_empty() && is_safe_ytdlp_header_name(name) {
             command.args(["--add-headers", &format!("{}:{}", name, value)]);
         }
     }
@@ -1514,14 +1574,23 @@ async fn run_ytdlp_site_pipeline(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("yt-dlp stderr was not captured"))?;
-    let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        stderr.read_to_string(&mut text).await.map(|_| text)
-    });
 
-    let mut lines = BufReader::new(stdout).lines();
+    // Drain stderr on a background thread so the child never blocks on
+    // a full pipe while we stream stdout.
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("ytdlp-stderr".into())
+        .spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            let _ = stderr_tx.send(text);
+        })
+        .context("Failed to spawn yt-dlp stderr reader")?;
+
+    let lines = BufReader::new(stdout).lines();
     let mut reported_output = None;
-    while let Some(line) = lines.next_line().await? {
+    for line in lines {
+        let line = line.context("Failed to read yt-dlp stdout")?;
         if let Some((message, progress)) = parse_ytdlp_progress(line.trim()) {
             emit_progress(&reporter, message, progress);
         } else if let Some(path) = line.trim().strip_prefix("FERRISLOAD_OUTPUT:") {
@@ -1529,8 +1598,10 @@ async fn run_ytdlp_site_pipeline(
         }
     }
 
-    let status = child.wait().await?;
-    let stderr = stderr_task.await.context("yt-dlp stderr task failed")??;
+    let status = child.wait().context("Failed to wait for yt-dlp")?;
+    let stderr = stderr_rx
+        .recv()
+        .context("yt-dlp stderr reader terminated unexpectedly")?;
     if !status.success() {
         bail!("yt-dlp download failed: {}", ytdlp_error_tail(&stderr));
     }
@@ -1558,24 +1629,21 @@ async fn run_ytdlp_site_pipeline(
             video_bitrate.max(0) as u32,
             audio_bitrate.max(0) as u32,
             reporter.clone(),
-        )
-        .await?;
-        cleanup_temp_files(keep_temp, [&downloaded_path]).await;
+        )?;
+        cleanup_temp_files(keep_temp, [&downloaded_path]);
     } else if downloaded_path != output_path
-        && fs::rename(&downloaded_path, &output_path).await.is_err()
+        && std::fs::rename(&downloaded_path, &output_path).is_err()
     {
-        fs::copy(&downloaded_path, &output_path)
-            .await
-            .with_context(|| {
-                format!("Failed to move yt-dlp output to {}", output_path.display())
-            })?;
-        cleanup_temp_files(keep_temp, [&downloaded_path]).await;
+        std::fs::copy(&downloaded_path, &output_path).with_context(|| {
+            format!("Failed to move yt-dlp output to {}", output_path.display())
+        })?;
+        cleanup_temp_files(keep_temp, [&downloaded_path]);
     }
 
     if !keep_temp {
-        let _ = fs::remove_dir(&temp_dir).await;
+        let _ = std::fs::remove_dir(&temp_dir);
     }
-    ensure_output_file_ready(&output_path).await?;
+    ensure_output_file_ready(&output_path)?;
     emit_progress(&reporter, "All tasks completed", 1.0);
     Ok(())
 }
@@ -1594,20 +1662,27 @@ pub async fn download_media_run(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
-    download_media_with_context_core(
-        sink_progress_reporter(sink),
-        page_url,
-        media_url,
-        audio_url,
-        output,
-        concurrency,
-        retries,
-        video_bitrate,
-        audio_bitrate,
-        keep_temp,
-        RequestContext::default(),
+    let reporter = sink_progress_reporter(sink);
+    flutter_rust_bridge::spawn_blocking_with(
+        move || {
+            download_media_with_context_core(
+                reporter,
+                page_url,
+                media_url,
+                audio_url,
+                output,
+                concurrency,
+                retries,
+                video_bitrate,
+                audio_bitrate,
+                keep_temp,
+                RequestContext::default(),
+            )
+        },
+        (),
     )
     .await
+    .map_err(|e| anyhow!("download background task failed: {e}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1625,24 +1700,31 @@ pub async fn download_media_with_context(
     keep_temp: bool,
     request_context: RequestContext,
 ) -> Result<()> {
-    download_media_with_context_core(
-        sink_progress_reporter(sink),
-        page_url,
-        media_url,
-        audio_url,
-        output,
-        concurrency,
-        retries,
-        video_bitrate,
-        audio_bitrate,
-        keep_temp,
-        request_context,
+    let reporter = sink_progress_reporter(sink);
+    flutter_rust_bridge::spawn_blocking_with(
+        move || {
+            download_media_with_context_core(
+                reporter,
+                page_url,
+                media_url,
+                audio_url,
+                output,
+                concurrency,
+                retries,
+                video_bitrate,
+                audio_bitrate,
+                keep_temp,
+                request_context,
+            )
+        },
+        (),
     )
     .await
+    .map_err(|e| anyhow!("download background task failed: {e}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn download_media_with_context_core(
+pub(crate) fn download_media_with_context_core(
     reporter: ProgressReporter,
     page_url: String,
     media_url: String,
@@ -1691,13 +1773,13 @@ pub(crate) async fn download_media_with_context_core(
             .ok()
             .map(|url| extractor_name_for_host(url.domain()))
             .unwrap_or_default();
-        let should_use_ytdlp = extractor == "youtube"
-            || (extractor == "bilibili" && auto_inspect && check_ffmpeg().await);
+        let should_use_ytdlp =
+            extractor == "youtube" || (extractor == "bilibili" && auto_inspect && check_ffmpeg());
         if should_use_ytdlp {
-            let command = if let Some(command) = resolve_ytdlp_command().await {
+            let command = if let Some(command) = resolve_ytdlp_command() {
                 Some(command)
             } else {
-                match provision_ytdlp_command(&reporter).await {
+                match provision_ytdlp_command(&reporter) {
                     Ok(command) => Some(command),
                     Err(error) => {
                         warn!("Verified yt-dlp installation failed: {}", error);
@@ -1726,8 +1808,7 @@ pub(crate) async fn download_media_with_context_core(
                     audio_bitrate,
                     keep_temp,
                     &request_context,
-                )
-                .await;
+                );
             }
         }
     }
@@ -1736,7 +1817,7 @@ pub(crate) async fn download_media_with_context_core(
         emit_progress(&reporter, "Resolving page media candidate...", 0.01);
 
         let inspection =
-            inspect_media_with_context(page_url.clone(), request_context.clone()).await?;
+            inspect_media_with_context_sync(page_url.clone(), request_context.clone())?;
         if inspection.auth_required {
             let reason = if inspection.challenge_reason.trim().is_empty() {
                 "Authorization required before download".to_string()
@@ -1754,7 +1835,7 @@ pub(crate) async fn download_media_with_context_core(
             bail!("Resolved page candidate did not expose a downloadable media stream");
         }
 
-        return Box::pin(download_media_with_context_core(
+        return download_media_with_context_core(
             reporter,
             selected_candidate.page_url,
             selected_candidate.media_url,
@@ -1766,13 +1847,12 @@ pub(crate) async fn download_media_with_context_core(
             audio_bitrate,
             keep_temp,
             request_context,
-        ))
-        .await;
+        );
     }
 
     if is_hls_like(&media_url) {
         return run_hls_pipeline(
-            reporter,
+            &reporter,
             &media_url,
             &request_context,
             concurrency,
@@ -1781,13 +1861,12 @@ pub(crate) async fn download_media_with_context_core(
             video_bitrate,
             audio_bitrate,
             keep_temp,
-        )
-        .await;
+        );
     }
 
     if protocol_from_url(&media_url) == "dash" {
         return run_dash_pipeline(
-            reporter,
+            &reporter,
             &media_url,
             &request_context,
             &output,
@@ -1795,8 +1874,7 @@ pub(crate) async fn download_media_with_context_core(
             video_bitrate,
             audio_bitrate,
             keep_temp,
-        )
-        .await;
+        );
     }
 
     emit_progress(&reporter, "Preparing direct media download...", 0.02);
@@ -1805,6 +1883,16 @@ pub(crate) async fn download_media_with_context_core(
     let client =
         create_http_client_for_context(page_url.as_ref().map(Url::as_str), &request_context)?;
     let (output_path, temp_dir) = prepare_output_path(&output)?;
+    // Build the authenticated headers once and reuse them for every
+    // stream so Referer/Origin/Cookie stay consistent across retries.
+    let headers = match page_url.as_ref() {
+        Some(parsed) => request_headers(parsed, &request_context)?,
+        None => {
+            let fallback = Url::parse("https://example.com/")
+                .context("failed to build fallback URL for headers")?;
+            request_headers(&fallback, &request_context)?
+        }
+    };
 
     match audio_url {
         Some(audio) => {
@@ -1814,25 +1902,25 @@ pub(crate) async fn download_media_with_context_core(
             download_with_retries(
                 &client,
                 &media_url,
+                &headers,
                 &video_temp,
                 retries.max(1) as u8,
                 0.04,
                 0.44,
                 &reporter,
                 "Downloading video stream",
-            )
-            .await?;
+            )?;
             download_with_retries(
                 &client,
                 &audio,
+                &headers,
                 &audio_temp,
                 retries.max(1) as u8,
                 0.46,
                 0.80,
                 &reporter,
                 "Downloading audio stream",
-            )
-            .await?;
+            )?;
 
             merge_media_streams(
                 &video_temp,
@@ -1841,10 +1929,10 @@ pub(crate) async fn download_media_with_context_core(
                 video_bitrate.max(0) as u32,
                 audio_bitrate.max(0) as u32,
                 reporter.clone(),
-            )
-            .await?;
+                None,
+            )?;
 
-            cleanup_temp_files(keep_temp, [&video_temp, &audio_temp]).await;
+            cleanup_temp_files(keep_temp, [&video_temp, &audio_temp]);
         }
         None => {
             let extension = container_from_url(&media_url);
@@ -1852,50 +1940,49 @@ pub(crate) async fn download_media_with_context_core(
                 download_with_retries(
                     &client,
                     &media_url,
+                    &headers,
                     &output_path,
                     retries.max(1) as u8,
                     0.04,
                     0.92,
                     &reporter,
                     "Downloading media",
-                )
-                .await?;
+                )?;
             } else {
                 let temp_input = temp_dir.join(format!("direct_input.{}", extension));
                 download_with_retries(
                     &client,
                     &media_url,
+                    &headers,
                     &temp_input,
                     retries.max(1) as u8,
                     0.04,
                     0.72,
                     &reporter,
                     "Downloading media",
-                )
-                .await?;
+                )?;
                 transcode_input_to_output(
                     &temp_input,
                     &output,
                     video_bitrate.max(0) as u32,
                     audio_bitrate.max(0) as u32,
                     reporter.clone(),
-                )
-                .await?;
-                cleanup_temp_files(keep_temp, [&temp_input]).await;
+                )?;
+                cleanup_temp_files(keep_temp, [&temp_input]);
             }
         }
     }
 
-    let _ = fs::remove_dir(&temp_dir).await;
-    ensure_output_file_ready(&output_path).await?;
+    let _ = std::fs::remove_dir(&temp_dir);
+    ensure_output_file_ready(&output_path)?;
     emit_progress(&reporter, "All tasks completed", 1.0);
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_dash_pipeline(
-    reporter: ProgressReporter,
+fn run_dash_pipeline(
+    reporter: &ProgressReporter,
     manifest_url: &str,
     request_context: &RequestContext,
     output: &str,
@@ -1904,27 +1991,29 @@ async fn run_dash_pipeline(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
-    emit_progress(&reporter, "Resolving DASH manifest...", 0.02);
+    emit_progress(reporter, "Resolving DASH manifest...", 0.02);
 
-    let plan = resolve_dash_download_plan(manifest_url, request_context).await?;
+    let plan = resolve_dash_download_plan(manifest_url, request_context)?;
     let (output_path, temp_dir) = prepare_output_path(output)?;
 
     let client = create_http_client_for_context(Some(&plan.video_url), request_context)?;
     let retries = retries.max(1) as u8;
+    let manifest_base = Url::parse(manifest_url).context("Invalid DASH manifest URL")?;
+    let headers = request_headers(&manifest_base, request_context)?;
 
     let video_extension = container_from_url(&plan.video_url);
     let video_temp = temp_dir.join(format!("dash_video_input.{}", video_extension));
     download_with_retries(
         &client,
         &plan.video_url,
+        &headers,
         &video_temp,
         retries,
         0.04,
         0.46,
-        &reporter,
+        reporter,
         "Downloading DASH video",
-    )
-    .await?;
+    )?;
 
     match plan.audio_url {
         Some(audio_url) => {
@@ -1934,14 +2023,14 @@ async fn run_dash_pipeline(
             download_with_retries(
                 &client,
                 &audio_url,
+                &headers,
                 &audio_temp,
                 retries,
                 0.48,
                 0.78,
-                &reporter,
+                reporter,
                 "Downloading DASH audio",
-            )
-            .await?;
+            )?;
 
             merge_media_streams(
                 &video_temp,
@@ -1950,19 +2039,19 @@ async fn run_dash_pipeline(
                 video_bitrate.max(0) as u32,
                 audio_bitrate.max(0) as u32,
                 reporter.clone(),
-            )
-            .await?;
+                None,
+            )?;
 
-            cleanup_temp_files(keep_temp, [&video_temp, &audio_temp]).await;
+            cleanup_temp_files(keep_temp, [&video_temp, &audio_temp]);
         }
         None => {
             if video_extension == "mp4" && video_bitrate <= 0 && audio_bitrate <= 0 {
-                if fs::rename(&video_temp, &output_path).await.is_err() {
-                    fs::copy(&video_temp, &output_path).await.with_context(|| {
+                if std::fs::rename(&video_temp, &output_path).is_err() {
+                    std::fs::copy(&video_temp, &output_path).with_context(|| {
                         format!("Failed to copy DASH output to {}", output_path.display())
                     })?;
                 }
-                cleanup_temp_files(keep_temp, [&video_temp]).await;
+                cleanup_temp_files(keep_temp, [&video_temp]);
             } else {
                 transcode_input_to_output(
                     &video_temp,
@@ -1970,22 +2059,21 @@ async fn run_dash_pipeline(
                     video_bitrate.max(0) as u32,
                     audio_bitrate.max(0) as u32,
                     reporter.clone(),
-                )
-                .await?;
-                cleanup_temp_files(keep_temp, [&video_temp]).await;
+                )?;
+                cleanup_temp_files(keep_temp, [&video_temp]);
             }
         }
     }
 
-    let _ = fs::remove_dir(&temp_dir).await;
-    ensure_output_file_ready(&output_path).await?;
-    emit_progress(&reporter, "All tasks completed", 1.0);
+    let _ = std::fs::remove_dir(&temp_dir);
+    ensure_output_file_ready(&output_path)?;
+    emit_progress(reporter, "All tasks completed", 1.0);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_hls_pipeline(
-    reporter: ProgressReporter,
+pub(crate) fn run_hls_pipeline(
+    reporter: &ProgressReporter,
     url: &str,
     request_context: &RequestContext,
     concurrency: i32,
@@ -1995,7 +2083,7 @@ pub(crate) async fn run_hls_pipeline(
     audio_bitrate: i32,
     keep_temp: bool,
 ) -> Result<()> {
-    emit_progress(&reporter, "Initializing...", 0.0);
+    emit_progress(reporter, "Initializing...", 0.0);
 
     init_runtime_logging();
 
@@ -2013,15 +2101,15 @@ pub(crate) async fn run_hls_pipeline(
     check_pb.set_message("Selecting transcoder backend...");
     check_pb.enable_steady_tick(Duration::from_millis(100));
 
-    emit_progress(&reporter, "Selecting transcoder backend...", 0.01);
+    emit_progress(reporter, "Selecting transcoder backend...", 0.01);
 
-    let backend = select_transcoder_backend().await?;
+    let backend = select_transcoder_backend()?;
     let requires_reencode = video_bitrate > 0 || audio_bitrate > 0;
     match backend {
         TranscoderKind::Ffmpeg(accel) if requires_reencode => {
             check_pb.finish_with_message(format!("Selected FFmpeg backend ({})", accel.label()));
             emit_progress(
-                &reporter,
+                reporter,
                 format!("Selected transcoder backend: {}", accel.label()),
                 0.015,
             );
@@ -2029,7 +2117,7 @@ pub(crate) async fn run_hls_pipeline(
         TranscoderKind::Ffmpeg(_) => {
             check_pb.finish_with_message("Selected FFmpeg stream-copy backend");
             emit_progress(
-                &reporter,
+                reporter,
                 "Selected FFmpeg stream copy (no re-encoding)",
                 0.015,
             );
@@ -2037,7 +2125,7 @@ pub(crate) async fn run_hls_pipeline(
         TranscoderKind::AndroidHardware if requires_reencode => {
             check_pb.finish_with_message("Selected Android MediaCodec backend");
             emit_progress(
-                &reporter,
+                reporter,
                 "Selected hardware encoder: Android MediaCodec",
                 0.015,
             );
@@ -2045,7 +2133,7 @@ pub(crate) async fn run_hls_pipeline(
         TranscoderKind::AndroidHardware => {
             check_pb.finish_with_message("Selected Android MediaMuxer pipeline");
             emit_progress(
-                &reporter,
+                reporter,
                 "Selected Android MediaMuxer (MediaCodec fallback if remux fails)",
                 0.015,
             );
@@ -2061,10 +2149,9 @@ pub(crate) async fn run_hls_pipeline(
     download_pb.set_message("Downloading M3U8 playlist...");
     download_pb.enable_steady_tick(Duration::from_millis(100));
 
-    emit_progress(&reporter, "Downloading M3U8 playlist...", 0.02);
+    emit_progress(reporter, "Downloading M3U8 playlist...", 0.02);
 
-    let (m3u8_content, effective_playlist_url) =
-        download_playlist_with_url(url, request_context).await?;
+    let (m3u8_content, effective_playlist_url) = download_playlist_with_url(url, request_context)?;
     let (_, playlist) =
         parse_playlist(&m3u8_content).map_err(|e| anyhow!("Failed to parse M3U8: {:?}", e))?;
     download_pb.finish_with_message("Parsed M3U8 playlist");
@@ -2096,7 +2183,12 @@ pub(crate) async fn run_hls_pipeline(
     info!("Temporary directory: {}", temp_dir.display());
     info!("Temporary primary stream: {}", temp_primary_str);
 
-    let mut external_audio_plan: Option<(m3u8_rs::MediaPlaylist, Url, String)> = None;
+    let mut external_audio_plan: Option<(MediaPlaylist, Url, String)> = None;
+    // Sum of the media playlist's EXTINF durations. Used after conversion to
+    // detect silent truncation (e.g. only the first few seconds surviving),
+    // which previously wasted all the download traffic on a broken output.
+    // Both match arms below assign this before use.
+    let expected_duration: Option<f64>;
 
     match playlist {
         Playlist::MasterPlaylist(master) => {
@@ -2121,13 +2213,20 @@ pub(crate) async fn run_hls_pipeline(
             };
 
             let (media_content, effective_media_url) =
-                download_playlist_with_url(media_url.as_str(), request_context).await?;
+                download_playlist_with_url(media_url.as_str(), request_context)?;
             let (_, media_pl) = parse_playlist(&media_content)
                 .map_err(|e| anyhow!("Failed to parse m3u8: {:?}", e))?;
 
             let Playlist::MediaPlaylist(media_playlist) = media_pl else {
                 bail!("Master playlist's referenced playlist is not a media playlist");
             };
+            expected_duration = Some(
+                media_playlist
+                    .segments
+                    .iter()
+                    .map(|segment| segment.duration as f64)
+                    .sum(),
+            );
 
             if let Some(audio_group) = best.audio.as_deref() {
                 let rendition =
@@ -2149,7 +2248,7 @@ pub(crate) async fn run_hls_pipeline(
                         .ok_or_else(|| anyhow!("Master playlist missing URL"))?
                         .join(audio_uri)?;
                     let (audio_content, effective_audio_url) =
-                        download_playlist_with_url(audio_url.as_str(), request_context).await?;
+                        download_playlist_with_url(audio_url.as_str(), request_context)?;
                     let (_, audio_playlist) = parse_playlist(&audio_content)
                         .map_err(|e| anyhow!("Failed to parse HLS audio rendition: {:?}", e))?;
                     let Playlist::MediaPlaylist(audio_playlist) = audio_playlist else {
@@ -2180,11 +2279,16 @@ pub(crate) async fn run_hls_pipeline(
                 &multi_progress,
                 video_reporter,
                 request_context.clone(),
-            )
-            .await?;
+            )?;
         }
         Playlist::MediaPlaylist(mp) => {
             info!("Media Playlist found, {} segments", mp.segments.len());
+            expected_duration = Some(
+                mp.segments
+                    .iter()
+                    .map(|segment| segment.duration as f64)
+                    .sum(),
+            );
             download_and_merge(
                 mp,
                 base_url,
@@ -2195,14 +2299,13 @@ pub(crate) async fn run_hls_pipeline(
                 &multi_progress,
                 reporter.clone(),
                 request_context.clone(),
-            )
-            .await?;
+            )?;
         }
     }
 
     if let Some((audio_playlist, audio_base_url, rendition_name)) = external_audio_plan {
         emit_progress(
-            &reporter,
+            reporter,
             format!("Downloading HLS audio rendition: {}", rendition_name),
             0.48,
         );
@@ -2216,8 +2319,7 @@ pub(crate) async fn run_hls_pipeline(
             &multi_progress,
             staged_progress_reporter(reporter.clone(), "Audio", 0.48, 0.92),
             request_context.clone(),
-        )
-        .await?;
+        )?;
         merge_media_streams(
             &temp_primary,
             &temp_audio,
@@ -2225,8 +2327,8 @@ pub(crate) async fn run_hls_pipeline(
             video_bitrate,
             audio_bitrate,
             reporter.clone(),
-        )
-        .await?;
+            expected_duration,
+        )?;
     } else {
         convert_to_mp4(
             &temp_primary_str,
@@ -2236,18 +2338,18 @@ pub(crate) async fn run_hls_pipeline(
             &multi_progress,
             backend,
             reporter.clone(),
-        )
-        .await?;
+            expected_duration,
+        )?;
     }
 
     if !keep_temp {
-        let _ = fs::remove_file(&temp_primary).await;
-        let _ = fs::remove_file(&temp_audio).await;
-        let _ = fs::remove_dir(&temp_dir).await;
+        // remove_dir_all also cleans the per-segment .part files and the
+        // ffmpeg concat lists that live inside the temp directory.
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    ensure_output_file_ready(Path::new(output)).await?;
-    emit_progress(&reporter, "All tasks completed", 1.0);
+    ensure_output_file_ready(Path::new(output))?;
+    emit_progress(reporter, "All tasks completed", 1.0);
 
     Ok(())
 }
@@ -2366,7 +2468,7 @@ impl CandidateCollector {
         let container = container_from_url(&media_url);
         let resolved_title = title.unwrap_or_else(|| self.default_title.clone());
         self.candidates.push(MediaCandidate {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: Uuid::new_v4().to_string(),
             title: resolved_title,
             extractor: extractor.unwrap_or(&self.extractor).to_string(),
             page_url: self.page_url.clone(),
@@ -2611,7 +2713,7 @@ fn create_unique_temp_dir(root: &Path, output_path: &Path) -> Result<PathBuf> {
     let temp_dir = root.join(format!(
         ".ferrisload-{}-{}",
         safe_stem,
-        uuid::Uuid::new_v4().simple()
+        Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&temp_dir).with_context(|| {
         format!(
@@ -2622,7 +2724,7 @@ fn create_unique_temp_dir(root: &Path, output_path: &Path) -> Result<PathBuf> {
     Ok(temp_dir)
 }
 
-async fn cleanup_temp_files<'a, I>(keep_temp: bool, paths: I)
+fn cleanup_temp_files<'a, I>(keep_temp: bool, paths: I)
 where
     I: IntoIterator<Item = &'a PathBuf>,
 {
@@ -2631,11 +2733,11 @@ where
     }
 
     for path in paths {
-        let _ = fs::remove_file(path).await;
+        let _ = std::fs::remove_file(path);
     }
 }
 
-async fn transcode_input_to_output(
+fn transcode_input_to_output(
     input_path: &Path,
     output: &str,
     video_bitrate: u32,
@@ -2648,10 +2750,10 @@ async fn transcode_input_to_output(
         video_bitrate,
         audio_bitrate,
         &MultiProgress::new(),
-        select_transcoder_backend().await?,
+        select_transcoder_backend()?,
         reporter,
+        None,
     )
-    .await
 }
 
 fn has_mp4_signature(prefix: &[u8]) -> bool {
@@ -2661,7 +2763,7 @@ fn has_mp4_signature(prefix: &[u8]) -> bool {
         .any(|window| window == b"ftyp" || window == b"styp")
 }
 
-async fn ensure_output_file_ready(path: &Path) -> Result<()> {
+fn ensure_output_file_ready(path: &Path) -> Result<()> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("Output file not found after download: {}", path.display()))?;
     if metadata.len() < 1024 {
@@ -2677,9 +2779,9 @@ async fn ensure_output_file_ready(path: &Path) -> Result<()> {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
     {
-        let mut file = fs::File::open(path).await?;
+        let mut file = std::fs::File::open(path)?;
         let mut prefix = [0u8; 64];
-        let bytes_read = file.read(&mut prefix).await?;
+        let bytes_read = file.read(&mut prefix)?;
         if !has_mp4_signature(&prefix[..bytes_read]) {
             bail!(
                 "Output does not contain an MP4 file signature: {}",
@@ -2688,14 +2790,23 @@ async fn ensure_output_file_ready(path: &Path) -> Result<()> {
         }
     }
 
-    let ffprobe_available = Command::new("ffprobe")
+    let ffprobe = if let Some(ffmpeg) = resolve_ffmpeg_path() {
+        let executable_name = if cfg!(target_os = "windows") {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        ffmpeg.with_file_name(executable_name)
+    } else {
+        PathBuf::from("ffprobe")
+    };
+    let ffprobe_available = Command::new(&ffprobe)
         .arg("-version")
         .output()
-        .await
         .map(|output| output.status.success())
         .unwrap_or(false);
     if ffprobe_available {
-        let probe = Command::new("ffprobe")
+        let probe = Command::new(&ffprobe)
             .args([
                 "-v",
                 "error",
@@ -2708,7 +2819,6 @@ async fn ensure_output_file_ready(path: &Path) -> Result<()> {
             ])
             .arg(path)
             .output()
-            .await
             .context("Failed to run ffprobe media validation")?;
         let stream_type = String::from_utf8_lossy(&probe.stdout);
         if !probe.status.success() || !stream_type.lines().any(|line| line.trim() == "video") {
@@ -2736,19 +2846,43 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-async fn stream_media_response_to_file(
-    response: Response,
+/// Stream a large payload to `path` using bounded Range chunks.
+///
+/// The `courierust` engine materializes each request body in memory, so
+/// large media must be pulled in chunks instead of buffering the whole
+/// file. A server that ignores Range (returns `200` with the full body)
+/// is handled by writing the single received body.
+#[allow(clippy::too_many_arguments)]
+fn stream_media_response_to_file(
+    client: &SyncHttpClient,
+    url: &str,
+    headers: &[(String, String)],
     path: &Path,
     progress_start: f64,
     progress_end: f64,
     reporter: &ProgressReporter,
     label: &str,
 ) -> Result<()> {
-    if let Some(content_type) = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase())
+    const CHUNK: u64 = 8 * 1024 * 1024;
+
+    let mut output = std::fs::File::create(path)
+        .with_context(|| format!("Failed to create media file: {}", path.display()))?;
+    let mut downloaded = 0u64;
+    let mut last_reported = 0u64;
+    emit_progress(reporter, label, progress_start);
+
+    // First request asks for a bounded first chunk (Range). A server that
+    // honors Range answers `206` with a partial body; one that ignores it
+    // answers `200` with the whole body. Both cases are handled below.
+    let (first_status, first_headers, first_body) = client.get_range(url, headers, 0, CHUNK - 1)?;
+    if !(200..300).contains(&first_status) {
+        bail!("Media request returned HTTP {}", first_status);
+    }
+    // Reject HTML/JSON responses that indicate a captcha or error page.
+    if let Some(content_type) = first_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.to_ascii_lowercase())
     {
         if content_type.starts_with("text/html")
             || content_type.starts_with("application/json")
@@ -2761,37 +2895,83 @@ async fn stream_media_response_to_file(
         }
     }
 
-    let total = response.content_length();
-    let mut stream = response.bytes_stream();
-    let mut output = fs::File::create(path)
-        .await
-        .with_context(|| format!("Failed to create media file: {}", path.display()))?;
-    let mut downloaded = 0u64;
-    let mut last_reported = 0u64;
-    emit_progress(reporter, label, progress_start);
+    let total = first_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok());
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        output.write_all(&chunk).await?;
-        downloaded = downloaded.saturating_add(chunk.len() as u64);
-
-        if downloaded.saturating_sub(last_reported) >= 512 * 1024 {
+    let write_and_report = |output: &mut std::fs::File,
+                            data: &[u8],
+                            downloaded: &mut u64,
+                            last_reported: &mut u64|
+     -> Result<()> {
+        output.write_all(data)?;
+        *downloaded = downloaded.saturating_add(data.len() as u64);
+        if downloaded.saturating_sub(*last_reported) >= 512 * 1024 {
             let progress = total
                 .filter(|total| *total > 0)
                 .map(|total| {
                     progress_start
-                        + (downloaded as f64 / total as f64).clamp(0.0, 1.0)
+                        + (*downloaded as f64 / total as f64).clamp(0.0, 1.0)
                             * (progress_end - progress_start)
                 })
                 .unwrap_or(progress_start);
             let detail = total
-                .map(|total| format!("{} / {}", human_bytes(downloaded), human_bytes(total)))
-                .unwrap_or_else(|| human_bytes(downloaded));
+                .map(|total| format!("{} / {}", human_bytes(*downloaded), human_bytes(total)))
+                .unwrap_or_else(|| human_bytes(*downloaded));
             emit_progress(reporter, format!("{} [{}]", label, detail), progress);
-            last_reported = downloaded;
+            *last_reported = *downloaded;
         }
+        Ok(())
+    };
+
+    if first_status == 206 {
+        // Server honors Range: write the first chunk, then pull the rest.
+        if !first_body.is_empty() {
+            write_and_report(
+                &mut output,
+                &first_body,
+                &mut downloaded,
+                &mut last_reported,
+            )?;
+        }
+        let total = total.unwrap_or(0);
+        let mut offset = first_body.len() as u64;
+        while total == 0 || offset < total {
+            let end = if total > 0 {
+                (offset + CHUNK - 1).min(total - 1)
+            } else {
+                offset + CHUNK - 1
+            };
+            let (status, _, body) = client.get_range(url, headers, offset, end)?;
+            if !(200..300).contains(&status) {
+                bail!("Media Range request returned HTTP {}", status);
+            }
+            if body.is_empty() {
+                break;
+            }
+            write_and_report(&mut output, &body, &mut downloaded, &mut last_reported)?;
+            offset = offset.saturating_add(body.len() as u64);
+            // Stop when we have reached the declared length, or when the
+            // server returned a short chunk with no declared length.
+            if total > 0 && offset >= total {
+                break;
+            }
+            if total == 0 && (body.len() as u64) < CHUNK {
+                break;
+            }
+        }
+    } else {
+        // Server ignored Range and returned the whole body in one shot.
+        write_and_report(
+            &mut output,
+            &first_body,
+            &mut downloaded,
+            &mut last_reported,
+        )?;
     }
-    output.flush().await?;
+
+    output.flush()?;
     if downloaded == 0 {
         bail!("Media response was empty");
     }
@@ -2804,9 +2984,10 @@ async fn stream_media_response_to_file(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn download_with_retries(
-    client: &Client,
+fn download_with_retries(
+    client: &SyncHttpClient,
     url: &str,
+    headers: &[(String, String)],
     path: &Path,
     retries: u8,
     progress_start: f64,
@@ -2815,100 +2996,35 @@ async fn download_with_retries(
     label: &str,
 ) -> Result<()> {
     for attempt in 1..=retries {
-        let _ = fs::remove_file(path).await;
-        match client.get(url).send().await {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    if attempt == retries {
-                        return Err(anyhow!("Failed to download media: HTTP {}", status));
-                    }
-                    let delay = retry_backoff_delay(attempt, Some(status.as_u16()));
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-
-                match stream_media_response_to_file(
-                    response,
-                    path,
-                    progress_start,
-                    progress_end,
-                    reporter,
-                    label,
-                )
-                .await
-                {
-                    Ok(()) => return Ok(()),
-                    Err(error) if attempt < retries => {
-                        warn!(
-                            "Media stream attempt {} failed for {}: {}",
-                            attempt, url, error
-                        );
-                        let delay = retry_backoff_delay(attempt, None);
-                        tokio::time::sleep(delay).await;
-                    }
-                    Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("Failed to download media: {}", url));
-                    }
-                }
-            }
+        let _ = std::fs::remove_file(path);
+        let result = stream_media_response_to_file(
+            client,
+            url,
+            headers,
+            path,
+            progress_start,
+            progress_end,
+            reporter,
+            label,
+        );
+        match result {
+            Ok(()) => return Ok(()),
             Err(error) => {
                 if attempt == retries {
                     return Err(error)
                         .with_context(|| format!("Failed to download media: {}", url));
                 }
+                warn!(
+                    "Media stream attempt {} failed for {}: {}",
+                    attempt, url, error
+                );
                 let delay = retry_backoff_delay(attempt, None);
-                tokio::time::sleep(delay).await;
+                std::thread::sleep(delay);
             }
         }
     }
 
     bail!("Failed to download media after retries: {}", url)
-}
-
-#[derive(Debug, Deserialize)]
-struct DashMpd {
-    #[serde(rename = "BaseURL", default)]
-    base_urls: Vec<String>,
-    #[serde(rename = "Period", default)]
-    periods: Vec<DashPeriod>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DashPeriod {
-    #[serde(rename = "AdaptationSet", default)]
-    adaptation_sets: Vec<DashAdaptationSet>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DashAdaptationSet {
-    #[serde(rename = "@mimeType")]
-    mime_type: Option<String>,
-    #[serde(rename = "@contentType")]
-    content_type: Option<String>,
-    #[serde(rename = "@lang")]
-    lang: Option<String>,
-    #[serde(rename = "BaseURL", default)]
-    base_urls: Vec<String>,
-    #[serde(rename = "Representation", default)]
-    representations: Vec<DashRepresentation>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DashRepresentation {
-    #[serde(rename = "@id")]
-    id: Option<String>,
-    #[serde(rename = "@mimeType")]
-    mime_type: Option<String>,
-    #[serde(rename = "@bandwidth")]
-    bandwidth: Option<i64>,
-    #[serde(rename = "@width")]
-    width: Option<i32>,
-    #[serde(rename = "@height")]
-    height: Option<i32>,
-    #[serde(rename = "BaseURL", default)]
-    base_urls: Vec<String>,
 }
 
 struct DashDownloadPlan {
@@ -2924,56 +3040,69 @@ struct DashRepresentationCandidate {
     height: i32,
 }
 
-async fn resolve_dash_download_plan(
+fn resolve_dash_download_plan(
     manifest_url: &str,
     request_context: &RequestContext,
 ) -> Result<DashDownloadPlan> {
     let (manifest_bytes, effective_manifest_url) =
-        download_playlist_with_url(manifest_url, request_context).await?;
+        download_playlist_with_url(manifest_url, request_context)?;
     let manifest = String::from_utf8(manifest_bytes).context("DASH manifest is not valid UTF-8")?;
     resolve_dash_download_plan_from_manifest(effective_manifest_url.as_str(), &manifest)
 }
 
+/// Parse a DASH MPD manifest (XML) and select the best video/audio
+/// representations, resolving relative BaseURLs against the manifest.
 fn resolve_dash_download_plan_from_manifest(
     manifest_url: &str,
     manifest: &str,
 ) -> Result<DashDownloadPlan> {
-    let mpd: DashMpd =
-        quick_xml::de::from_str(manifest).context("Failed to parse DASH manifest")?;
+    let root = xml::parse_xml(manifest.as_bytes()).context("Failed to parse DASH manifest")?;
+    if root.name != "MPD" {
+        bail!("DASH manifest root element is not <MPD>");
+    }
     let manifest_base = Url::parse(manifest_url).context("Invalid DASH manifest URL")?;
 
+    let mpd_base_urls = base_urls_of(&root);
     let mut best_video: Option<DashRepresentationCandidate> = None;
     let mut best_audio: Option<DashRepresentationCandidate> = None;
 
-    for period in &mpd.periods {
-        for adaptation in &period.adaptation_sets {
+    for period in root.children_named("Period") {
+        for adaptation in period.children_named("AdaptationSet") {
             let content_type = adaptation
-                .content_type
-                .as_deref()
-                .or(adaptation.mime_type.as_deref())
+                .attr("contentType")
+                .or_else(|| adaptation.attr("mimeType"))
                 .unwrap_or_default()
                 .to_ascii_lowercase();
+            let adaptation_base_urls = base_urls_of(adaptation);
 
-            for representation in &adaptation.representations {
+            for representation in adaptation.children_named("Representation") {
                 let representation_type = representation
-                    .mime_type
-                    .as_deref()
+                    .attr("mimeType")
                     .unwrap_or(&content_type)
                     .to_ascii_lowercase();
                 let Some(url) = resolve_dash_representation_url(
                     &manifest_base,
-                    &mpd.base_urls,
-                    &adaptation.base_urls,
-                    &representation.base_urls,
+                    &mpd_base_urls,
+                    &adaptation_base_urls,
+                    &base_urls_of(representation),
                 ) else {
                     continue;
                 };
 
                 let candidate = DashRepresentationCandidate {
                     url,
-                    bandwidth: representation.bandwidth.unwrap_or_default(),
-                    width: representation.width.unwrap_or_default(),
-                    height: representation.height.unwrap_or_default(),
+                    bandwidth: representation
+                        .attr("bandwidth")
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .unwrap_or_default(),
+                    width: representation
+                        .attr("width")
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .unwrap_or_default(),
+                    height: representation
+                        .attr("height")
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .unwrap_or_default(),
                 };
 
                 if representation_type.starts_with("video/") || content_type.starts_with("video") {
@@ -3012,6 +3141,15 @@ fn resolve_dash_download_plan_from_manifest(
     })
 }
 
+/// Collect the text of every direct `<BaseURL>` child of `element`.
+fn base_urls_of(element: &Element) -> Vec<String> {
+    element
+        .children_named("BaseURL")
+        .map(|base| base.text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
 fn resolve_dash_representation_url(
     manifest_base: &Url,
     mpd_base_urls: &[String],
@@ -3045,7 +3183,13 @@ fn join_manifest_url(
         current = current.join(base).ok()?;
     }
 
-    current.join(leaf).ok().map(|url| url.to_string())
+    let joined = current.join(leaf).ok()?;
+    // Enforce an http/https-only allow-list so a malicious MPD cannot
+    // redirect the client to file://, ftp://, data:, etc.
+    if !matches!(joined.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(joined.to_string())
 }
 
 #[cfg(test)]
@@ -3055,10 +3199,9 @@ mod tests {
         has_mp4_signature, hls_response_bytes, normalize_source_url, parse_ytdlp_progress,
         playlist_base_url, resolve_dash_download_plan_from_manifest, resolve_hls_byte_range,
         select_best_hls_variant, select_hls_audio_rendition, should_auto_inspect_download_target,
-        youtube_itag_from_media_url,
+        youtube_itag_from_media_url, ByteRange, Playlist,
     };
-    use m3u8_rs::{parse_playlist, ByteRange, Playlist};
-    use reqwest::StatusCode;
+    use crate::hls::parse_playlist;
     use url::Url;
 
     #[test]
@@ -3217,12 +3360,12 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *yt-dlp.exe\n";
     #[test]
     fn slices_full_responses_when_a_server_ignores_range() {
         assert_eq!(
-            hls_response_bytes(StatusCode::OK, &[0, 1, 2, 3, 4, 5], Some((2, 4)))
+            hls_response_bytes(200, &[0, 1, 2, 3, 4, 5], Some((2, 4)))
                 .expect("full response should be sliced"),
             vec![2, 3, 4]
         );
         assert_eq!(
-            hls_response_bytes(StatusCode::PARTIAL_CONTENT, &[7, 8, 9], Some((100, 102)),)
+            hls_response_bytes(206, &[7, 8, 9], Some((100, 102)),)
                 .expect("partial response should already represent the range"),
             vec![7, 8, 9]
         );
@@ -3344,13 +3487,14 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *yt-dlp.exe\n";
     }
 }
 
-async fn merge_media_streams(
+fn merge_media_streams(
     video_path: &Path,
     audio_path: &Path,
     output_path: &str,
     video_bitrate: u32,
     audio_bitrate: u32,
     reporter: ProgressReporter,
+    expected_duration: Option<f64>,
 ) -> Result<()> {
     let requires_reencode = video_bitrate > 0 || audio_bitrate > 0;
 
@@ -3363,14 +3507,12 @@ async fn merge_media_streams(
                     "Merging streams with Android MediaMuxer (no re-encoding)",
                     0.9,
                 );
-                match transcoder
-                    .mux(
-                        video_path.to_string_lossy().as_ref(),
-                        audio_path.to_string_lossy().as_ref(),
-                        output_path,
-                    )
-                    .await
-                {
+                match transcoder.mux(
+                    video_path.to_string_lossy().as_ref(),
+                    audio_path.to_string_lossy().as_ref(),
+                    output_path,
+                    expected_duration,
+                ) {
                     Ok(_) => return Ok(()),
                     Err(e) => warn!(
                         "Android MediaMuxer merge failed, falling back if possible: {}",
@@ -3380,20 +3522,19 @@ async fn merge_media_streams(
             } else {
                 let mux_input = video_path.with_file_name(format!(
                     "merged_transcode_input_{}.mp4",
-                    uuid::Uuid::new_v4().simple()
+                    Uuid::new_v4().simple()
                 ));
                 emit_progress(
                     &reporter,
                     "Preparing separate streams with Android MediaMuxer",
                     0.88,
                 );
-                let mux_result = transcoder
-                    .mux(
-                        video_path.to_string_lossy().as_ref(),
-                        audio_path.to_string_lossy().as_ref(),
-                        mux_input.to_string_lossy().as_ref(),
-                    )
-                    .await;
+                let mux_result = transcoder.mux(
+                    video_path.to_string_lossy().as_ref(),
+                    audio_path.to_string_lossy().as_ref(),
+                    mux_input.to_string_lossy().as_ref(),
+                    expected_duration,
+                );
 
                 if let Err(error) = mux_result {
                     warn!(
@@ -3402,15 +3543,14 @@ async fn merge_media_streams(
                     );
                 } else {
                     emit_progress(&reporter, "Using Android MediaCodec hardware encoder", 0.93);
-                    let transcode_result = transcoder
-                        .transcode(
-                            mux_input.to_string_lossy().as_ref(),
-                            output_path,
-                            video_bitrate,
-                            audio_bitrate,
-                        )
-                        .await;
-                    let _ = fs::remove_file(&mux_input).await;
+                    let transcode_result = transcoder.transcode(
+                        mux_input.to_string_lossy().as_ref(),
+                        output_path,
+                        video_bitrate,
+                        audio_bitrate,
+                        expected_duration,
+                    );
+                    let _ = std::fs::remove_file(&mux_input);
                     match transcode_result {
                         Ok(()) => return Ok(()),
                         Err(error) => {
@@ -3418,21 +3558,26 @@ async fn merge_media_streams(
                                 "Android MediaCodec hardware encode failed, falling back if possible: {}",
                                 error
                             );
-                            let _ = fs::remove_file(output_path).await;
+                            let _ = std::fs::remove_file(output_path);
                         }
                     }
                 }
-                let _ = fs::remove_file(&mux_input).await;
+                let _ = std::fs::remove_file(&mux_input);
             }
         }
     }
 
     let ffmpeg_path = resolve_ffmpeg_path()
-        .await
         .ok_or_else(|| anyhow!("FFmpeg is required to merge separated audio and video streams"))?;
 
+    // Prefer concat demuxer segment lists (written by download_and_merge_once)
+    // over the naively-concatenated TS files, for the same discontinuity reasons
+    // described in convert_to_mp4.
+    let video_concat = concat_list_for_input(video_path);
+    let audio_concat = concat_list_for_input(audio_path);
+
     let mut selected_accel = if requires_reencode {
-        detect_acceleration(&ffmpeg_path).await?
+        detect_acceleration(&ffmpeg_path)?
     } else {
         AccelType::Cpu
     };
@@ -3455,14 +3600,15 @@ async fn merge_media_streams(
 
     let mut output = run_ffmpeg_merge(
         video_path,
+        video_concat.as_deref(),
         audio_path,
+        audio_concat.as_deref(),
         output_path,
         video_bitrate,
         audio_bitrate,
         selected_accel,
         &ffmpeg_path,
-    )
-    .await?;
+    )?;
 
     if !output.status.success() && requires_reencode && selected_accel != AccelType::Cpu {
         warn!(
@@ -3479,17 +3625,18 @@ async fn merge_media_streams(
             0.94,
         );
         selected_accel = AccelType::Cpu;
-        let _ = fs::remove_file(output_path).await;
+        let _ = std::fs::remove_file(output_path);
         output = run_ffmpeg_merge(
             video_path,
+            video_concat.as_deref(),
             audio_path,
+            audio_concat.as_deref(),
             output_path,
             video_bitrate,
             audio_bitrate,
             selected_accel,
             &ffmpeg_path,
-        )
-        .await?;
+        )?;
     }
 
     if !output.status.success() {
@@ -3500,12 +3647,22 @@ async fn merge_media_streams(
         );
     }
 
+    validate_output_duration(
+        Path::new(output_path),
+        expected_duration,
+        &ffmpeg_path,
+        "FFmpeg merge",
+    )?;
+
     Ok(())
 }
 
-async fn run_ffmpeg_merge(
+#[allow(clippy::too_many_arguments)]
+fn run_ffmpeg_merge(
     video_path: &Path,
+    video_concat: Option<&Path>,
     audio_path: &Path,
+    audio_concat: Option<&Path>,
     output_path: &str,
     video_bitrate: u32,
     audio_bitrate: u32,
@@ -3519,15 +3676,39 @@ async fn run_ffmpeg_merge(
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
-        "-i".to_string(),
-        video_path.to_string_lossy().to_string(),
-        "-i".to_string(),
-        audio_path.to_string_lossy().to_string(),
+        "-fflags".to_string(),
+        "+genpts".to_string(),
+    ];
+    if let Some(concat) = video_concat {
+        args.extend([
+            "-f".to_string(),
+            "concat".to_string(),
+            "-safe".to_string(),
+            "0".to_string(),
+            "-i".to_string(),
+            concat.to_string_lossy().to_string(),
+        ]);
+    } else {
+        args.extend(["-i".to_string(), video_path.to_string_lossy().to_string()]);
+    }
+    if let Some(concat) = audio_concat {
+        args.extend([
+            "-f".to_string(),
+            "concat".to_string(),
+            "-safe".to_string(),
+            "0".to_string(),
+            "-i".to_string(),
+            concat.to_string_lossy().to_string(),
+        ]);
+    } else {
+        args.extend(["-i".to_string(), audio_path.to_string_lossy().to_string()]);
+    }
+    args.extend([
         "-map".to_string(),
         "0:v:0".to_string(),
         "-map".to_string(),
         "1:a:0".to_string(),
-    ];
+    ]);
 
     if !requires_reencode {
         args.extend(["-c".to_string(), "copy".to_string()]);
@@ -3564,13 +3745,21 @@ async fn run_ffmpeg_merge(
         }
     }
 
-    args.extend(["-movflags".to_string(), "+faststart".to_string()]);
+    args.extend([
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        "-muxpreload".to_string(),
+        "0".to_string(),
+        "-muxdelay".to_string(),
+        "0".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+    ]);
     args.push(output_path.to_string());
 
     Command::new(ffmpeg_path)
         .args(&args)
         .output()
-        .await
         .context("FFmpeg merge process failed")
 }
 
@@ -3597,18 +3786,14 @@ fn detect_access_challenge(status: u16, body: &str) -> Option<String> {
     None
 }
 
-async fn score_candidates(
+fn score_candidates(
     candidates: Vec<MediaCandidate>,
     request_context: &RequestContext,
 ) -> Vec<MediaCandidate> {
-    let request_context = request_context.clone();
-    let mut candidates = stream::iter(candidates.into_iter().map(|candidate| {
-        let request_context = request_context.clone();
-        async move { score_candidate(candidate, &request_context).await }
-    }))
-    .buffer_unordered(6)
-    .collect::<Vec<_>>()
-    .await;
+    let mut candidates = candidates
+        .into_iter()
+        .map(|candidate| score_candidate(candidate, request_context))
+        .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
         let left_score = (
@@ -3634,7 +3819,7 @@ async fn score_candidates(
     candidates
 }
 
-async fn score_candidate(
+fn score_candidate(
     mut candidate: MediaCandidate,
     request_context: &RequestContext,
 ) -> MediaCandidate {
@@ -3647,7 +3832,7 @@ async fn score_candidate(
         score += 300;
         reasons.push("hls".to_string());
         if let Ok((segments, duration)) =
-            inspect_hls_metadata(&candidate.media_url, request_context).await
+            inspect_hls_metadata(&candidate.media_url, request_context)
         {
             candidate.segment_count = segments as i32;
             candidate.duration_seconds = duration;
@@ -3714,8 +3899,8 @@ fn retry_backoff_delay(attempt: u8, status: Option<u16>) -> Duration {
     Duration::from_millis(base_ms * (1u64 << exponent))
 }
 
-async fn inspect_hls_metadata(url: &str, request_context: &RequestContext) -> Result<(usize, f64)> {
-    let bytes = download_playlist(url, request_context).await?;
+fn inspect_hls_metadata(url: &str, request_context: &RequestContext) -> Result<(usize, f64)> {
+    let bytes = download_playlist(url, request_context)?;
     let (_, playlist) =
         parse_playlist(&bytes).map_err(|e| anyhow!("Failed to parse HLS metadata: {:?}", e))?;
     match playlist {
@@ -3732,50 +3917,56 @@ async fn inspect_hls_metadata(url: &str, request_context: &RequestContext) -> Re
 }
 
 fn create_http_client_for_context(
-    source_url: Option<&str>,
+    _source_url: Option<&str>,
+    _request_context: &RequestContext,
+) -> Result<SyncHttpClient> {
+    // The client itself carries TLS roots and timeouts; the per-request
+    // headers (referer/origin/cookie/custom) are attached by
+    // `request_headers` at each call site.
+    SyncHttpClient::with_timeouts(Duration::from_secs(10), Duration::from_secs(45))
+}
+
+/// Build the per-request header list for a given source URL and context.
+fn request_headers(
+    source_url: &Url,
     request_context: &RequestContext,
-) -> Result<Client> {
-    let mut headers = header::HeaderMap::new();
+) -> Result<Vec<(String, String)>> {
+    let mut headers: Vec<(String, String)> = Vec::new();
     let user_agent = if request_context.user_agent.trim().is_empty() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     } else {
         request_context.user_agent.trim()
     };
-    headers.insert(
-        header::USER_AGENT,
-        header::HeaderValue::from_str(user_agent)?,
-    );
-    headers.insert(header::ACCEPT, header::HeaderValue::from_static("*/*"));
-    headers.insert(
-        header::ACCEPT_LANGUAGE,
-        header::HeaderValue::from_static("en-US,en;q=0.9,zh-CN;q=0.8"),
-    );
+    validate_header_value(user_agent, "user-agent")?;
+    headers.push(("user-agent".to_string(), user_agent.to_string()));
+    headers.push(("accept".to_string(), "*/*".to_string()));
+    headers.push((
+        "accept-language".to_string(),
+        "en-US,en;q=0.9,zh-CN;q=0.8".to_string(),
+    ));
 
-    if let Some(source_url) = source_url {
-        if let Ok(parsed_url) = Url::parse(source_url) {
-            if let Some(domain) = parsed_url.domain() {
-                let (default_referer, default_origin) = canonical_site_context(domain);
-                let referer = if request_context.referer.trim().is_empty() {
-                    default_referer.as_str()
-                } else {
-                    request_context.referer.trim()
-                };
-                let origin = if request_context.origin.trim().is_empty() {
-                    default_origin.as_str()
-                } else {
-                    request_context.origin.trim()
-                };
-                headers.insert(header::REFERER, header::HeaderValue::from_str(referer)?);
-                headers.insert(header::ORIGIN, header::HeaderValue::from_str(origin)?);
-            }
-        }
+    if let Some(domain) = source_url.domain() {
+        let (default_referer, default_origin) = canonical_site_context(domain);
+        let referer = if request_context.referer.trim().is_empty() {
+            default_referer
+        } else {
+            request_context.referer.trim().to_string()
+        };
+        let origin = if request_context.origin.trim().is_empty() {
+            default_origin
+        } else {
+            request_context.origin.trim().to_string()
+        };
+        validate_header_value(&referer, "referer")?;
+        validate_header_value(&origin, "origin")?;
+        headers.push(("referer".to_string(), referer));
+        headers.push(("origin".to_string(), origin));
     }
 
     if !request_context.cookie.trim().is_empty() {
-        headers.insert(
-            header::COOKIE,
-            header::HeaderValue::from_str(request_context.cookie.trim())?,
-        );
+        let cookie = request_context.cookie.trim().to_string();
+        validate_header_value(&cookie, "cookie")?;
+        headers.push(("cookie".to_string(), cookie));
     }
 
     for entry in &request_context.headers {
@@ -3784,14 +3975,41 @@ fn create_http_client_for_context(
         if name.is_empty() || value.is_empty() {
             continue;
         }
-        let header_name = header::HeaderName::from_bytes(name.as_bytes())?;
-        headers.insert(header_name, header::HeaderValue::from_str(value)?);
+        // Validate the header name against HTTP token rules before
+        // forwarding, preventing header injection.
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b':' && byte != b' ')
+        {
+            bail!("Invalid HTTP header name in request context: {:?}", name);
+        }
+        // Validate the header value: CR/LF/control bytes would enable
+        // response-splitting / header injection.
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b'\t')
+        {
+            bail!(
+                "Invalid HTTP header value in request context (contains CR/LF/control bytes): {:?}",
+                value
+            );
+        }
+        headers.push((name.to_ascii_lowercase(), value.to_string()));
     }
 
-    Ok(Client::builder()
-        .default_headers(headers)
-        .timeout(Duration::from_secs(45))
-        .build()?)
+    Ok(headers)
+}
+
+/// Reject header values containing CR/LF or other control bytes, which would
+/// enable response-splitting / header injection when forwarded upstream.
+fn validate_header_value(value: &str, header_name: &str) -> Result<()> {
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() || byte == b'\t')
+    {
+        bail!("Invalid HTTP header value for {header_name:?} (contains CR/LF/control bytes)");
+    }
+    Ok(())
 }
 
 fn canonical_site_context(domain: &str) -> (String, String) {
@@ -3819,36 +4037,58 @@ fn canonical_site_context(domain: &str) -> (String, String) {
     )
 }
 
-async fn download_playlist(url: &str, request_context: &RequestContext) -> Result<Vec<u8>> {
-    let (bytes, _) = download_playlist_with_url(url, request_context).await?;
+fn download_playlist(url: &str, request_context: &RequestContext) -> Result<Vec<u8>> {
+    let (bytes, _) = download_playlist_with_url(url, request_context)?;
     Ok(bytes)
 }
 
-async fn download_playlist_with_url(
+fn download_playlist_with_url(
     url: &str,
     request_context: &RequestContext,
 ) -> Result<(Vec<u8>, Url)> {
     let client = create_http_client_for_context(Some(url), request_context)?;
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        bail!("Failed to download playlist: HTTP {}", response.status());
+    let parsed = Url::parse(url).context("Invalid playlist URL")?;
+    let headers = request_headers(&parsed, request_context)?;
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=3u8 {
+        let result = client.get(url, &headers);
+        match result {
+            Ok((status, _, body)) => {
+                if !(200..300).contains(&status) {
+                    last_error = Some(anyhow!("Failed to download playlist: HTTP {}", status));
+                    if attempt < 3 {
+                        let delay = retry_backoff_delay(attempt, Some(status));
+                        std::thread::sleep(delay);
+                    }
+                    continue;
+                }
+                let effective_url = Url::parse(url).context("Invalid playlist URL")?;
+                return Ok((body, effective_url));
+            }
+            Err(error) => {
+                last_error = Some(anyhow!("Failed to download playlist: {}", error));
+                if attempt < 3 {
+                    let delay = retry_backoff_delay(attempt, None);
+                    std::thread::sleep(delay);
+                }
+            }
+        }
     }
-    let effective_url = response.url().clone();
-    Ok((response.bytes().await?.to_vec(), effective_url))
+    Err(last_error.unwrap_or_else(|| anyhow!("Failed to download playlist: {}", url)))
 }
 
-async fn check_ffmpeg() -> bool {
-    resolve_ffmpeg_path().await.is_some()
+fn check_ffmpeg() -> bool {
+    resolve_ffmpeg_path().is_some()
 }
 
-async fn select_transcoder_backend() -> Result<TranscoderKind> {
+fn select_transcoder_backend() -> Result<TranscoderKind> {
     #[cfg(target_os = "android")]
     if ANDROID_HW_TRANSCODER.get().is_some() {
         return Ok(TranscoderKind::AndroidHardware);
     }
 
-    if let Some(ffmpeg_path) = resolve_ffmpeg_path().await {
-        let accel = detect_acceleration(&ffmpeg_path).await?;
+    if let Some(ffmpeg_path) = resolve_ffmpeg_path() {
+        let accel = detect_acceleration(&ffmpeg_path)?;
         return Ok(TranscoderKind::Ffmpeg(accel));
     }
 
@@ -3869,8 +4109,8 @@ async fn select_transcoder_backend() -> Result<TranscoderKind> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn download_and_merge(
-    playlist: m3u8_rs::MediaPlaylist,
+fn download_and_merge(
+    playlist: MediaPlaylist,
     base_url: Option<Url>,
     concurrency: usize,
     retries: u8,
@@ -3891,9 +4131,7 @@ async fn download_and_merge(
             multi_progress,
             reporter.clone(),
             request_context.clone(),
-        )
-        .await
-        {
+        ) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 warn!(
@@ -3901,7 +4139,7 @@ async fn download_and_merge(
                     concurrency,
                     error
                 );
-                cleanup_segment_temp_files(temp_dir, playlist.segments.len(), output_file).await;
+                cleanup_segment_temp_files(temp_dir, playlist.segments.len(), output_file);
                 emit_progress(
                     &reporter,
                     "Multi-thread download failed. Retrying in single-thread mode...",
@@ -3922,7 +4160,6 @@ async fn download_and_merge(
         reporter,
         request_context,
     )
-    .await
 }
 
 #[derive(Clone, Debug)]
@@ -3964,11 +4201,7 @@ fn resolve_hls_byte_range(
     Ok(Some((start, end_exclusive - 1)))
 }
 
-fn hls_response_bytes(
-    status: reqwest::StatusCode,
-    data: &[u8],
-    byte_range: Option<(u64, u64)>,
-) -> Result<Vec<u8>> {
+fn hls_response_bytes(status: u16, data: &[u8], byte_range: Option<(u64, u64)>) -> Result<Vec<u8>> {
     let Some((start, end)) = byte_range else {
         return Ok(data.to_vec());
     };
@@ -3979,7 +4212,7 @@ fn hls_response_bytes(
     let expected_length = usize::try_from(expected_length)
         .context("HLS byte range is too large for this platform")?;
 
-    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+    if status == 206 {
         if data.len() < expected_length {
             bail!(
                 "HLS range response was truncated: expected {} bytes, received {}",
@@ -4005,21 +4238,24 @@ fn hls_response_bytes(
     Ok(data[start..end_exclusive].to_vec())
 }
 
-async fn download_hls_resource(
-    client: &Client,
+fn download_hls_resource(
+    client: &SyncHttpClient,
     request: &HlsResourceRequest,
     retries: u8,
 ) -> Result<Vec<u8>> {
     for attempt in 1..=retries {
-        let mut builder = client.get(&request.url);
-        if let Some((start, end)) = request.byte_range {
-            builder = builder.header(header::RANGE, format!("bytes={}-{}", start, end));
-        }
+        let headers: Vec<(String, String)> = Vec::new();
+        let result = match request.byte_range {
+            Some((start, end)) => client
+                .get_range(&request.url, &headers, start, end)
+                .map(|(status, _, body)| (status, body)),
+            None => client
+                .get(&request.url, &headers)
+                .map(|(status, _, body)| (status, body)),
+        };
 
-        match builder.send().await {
-            Ok(response) if response.status().is_success() => {
-                let status = response.status();
-                let bytes = response.bytes().await?;
+        match result {
+            Ok((status, bytes)) if (200..300).contains(&status) => {
                 match hls_response_bytes(status, &bytes, request.byte_range) {
                     Ok(data) => return Ok(data),
                     Err(error) => {
@@ -4030,16 +4266,14 @@ async fn download_hls_resource(
                     }
                 }
             }
-            Ok(response) => {
+            Ok((status, _)) => {
                 warn!(
                     "Attempt {} failed: {} HTTP {}",
-                    attempt,
-                    request.url,
-                    response.status()
+                    attempt, request.url, status
                 );
                 if attempt < retries {
-                    let delay = retry_backoff_delay(attempt, Some(response.status().as_u16()));
-                    tokio::time::sleep(delay).await;
+                    let delay = retry_backoff_delay(attempt, Some(status));
+                    std::thread::sleep(delay);
                 }
                 continue;
             }
@@ -4053,7 +4287,7 @@ async fn download_hls_resource(
 
         if attempt < retries {
             let delay = retry_backoff_delay(attempt, None);
-            tokio::time::sleep(delay).await;
+            std::thread::sleep(delay);
         }
     }
 
@@ -4067,13 +4301,12 @@ fn decrypt_hls_resource(data: Vec<u8>, crypto: Option<&(Vec<u8>, Vec<u8>)>) -> R
     if key.len() != 16 || iv.len() != 16 {
         bail!("AES-128 key and IV must contain exactly 16 bytes");
     }
-    let cipher = Aes128Cbc::new_from_slices(key, iv)?;
-    Ok(cipher.decrypt_vec(&data)?)
+    aes_128_cbc_decrypt(key, iv, &data).map_err(|e| anyhow!("AES-128-CBC decryption failed: {e}"))
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn download_and_merge_once(
-    playlist: m3u8_rs::MediaPlaylist,
+fn download_and_merge_once(
+    playlist: MediaPlaylist,
     base_url: Option<Url>,
     concurrency: usize,
     retries: u8,
@@ -4143,6 +4376,15 @@ async fn download_and_merge_once(
         } else {
             Url::parse(key_uri)?
         };
+        // Enforce an http/https-only allow-list for key URIs too (a
+        // malicious playlist must not redirect the client to file://,
+        // ftp://, data:, etc.).
+        if !matches!(key_url.scheme(), "http" | "https") {
+            bail!(
+                "Refusing non-HTTP(S) HLS key URL: {}",
+                key_url.scheme()
+            );
+        }
         let key_url_string = key_url.to_string();
         let key_bytes = if let Some(cached) = key_cache.get(&key_url_string) {
             cached.clone()
@@ -4154,8 +4396,7 @@ async fn download_and_merge_once(
                     byte_range: None,
                 },
                 retries,
-            )
-            .await?;
+            )?;
             if bytes.len() != 16 {
                 bail!("AES-128 key must contain exactly 16 bytes");
             }
@@ -4186,11 +4427,22 @@ async fn download_and_merge_once(
     }
 
     let resolve_url = |uri: &str| -> Result<String> {
-        if let Some(base) = &base_url {
-            Ok(base.join(uri)?.to_string())
+        // Resolve the segment/key URI against the playlist base, then
+        // enforce an http/https-only allow-list so a malicious playlist
+        // cannot redirect the client to file://, ftp://, data:, etc.
+        // (defense in depth against SSRF / local-file access).
+        let resolved = if let Some(base) = &base_url {
+            base.join(uri)?
         } else {
-            Ok(Url::parse(uri)?.to_string())
+            Url::parse(uri)?
+        };
+        if !matches!(resolved.scheme(), "http" | "https") {
+            bail!(
+                "Refusing non-HTTP(S) media resource URL: {}",
+                resolved.scheme()
+            );
         }
+        Ok(resolved.to_string())
     };
     let mut segment_range_cursor = None;
     let mut map_range_cursor = None;
@@ -4236,76 +4488,139 @@ async fn download_and_merge_once(
         init_requests.push(init_request);
     }
 
-    let sem = Arc::new(Semaphore::new(concurrency));
     let client = Arc::new(create_http_client_for_context(
         base_url.as_ref().map(Url::as_str),
         &request_context,
     )?);
-    let completed = Arc::new(Mutex::new(0u64));
+    let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let temp_dir = temp_dir.to_path_buf();
 
-    let tasks = stream::iter(0..total)
-        .map(|idx| {
-            let segment_request = segment_requests[idx].clone();
-            let init_request = init_requests[idx].clone();
-            let client = client.clone();
-            let sem = sem.clone();
-            let key = segment_crypto.get(idx).cloned().flatten();
-            let pb = download_pb.clone();
-            let completed = completed.clone();
-            let reporter = reporter.clone();
-            let temp_dir = temp_dir.clone();
+    // Bounded-concurrency synchronous downloader. Segment work is
+    // dispatched to a fixed pool of worker threads; each worker pulls the
+    // next pending index from a shared atomic cursor, so no semaphore is
+    // needed and no work is duplicated.
+    let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_count = concurrency.min(total).max(1);
+    let errors: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+    let client_shared = client.clone();
+    let completed_shared = completed.clone();
+    let pb_shared = download_pb.clone();
+    let reporter_shared = reporter.clone();
+    let temp_dir_shared = temp_dir.clone();
+    let next_shared = next_index.clone();
+    let errors_shared = errors.clone();
+    let segment_requests_shared = segment_requests;
+    let init_requests_shared = init_requests;
+    let segment_crypto_shared = segment_crypto;
 
-            tokio::spawn(async move {
-                let _permit = sem
-                    .acquire()
-                    .await
-                    .map_err(|_| anyhow!("Semaphore acquire failed"))?;
-
-                let mut buffer = Vec::new();
-                if let Some(init_request) = init_request {
-                    let init_data = download_hls_resource(&client, &init_request, retries).await?;
-                    let init_data = decrypt_hls_resource(init_data, key.as_ref())?;
-                    buffer.extend_from_slice(&init_data);
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let next = next_shared.clone();
+            let errors = errors_shared.clone();
+            let client = client_shared.clone();
+            let completed = completed_shared.clone();
+            let pb = pb_shared.clone();
+            let reporter = reporter_shared.clone();
+            let temp_dir = temp_dir_shared.clone();
+            let segment_requests = &segment_requests_shared;
+            let init_requests = &init_requests_shared;
+            let segment_crypto = &segment_crypto_shared;
+            scope.spawn(move || loop {
+                // Stop early if a previous worker failed.
+                if errors.lock().unwrap().is_some() {
+                    break;
                 }
-                let segment_data =
-                    download_hls_resource(&client, &segment_request, retries).await?;
-                let segment_data = decrypt_hls_resource(segment_data, key.as_ref())?;
-                buffer.extend_from_slice(&segment_data);
+                let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx >= total {
+                    break;
+                }
 
-                let file_name = format!("seg_{:05}.part", idx);
-                let tmp_path = temp_dir.join(file_name);
-                fs::write(&tmp_path, &buffer).await.with_context(|| {
-                    format!(
-                        "Failed to write segment: {} (url: {})",
-                        tmp_path.display(),
-                        segment_request.url
-                    )
-                })?;
+                let result = (|| -> Result<()> {
+                    let segment_request = segment_requests[idx].clone();
+                    let init_request = init_requests[idx].clone();
+                    let key = segment_crypto.get(idx).cloned().flatten();
 
-                let mut count = completed.lock().await;
-                *count += 1;
-                pb.set_position(*count);
-                pb.set_message(format!("Downloading segments [{}/{}]", *count, total));
-                emit_progress(
-                    &reporter,
-                    format!("Downloading segments [{}/{}]", *count, total),
-                    (*count as f64) / (total as f64) * 0.9,
-                );
+                    let mut buffer = Vec::new();
+                    if let Some(init_request) = init_request {
+                        let init_data = download_hls_resource(&client, &init_request, retries)?;
+                        let init_data = decrypt_hls_resource(init_data, key.as_ref())?;
+                        buffer.extend_from_slice(&init_data);
+                    }
+                    let segment_data = download_hls_resource(&client, &segment_request, retries)?;
+                    let segment_data = decrypt_hls_resource(segment_data, key.as_ref())?;
+                    buffer.extend_from_slice(&segment_data);
 
-                Ok::<(), anyhow::Error>(())
-            })
-        })
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
-        .await;
+                    let file_name = format!("seg_{:05}.part", idx);
+                    let tmp_path = temp_dir.join(file_name);
+                    std::fs::write(&tmp_path, &buffer).with_context(|| {
+                        format!(
+                            "Failed to write segment: {} (url: {})",
+                            tmp_path.display(),
+                            segment_request.url
+                        )
+                    })?;
 
-    for task in tasks {
-        task??;
+                    let count = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    pb.set_position(count);
+                    pb.set_message(format!("Downloading segments [{}/{}]", count, total));
+                    emit_progress(
+                        &reporter,
+                        format!("Downloading segments [{}/{}]", count, total),
+                        (count as f64) / (total as f64) * 0.9,
+                    );
+                    Ok(())
+                })();
+
+                if let Err(error) = result {
+                    let mut slot = errors.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(error);
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(error) = errors.lock().unwrap().take() {
+        return Err(error);
     }
 
     download_pb.finish_with_message("All segments downloaded");
+
+    // Write a concat-demuxer list for ffmpeg so conversion can consume the
+    // individual segment files (robust against PTS/DTS discontinuities) instead
+    // of the single naively-concatenated stream. fMP4 streams (those using
+    // EXT-X-MAP) cannot use the concat demuxer because each segment is only a
+    // fragment, so they keep using the merged file. Android's MediaCodec
+    // backend cannot read a concat list either, so there the segments are
+    // deleted after merging to save space.
+    let is_fmp4 = segments.iter().any(|segment| segment.map.is_some());
+    let use_concat = !is_fmp4 && cfg!(not(target_os = "android"));
+    let concat_list_path = PathBuf::from(format!("{}.concat.txt", output_file));
+    if use_concat {
+        let mut list_content = String::new();
+        for i in 0..total {
+            let segment_path = temp_dir.join(format!("seg_{:05}.part", i));
+            let absolute = std::path::absolute(&segment_path).unwrap_or(segment_path);
+            // ffmpeg's concat demuxer is POSIX-oriented: use forward slashes so
+            // Windows drive paths like C:/... are parsed reliably.
+            let normalized = absolute.to_string_lossy().replace('\\', "/");
+            let escaped = normalized.replace('\'', "'\\''");
+            list_content.push_str(&format!("file '{}'\n", escaped));
+        }
+        std::fs::write(&concat_list_path, list_content).with_context(|| {
+            format!(
+                "Failed to write concat list for ffmpeg: {}",
+                concat_list_path.display()
+            )
+        })?;
+        info!(
+            "Wrote ffmpeg concat list with {} segments: {}",
+            total,
+            concat_list_path.display()
+        );
+    }
 
     let merge_pb = multi_progress.add(ProgressBar::new(total as u64));
     merge_pb.set_style(
@@ -4316,23 +4631,22 @@ async fn download_and_merge_once(
     );
     merge_pb.set_message("Merging segments");
 
-    let mut output = fs::File::create(output_file)
-        .await
+    let mut output = std::fs::File::create(output_file)
         .with_context(|| format!("Failed to create output TS file: {}", output_file))?;
 
     for i in 0..total {
         let file_name = format!("seg_{:05}.part", i);
         let tmp_path = temp_dir.join(&file_name);
 
-        let mut segment = fs::File::open(&tmp_path)
-            .await
+        let mut segment = std::fs::File::open(&tmp_path)
             .with_context(|| format!("Failed to read segment: {}", tmp_path.display()))?;
 
-        tokio::io::copy(&mut segment, &mut output)
-            .await
+        std::io::copy(&mut segment, &mut output)
             .with_context(|| format!("Failed to write to output TS: {}", output_file))?;
 
-        let _ = fs::remove_file(&tmp_path).await;
+        if !use_concat {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
         merge_pb.inc(1);
         merge_pb.set_message(format!("Merging segments [{}/{}]", i + 1, total));
     }
@@ -4341,35 +4655,20 @@ async fn download_and_merge_once(
     Ok(())
 }
 
-async fn cleanup_segment_temp_files(temp_dir: &Path, total: usize, output_file: &str) {
+fn cleanup_segment_temp_files(temp_dir: &Path, total: usize, output_file: &str) {
     for index in 0..total {
         let file_name = format!("seg_{:05}.part", index);
-        let _ = fs::remove_file(temp_dir.join(file_name)).await;
+        let _ = std::fs::remove_file(temp_dir.join(file_name));
     }
-    let _ = fs::remove_file(output_file).await;
+    let _ = std::fs::remove_file(output_file);
+    let concat_list = PathBuf::from(format!("{}.concat.txt", output_file));
+    let _ = std::fs::remove_file(concat_list);
 }
 
-fn create_http_client() -> Result<Client> {
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::USER_AGENT,
-        header::HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        ),
-    );
-    headers.insert(header::ACCEPT, header::HeaderValue::from_static("*/*"));
-
-    Ok(Client::builder()
-        .default_headers(headers)
-        .timeout(Duration::from_secs(30))
-        .build()?)
-}
-
-async fn detect_acceleration(ffmpeg_path: &Path) -> Result<AccelType> {
+fn detect_acceleration(ffmpeg_path: &Path) -> Result<AccelType> {
     let output = Command::new(ffmpeg_path)
         .args(["-hide_banner", "-encoders"])
         .output()
-        .await
         .context("Failed to run ffmpeg")?;
 
     let list = String::from_utf8_lossy(&output.stdout);
@@ -4381,20 +4680,18 @@ async fn detect_acceleration(ffmpeg_path: &Path) -> Result<AccelType> {
         AccelType::AppleVideoToolbox,
     ];
     for candidate in candidates {
-        if list.contains(candidate.encoder()) && probe_ffmpeg_encoder(ffmpeg_path, candidate).await
-        {
+        if list.contains(candidate.encoder()) && probe_ffmpeg_encoder(ffmpeg_path, candidate) {
             return Ok(candidate);
         }
     }
-    if list.contains(AccelType::Cpu.encoder())
-        && probe_ffmpeg_encoder(ffmpeg_path, AccelType::Cpu).await
+    if list.contains(AccelType::Cpu.encoder()) && probe_ffmpeg_encoder(ffmpeg_path, AccelType::Cpu)
     {
         return Ok(AccelType::Cpu);
     }
     bail!("FFmpeg is installed but no usable H.264 encoder passed the runtime probe")
 }
 
-async fn probe_ffmpeg_encoder(ffmpeg_path: &Path, accel: AccelType) -> bool {
+fn probe_ffmpeg_encoder(ffmpeg_path: &Path, accel: AccelType) -> bool {
     let mut args = vec![
         "-hide_banner",
         "-loglevel",
@@ -4419,13 +4716,113 @@ async fn probe_ffmpeg_encoder(ffmpeg_path: &Path, accel: AccelType) -> bool {
     }
     args.extend(["-f", "null", "-"]);
 
-    match Command::new(ffmpeg_path).args(args).output().await {
+    match Command::new(ffmpeg_path).args(args).output() {
         Ok(output) => output.status.success(),
         Err(_) => false,
     }
 }
 
-async fn convert_to_mp4(
+/// Returns the concat-demuxer list file that `download_and_merge_once` writes
+/// next to the merged stream (e.g. `temp_primary.ts.concat.txt`), when present.
+///
+/// Using the concat demuxer with the original segment files is dramatically more
+/// robust than transcoding a single naively-concatenated TS: ffmpeg re-stamps
+/// each segment and no longer stops at the first non-monotonic timestamp, which
+/// was the root cause of outputs containing only the first few seconds.
+fn concat_list_for_input(input_path: &Path) -> Option<PathBuf> {
+    let list = PathBuf::from(format!("{}.concat.txt", input_path.to_string_lossy()));
+    if list.is_file() {
+        Some(list)
+    } else {
+        None
+    }
+}
+
+fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
+    let pattern = Regex::new(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)").ok()?;
+    let captures = pattern.captures(stderr)?;
+    let hours: f64 = captures.get(1)?.as_str().parse().ok()?;
+    let minutes: f64 = captures.get(2)?.as_str().parse().ok()?;
+    let seconds: f64 = captures.get(3)?.as_str().parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn probe_media_duration(path: &Path, ffmpeg_path: &Path) -> Option<f64> {
+    // Prefer the ffprobe binary that ships next to the resolved ffmpeg.
+    let executable_name = if cfg!(target_os = "windows") {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+    let ffprobe_path = ffmpeg_path.with_file_name(executable_name);
+    let probe = Command::new(&ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if probe.status.success() {
+        if let Ok(text) = String::from_utf8(probe.stdout) {
+            if let Ok(seconds) = text.trim().parse::<f64>() {
+                if seconds.is_finite() && seconds > 0.0 {
+                    return Some(seconds);
+                }
+            }
+        }
+    }
+
+    // Fallback: parse the `Duration:` line from `ffmpeg -i`.
+    let inspect = Command::new(ffmpeg_path)
+        .args(["-hide_banner", "-i"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&inspect.stderr);
+    parse_ffmpeg_duration(&stderr)
+}
+
+/// Verifies that a produced output is not truncated relative to the expected
+/// duration derived from the HLS playlist. Without this check a transcoder that
+/// silently stops after the first few seconds (while exiting with success)
+/// would hand the user a broken file after wasting all the download traffic.
+fn validate_output_duration(
+    path: &Path,
+    expected: Option<f64>,
+    ffmpeg_path: &Path,
+    stage: &str,
+) -> Result<()> {
+    let Some(expected) = expected.filter(|value| *value > 0.0) else {
+        return Ok(());
+    };
+    let Some(actual) = probe_media_duration(path, ffmpeg_path) else {
+        warn!(
+            "Could not probe duration of {} output; skipping duration validation",
+            stage
+        );
+        return Ok(());
+    };
+    // Tolerate up to 15% drift or 5 seconds (whichever is larger), which covers
+    // EXTINF rounding and container rounding without masking real truncation.
+    let tolerance = (expected * 0.85).max(expected - 5.0);
+    if actual + 1.0 < tolerance {
+        bail!(
+            "{} output is truncated: expected about {:.1}s but produced {:.1}s",
+            stage,
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_to_mp4(
     input_ts: &str,
     output_path: &str,
     video_bitrate: u32,
@@ -4433,6 +4830,7 @@ async fn convert_to_mp4(
     multi_progress: &MultiProgress,
     backend: TranscoderKind,
     reporter: ProgressReporter,
+    expected_duration: Option<f64>,
 ) -> Result<()> {
     let convert_pb = multi_progress.add(ProgressBar::new_spinner());
     convert_pb.set_style(
@@ -4460,18 +4858,22 @@ async fn convert_to_mp4(
             }
 
             let ffmpeg_path = resolve_ffmpeg_path()
-                .await
                 .ok_or_else(|| anyhow!("FFmpeg became unavailable before conversion"))?;
+            // Prefer the concat demuxer (segment list) over the single merged TS
+            // file; fall back to the merged file if the list is unavailable.
+            let concat_list = concat_list_for_input(Path::new(input_ts));
+            let used_concat = concat_list.is_some();
+
             let mut selected_accel = accel;
             let mut output = run_ffmpeg_conversion(
                 input_ts,
+                concat_list.as_deref(),
                 output_path,
                 video_bitrate,
                 audio_bitrate,
                 selected_accel,
                 &ffmpeg_path,
-            )
-            .await?;
+            )?;
 
             if !output.status.success() && selected_accel != AccelType::Cpu && requires_reencode {
                 warn!(
@@ -4487,16 +4889,17 @@ async fn convert_to_mp4(
                     ),
                     0.96,
                 );
+                let _ = std::fs::remove_file(output_path);
                 selected_accel = AccelType::Cpu;
                 output = run_ffmpeg_conversion(
                     input_ts,
+                    concat_list.as_deref(),
                     output_path,
                     video_bitrate,
                     audio_bitrate,
                     selected_accel,
                     &ffmpeg_path,
-                )
-                .await?;
+                )?;
             }
 
             if !output.status.success() {
@@ -4504,6 +4907,45 @@ async fn convert_to_mp4(
                 convert_pb.finish_with_message("MP4 transcode failed");
                 error!("FFmpeg stderr:\n{}", stderr);
                 bail!("MP4 transcode failed with {}", selected_accel.label());
+            }
+
+            // Detect silent truncation (e.g. only the first few seconds) that
+            // ffmpeg reports as success, and retry once without the concat
+            // demuxer before giving up with a clear error.
+            if let Err(error) = validate_output_duration(
+                Path::new(output_path),
+                expected_duration,
+                &ffmpeg_path,
+                "MP4 transcode",
+            ) {
+                if used_concat {
+                    warn!("{}; retrying with the merged stream file", error);
+                    let _ = std::fs::remove_file(output_path);
+                    output = run_ffmpeg_conversion(
+                        input_ts,
+                        None,
+                        output_path,
+                        video_bitrate,
+                        audio_bitrate,
+                        selected_accel,
+                        &ffmpeg_path,
+                    )?;
+                    if !output.status.success() {
+                        bail!(
+                            "MP4 transcode failed on retry with {}: {}",
+                            selected_accel.label(),
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
+                    validate_output_duration(
+                        Path::new(output_path),
+                        expected_duration,
+                        &ffmpeg_path,
+                        "MP4 transcode",
+                    )?;
+                } else {
+                    return Err(error);
+                }
             }
 
             convert_pb.finish_with_message("MP4 transcode complete");
@@ -4541,9 +4983,9 @@ async fn convert_to_mp4(
                 output_path,
                 video_bitrate,
                 audio_bitrate,
+                expected_duration,
                 &convert_pb,
-            )
-            .await?;
+            )?;
             convert_pb.finish_with_message("Android hardware transcode complete");
             info!("Output file: {}", output_path);
 
@@ -4561,8 +5003,9 @@ async fn convert_to_mp4(
     }
 }
 
-async fn run_ffmpeg_conversion(
+fn run_ffmpeg_conversion(
     input_path: &str,
+    concat_list: Option<&Path>,
     output_path: &str,
     video_bitrate: u32,
     audio_bitrate: u32,
@@ -4573,10 +5016,30 @@ async fn run_ffmpeg_conversion(
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
-        "info".to_string(),
-        "-i".to_string(),
-        input_path.to_string(),
+        "error".to_string(),
+        // Generate missing PTS/DTS and tolerate non-monotonic timestamps at
+        // segment boundaries. Without this, remuxing/transcoding a stream that
+        // was naively concatenated from independently-encoded HLS segments can
+        // stop after the first few seconds while still exiting successfully.
+        "-fflags".to_string(),
+        "+genpts".to_string(),
     ];
+    if let Some(concat_list) = concat_list {
+        // Use the concat demuxer with a list of the downloaded segment files.
+        // This is far more robust than a single concatenated TS file because
+        // ffmpeg re-timestamps every segment instead of choking on the first
+        // PTS/DTS discontinuity it encounters.
+        args.extend([
+            "-f".to_string(),
+            "concat".to_string(),
+            "-safe".to_string(),
+            "0".to_string(),
+            "-i".to_string(),
+            concat_list.to_string_lossy().to_string(),
+        ]);
+    } else {
+        args.extend(["-i".to_string(), input_path.to_string()]);
+    }
 
     if video_bitrate == 0 && audio_bitrate == 0 {
         info!("Bitrates are 0, attempting a lossless stream remux");
@@ -4626,6 +5089,18 @@ async fn run_ffmpeg_conversion(
     }
 
     args.extend([
+        // Keep the MP4 muxer from shifting, buffering or dropping the start of
+        // the timeline when segment timestamps are not perfectly monotonic.
+        // `make_zero` normalizes negative timestamps to zero, and zeroing the
+        // mux preload/delay prevents the muxer from discarding the head of the
+        // stream, which previously produced outputs that only contained the
+        // first few seconds.
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        "-muxpreload".to_string(),
+        "0".to_string(),
+        "-muxdelay".to_string(),
+        "0".to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
         output_path.to_string(),
@@ -4634,15 +5109,15 @@ async fn run_ffmpeg_conversion(
     Command::new(ffmpeg_path)
         .args(&args)
         .output()
-        .await
         .context("FFmpeg conversion process failed")
 }
 
-async fn android_hardware_transcode(
+fn android_hardware_transcode(
     input_ts: &str,
     output_mp4: &str,
     video_bitrate: u32,
     audio_bitrate: u32,
+    expected_duration: Option<f64>,
     _pb: &ProgressBar,
 ) -> Result<()> {
     #[cfg(target_os = "android")]
@@ -4657,9 +5132,13 @@ async fn android_hardware_transcode(
             anyhow!("Android MediaCodec transcoder not registered; JNI_OnLoad failed")
         })?;
 
-        transcoder
-            .transcode(input_ts, output_mp4, video_bitrate, audio_bitrate)
-            .await
+        transcoder.transcode(
+            input_ts,
+            output_mp4,
+            video_bitrate,
+            audio_bitrate,
+            expected_duration,
+        )
     }
 
     #[cfg(not(target_os = "android"))]
@@ -4668,6 +5147,7 @@ async fn android_hardware_transcode(
         let _ = output_mp4;
         let _ = video_bitrate;
         let _ = audio_bitrate;
+        let _ = expected_duration;
         bail!("Android hardware transcoding is only available on Android");
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use chrono::Utc;
 use dashmap::DashMap;
+use tzcraft::Zoned;
 
 use super::models::DownloadStatus;
 
@@ -38,7 +38,13 @@ impl TaskStore {
             .iter()
             .map(|entry| entry.value().clone())
             .collect::<Vec<_>>();
-        tasks.sort_by_key(|task| std::cmp::Reverse(task.created_at));
+        // Zoned is not Ord; sort by the underlying instant (nanoseconds
+        // since the Unix epoch) descending so newest tasks come first.
+        tasks.sort_by(|left, right| {
+            let left_ns = left.created_at.ticks().as_unix_nanos();
+            let right_ns = right.created_at.ticks().as_unix_nanos();
+            right_ns.cmp(&left_ns)
+        });
         tasks
     }
 
@@ -67,7 +73,7 @@ impl TaskStore {
             task.progress_percent = Some(100.0);
             task.output_path = Some(output_path);
             task.error = None;
-            task.completed_at = Some(Utc::now());
+            task.completed_at = Some(Zoned::now_utc().unwrap_or_else(|_| Zoned::from_ticks(tzcraft::Ticks::EPOCH, tzcraft::Zone::Utc)));
         });
     }
 
@@ -76,7 +82,7 @@ impl TaskStore {
             task.status = "failed".to_string();
             task.message = "Download failed".to_string();
             task.error = Some(error.to_string());
-            task.completed_at = Some(Utc::now());
+            task.completed_at = Some(Zoned::now_utc().unwrap_or_else(|_| Zoned::from_ticks(tzcraft::Ticks::EPOCH, tzcraft::Zone::Utc)));
         });
     }
 }

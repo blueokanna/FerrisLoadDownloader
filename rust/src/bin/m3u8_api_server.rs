@@ -11,8 +11,7 @@ fn init_runtime_logging() {
         .ok();
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> std::io::Result<()> {
     init_runtime_logging();
-    rust_lib_m3u8_downloader::api_server::run_server().await;
+    rust_lib_m3u8_downloader::api_server::run_server()
 }

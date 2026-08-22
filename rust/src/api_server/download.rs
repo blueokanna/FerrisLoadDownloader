@@ -4,28 +4,23 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use uuid::Uuid;
 
-use crate::api::downloader::{inspect_media_with_context, RequestContext};
+use crate::api::downloader::{inspect_media_with_context_sync, RequestContext};
 use crate::download_service::{self, DownloadProgressHandler};
 
 use super::models::DownloadRequest;
 use super::storage::TaskStore;
 
-pub async fn run_download_task(task_id: String, req: DownloadRequest, tasks: TaskStore) {
-    if let Err(error) = execute_download_task(&task_id, &req, &tasks).await {
+pub fn run_download_task(task_id: String, req: DownloadRequest, tasks: TaskStore) {
+    if let Err(error) = execute_download_task(&task_id, &req, &tasks) {
         tasks.mark_failed(&task_id, &error.to_string());
     }
 }
 
-async fn execute_download_task(
-    task_id: &str,
-    req: &DownloadRequest,
-    tasks: &TaskStore,
-) -> Result<()> {
+fn execute_download_task(task_id: &str, req: &DownloadRequest, tasks: &TaskStore) -> Result<()> {
     tasks.update_progress(task_id, "running", "Inspecting source...", Some(1.0), None);
 
     let request_context: RequestContext = req.request_context.clone().unwrap_or_default().into();
-    let (page_url, media_url, audio_url, inferred_name) =
-        resolve_media(req, &request_context).await?;
+    let (page_url, media_url, audio_url, inferred_name) = resolve_media(req, &request_context)?;
     let file_name = normalized_output_name(req.output_filename.as_deref(), &inferred_name);
     let download_dir =
         std::env::var("DOWNLOAD_DIR").unwrap_or_else(|_| "/app/downloads".to_string());
@@ -65,11 +60,9 @@ async fn execute_download_task(
         req.keep_temp.unwrap_or(false),
         request_context,
         Some(progress),
-    )
-    .await?;
+    )?;
 
-    let metadata = tokio::fs::metadata(&output_path)
-        .await
+    let metadata = std::fs::metadata(&output_path)
         .with_context(|| format!("Output file was not created: {}", output_path.display()))?;
     if metadata.len() == 0 {
         return Err(anyhow!("Output file is empty: {}", output_path.display()));
@@ -79,7 +72,7 @@ async fn execute_download_task(
     Ok(())
 }
 
-async fn resolve_media(
+fn resolve_media(
     req: &DownloadRequest,
     request_context: &RequestContext,
 ) -> Result<(String, String, Option<String>, String)> {
@@ -94,7 +87,7 @@ async fn resolve_media(
         ));
     }
 
-    let inspection = inspect_media_with_context(req.url.clone(), request_context.clone()).await?;
+    let inspection = inspect_media_with_context_sync(req.url.clone(), request_context.clone())?;
     if inspection.auth_required {
         return Err(anyhow!(
             "Authorized session required: {}",
