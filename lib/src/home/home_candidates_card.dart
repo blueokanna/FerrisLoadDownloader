@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
+import 'package:m3u8_downloader/src/app/app_theme.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
 import 'package:m3u8_downloader/src/rust/api/downloader.dart';
 
@@ -59,7 +60,7 @@ class HomeCandidatesCard extends StatelessWidget {
                 width: double.infinity,
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: FerrisShapes.of(context).md,
                   color: cs.errorContainer,
                 ),
                 child: Column(
@@ -112,7 +113,7 @@ class HomeCandidatesCard extends StatelessWidget {
                     margin: const EdgeInsets.only(bottom: 14),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: FerrisShapes.of(context).md,
                       color: cs.primaryContainer,
                       border: Border.all(
                         color: cs.primary.withValues(alpha: 0.35),
@@ -173,7 +174,7 @@ class HomeCandidatesCard extends StatelessWidget {
                     width: double.infinity,
                     padding: const EdgeInsets.all(20),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: FerrisShapes.of(context).md,
                       color: cs.surfaceContainerHigh.withValues(alpha: 0.55),
                     ),
                     child: Text(

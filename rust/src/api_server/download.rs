@@ -21,6 +21,15 @@ fn execute_download_task(task_id: &str, req: &DownloadRequest, tasks: &TaskStore
 
     let request_context: RequestContext = req.request_context.clone().unwrap_or_default().into();
     let (page_url, media_url, audio_url, inferred_name) = resolve_media(req, &request_context)?;
+    // SSRF guard (defense in depth on top of the scheme allow-list): the API
+    // server is network-exposed, so refuse any target that resolves to a
+    // private / loopback / link-local address unless explicitly allowlisted.
+    for target in std::iter::once(page_url.as_str())
+        .chain(std::iter::once(media_url.as_str()))
+        .chain(audio_url.iter().map(String::as_str))
+    {
+        super::validate_public_http_url(target)?;
+    }
     let file_name = normalized_output_name(req.output_filename.as_deref(), &inferred_name);
     let download_dir =
         std::env::var("DOWNLOAD_DIR").unwrap_or_else(|_| "/app/downloads".to_string());

@@ -1,201 +1,145 @@
 # FerrisLoad
 
-FerrisLoad is a cross-platform media downloader built with Flutter and a Rust core (via `flutter_rust_bridge`). Its primary purpose is reliable **M3U8 / HLS** downloading: it fetches the playlist, downloads every segment concurrently, decrypts AES-128 streams when needed, merges the segments, and transcodes the result into a playable MP4 saved to a location you choose. It also recognizes direct media links (MP4/WebM/MKV/MPD) and exposed streams on generic pages, YouTube, and Bilibili, with additional fallback handling for alternate player JSON markers, DASH MPD manifests, and exposed backup media URLs.
+一个用 Flutter 写的跨平台视频下载器，核心下载与转码逻辑在 Rust 里（通过 `flutter_rust_bridge` 桥接）。
 
-## Highlights
+主打 HLS / M3U8 下载：拉取播放列表、并发抓段、AES-128 解密、合并、转封装成 MP4 存到你指定的位置。也能直接下 MP4 / WebM / MKV / DASH 直链，并支持从普通网页、YouTube、Bilibili 页面里自动找出可用的媒体流。
 
-- **M3U8 / HLS first.** Master and media playlists, AES-128-CBC decryption, automatic best-variant selection, default concurrent segment download with retry/backoff, automatic single-thread fallback after a concurrent segment failure, and segment merge.
-- **Direct download without analysis.** Paste an `.m3u8`, direct media link, or supported page URL and press Download — no separate analyze step is required. The Rust core now auto-resolves plain YouTube and Bilibili page URLs into the best exposed candidate before it starts the actual transfer pipeline.
-- **Optional page analysis.** Inspect a web page to detect and rank candidate streams (generic pages, YouTube, Bilibili), then download the selected core stream. The extractor now routes page parsing through dedicated site-adapter modules that try multiple player JSON markers, embedded/embed-live player-response variants, short-link hosts, live-replay manifests, membership-restricted responses, Bilibili initial-state title variants, paginated bangumi episode lists, multi-page collections, multi-audio DASH tracks, MPD manifest representations, and backup URL fields before falling back.
-- **Transcoding backends.** FFmpeg on desktop (with NVENC/AMF/CPU detection) and Android `MediaCodec` hardware transcoding on devices without FFmpeg.
-- **Multiple active downloads.** Each Download press snapshots the current URL, file name, output directory, auth context, and transfer settings, so one video can keep downloading while you edit the form and start another.
-- **Material 3 dynamic color.** Theme profiles include dynamic Monet, true-black Amoled Monet, and Pantone-led Amoled palettes with refined surface layering, stronger container contrast, and smoother theme transitions.
-- **Saves to your device.** On Android the file is exported to your chosen folder (SAF) or to the system `Downloads/Movies` collection via `MediaStore`. On desktop it is written to the chosen directory.
-- **Authorized session support.** Import your own Cookie / User-Agent / Referer / Origin / custom headers (manually or through the in-app authorization browser) for sites that require login. FerrisLoad never bypasses Cloudflare, CAPTCHA, DRM, signatures, bans, or preview limits.
-- **Categorized inspection warnings.** Analysis warnings are tagged by scope (`auth`, `site`, `media`) so the UI can distinguish access challenges, missing player JSON, signature-protected streams, generic extraction gaps, age-gates, and YouTube/Bilibili membership-required pages.
-- **Fixture-backed extractor regression tests.** Site adapters now ship fixture-based unit tests for YouTube watch/embed/live, age-gated watch/live, members-only pages, and short-link live replay variants; Bilibili standard/bangumi/collection, paginated bangumi, multi-page collection, members-only, short-link, and multi-audio variants; plus generic pages.
-- **Deeper workflow feedback.** The home screen now tracks workflow stages, retry intent, recovery-after-error state, and current candidate-switch feedback through the dedicated controller/view-model layer, then renders those transitions with stronger Material 3 status animations and explicit retry affordances.
-- **Widget-level UI regression tests.** Home status and candidate surfaces now ship focused Flutter widget tests alongside theme-profile regressions so interaction polish can be validated without manual tapping.
-- **Foreground download service** on Android with live progress notification and battery-optimization handling. Concurrent downloads share a foreground service, while Android `MediaCodec`/`MediaMuxer` access is serialized at the JNI boundary for device stability.
-- **24 UI languages** with English fallback, RTL handling, and full coverage for the in-app authorization flow.
+> 英文版： [README.en.md](README.en.md)
 
-## Project layout
+## 它能做什么
+
+- **M3U8 / HLS**：支持主/媒体播放列表、自动选择最高清晰度的变体、AES-128-CBC 解密、带退避重试的并发分片下载。并发失败会自动降级为单线程重试，而不是直接报错。
+- **直链下载**：粘贴一个 `.m3u8` 或媒体直链，直接下载，无需先"分析"。粘贴 YouTube / Bilibili 页面地址也会自动解析出可下载的流。
+- **页面分析**：可选地先分析网页，列出候选流并按清晰度/码率排序，再选一个下载。
+- **转封装 / 转码**：桌面端用 FFmpeg（自动探测 NVENC / AMF / Intel QSV / VAAPI / VideoToolbox）；Android 端用系统 `MediaCodec` 硬件编解码，不依赖 FFmpeg。
+- **多任务**：下载进行中你可以继续改地址、改文件名再开一个新任务，互不干扰。
+- **授权会话**：有些站点需要登录才能下。你可以手动填入 Cookie / User-Agent / Referer / Origin / 自定义请求头，也可以打开内置浏览器登录后一键导入。程序不会绕过 Cloudflare、验证码、DRM、防盗链签名或限流——这些限制本身就不该被绕。
+
+## 工程结构
 
 ```
-lib/                     Flutter app (UI, state, platform channels)
-  main.dart              App bootstrap and top-level Material 3 shell
-  src/app/
-    app_localizations.dart
-    app_settings.dart    Persistent theme/language/app behavior settings
-    app_theme.dart       Material 3 Monet/Amoled/Pantone theme profiles
-    auth_browser_page.dart
-    platform_bridge.dart Android MediaStore / foreground-service bridge
-  src/home/
-    home_page.dart       Home screen state, layout orchestration, analyze/download flow
-    home_page_controller.dart  HomePage view-model, workflow stage machine, and state transition controller
-    auth_context_editor.dart
-    home_candidates_card.dart
-    home_download_tasks_card.dart Active download queue and per-task progress
-    home_history_card.dart
-    home_input_card.dart
-    home_status_card.dart   Status timeline, retry actions, and recovery feedback
-    home_widgets.dart    Reusable home screen cards, badges, motion primitives, preview widgets
-    home_settings_sheet.dart
-  src/rust/              Generated flutter_rust_bridge bindings
-rust/                    Rust core
-  src/api/downloader.rs  HLS pipeline, extractors, transcoding, JNI
-  src/api/site_adapters/
-    mod.rs               Host dispatch and shared adapter entrypoints
-    common.rs            Shared JSON/title/media parsing helpers
-    youtube.rs           YouTube player-response extraction variants
-    bilibili.rs          Bilibili playinfo, DASH/progressive, membership, and multi-audio extraction
-    generic.rs           Generic exposed media URL fallback extraction
-    fixtures/            Stable HTML snapshots for watch/embed/live, members-only, short-link, age-gate, bangumi pagination, multi-page, and multi-audio regression tests
-  src/api_server/        API server routes, task store, models, execution flow
-  src/bin/               Standalone API server entrypoint
-android/                 Android host, MediaStore/SAF helpers, foreground service
-ios/ macos/ windows/ linux/ web/   Platform runners
+lib/            Flutter 界面（Material 3，动态取色，多语言）
+rust/           Rust 核心
+  src/api/      下载管线（HLS/DASH/直链）、站点适配、FFmpeg、Android JNI
+  src/api_server/ 可选的 HTTP API 服务（Docker）
+  src/crypto/   自研 AES-128-CBC 与 SHA-256（依赖标准库）
+  src/hls.rs    自研 HLS 播放列表解析器（带资源上限）
+  src/net.rs    同步 HTTP 客户端（courierust + rustls 后备）
+android/        Android 宿主：MediaCodec 转码器、MediaStore 导出、前台服务
 ```
 
-## Requirements
-
-- Flutter SDK `>=3.3.0 <4.0.0`
-- Rust toolchain (stable) with the targets for your platform
-- Desktop transcoding: `ffmpeg` available on `PATH`
-- Android transcoding: no FFmpeg needed; the bundled Rust `.so` registers a `MediaCodec` transcoder through `JNI_OnLoad`
-
-## Getting started
+## 快速开始
 
 ```bash
 flutter pub get
-```
-
-Run on a connected device or desktop:
-
-```bash
 flutter run
 ```
 
-The Rust library is built automatically by the `rust_builder` package (Cargokit) during the Flutter build.
+Rust 库由 `rust_builder`（Cargokit）在 Flutter 构建时自动编译，一般不需要手动干预。
 
-On the backend side, candidate ranking now probes HLS metadata concurrently instead of serially, which reduces page-analysis latency when a source exposes multiple playlists or mixed progressive/HLS/DASH candidates.
+桌面端转码需要 FFmpeg 在 `PATH` 里；Android 不需要。
 
-The Flutter shell now resolves locale variants against the supported language list, applies RTL direction automatically for supported right-to-left languages, animates theme switches while honoring Android 12+ dynamic color when a Monet profile is selected, and keeps the home surface fully componentized through dedicated input, candidate, active-downloads, status, history, settings, and authorization widgets. The current mobile pass also expands padding, rebalances card density, and cleans up the status and authorization surfaces so narrow screens no longer feel crowded.
-
-`HomePage` now keeps text controllers, platform hooks, and navigation boundaries, while a dedicated controller/view-model layer owns progress, per-download task snapshots, workflow stage transitions, retry intent, selection feedback, inspection, auth-redirect, recovery-after-error state, directory, and history transitions. Shared home widgets now also provide the app-wide motion tokens and transition builders used by the input, candidate, active-downloads, status, history, and settings surfaces.
-
-For narrow regression checks during extractor work, run `cargo test --manifest-path rust/Cargo.toml site_adapters` or `cargo test --manifest-path rust/Cargo.toml downloader::tests`. For Flutter UI/theme/motion changes, run `flutter analyze lib test` and `flutter test test/home/home_download_tasks_card_test.dart test/home/home_status_card_test.dart test/home/home_candidates_card_test.dart test/app/app_theme_test.dart`.
-
-### Regenerating bridge bindings (only if you change the Rust API)
+### 重新生成 FRB 绑定（仅在改动 Rust API 时需要）
 
 ```bash
 flutter_rust_bridge_codegen generate
 ```
 
-## Building
+要求 codegen 版本与 `rust/Cargo.toml` 里的 `flutter_rust_bridge` 一致（目前为 2.13.0）。
 
-Android (recommended per-ABI for the Rust core):
+## 使用
+
+1. 把链接粘贴到「资源地址」。
+   - `.m3u8` 或媒体直链：直接点下载。
+   - 网页地址：可以先「分析」，选好候选流再下载。
+2. 填「输出文件」名，可选指定保存目录。
+3. 「下载选项」里可调并发数、重试次数、视频/音频码率（0 = 保持源码率）。
+4. 点「下载」。想先看候选就点「分析」。
+5. 完成后会显示保存路径并记入历史。
+
+需要登录的站点：打开设置里的授权浏览器，自己完成登录后导入会话，后续分析与下载都会复用这个授权上下文。
+
+## Android 转码说明
+
+Android 端没有 FFmpeg，转码完全靠系统 `MediaCodec`：
+
+- **解码/编码都优先硬件**（按厂商名评分：高通、联发科、海思、三星等），没有可用硬件编码器时才回退软件编码器。
+- **HLS 逐段处理**：不再把 TS 字节硬拼成一个文件（那样每段的时间戳会重置，导致 MediaCodec 只解出前几秒）。现在把每一段独立喂给解码器，跨段连续重建时间戳，等价于 FFmpeg 的 concat demuxer。
+- **纯转封装优先**：码率为 0 时先尝试无损 remux（视频/音频直接搬进 MP4）；失败或时长被截断时才做硬件重编码。
+- **输出自检**：转完会用 `MediaExtractor` / `MediaMetadataRetriever` 验证轨道存在、时长达标，不产出"只有前几秒"的废文件。
+- 编码器按分辨率自适应默认码率、实测帧率设 `KEY_FRAME_RATE` / `KEY_OPERATING_RATE`、实时优先级、无 B 帧，尽量减少播放时的卡顿。
+
+## iOS 转码说明（Apple A / M 系列硬件）
+
+iOS 没有 FFmpeg、也没有软件 H.264 编码器，转码走原生 `AVFoundation` / `VideoToolbox`（`ios/Runner/VideoToolboxBridge.m`）：
+
+- **AVAssetWriter + H.264 自动使用硬件编码器**——A 系列（iPhone/iPad）和 M 系列（Mac）芯片都会命中 VideoToolbox，这是 iOS 上"正确调用硬件"的唯一途径。
+- **旋转保留**：输出带上 `preferredTransform`，竖屏素材不会被横过来。
+- **音频处理**：AAC 直接 passthrough（不重编码）；非 AAC 自动转 AAC，保证 MP4 兼容。
+- **时长自检**：转码/合并后对照 HLS 期望时长校验，截断立即报错而不是产出废文件。
+- **超时兜底**：Rust 侧用 `ios_videotoolbox_timeout` 做墙钟上限，原生侧内部也有有界等待，硬件挂起不会卡死下载。
+
+桌面端（Windows/macOS/Linux x86 与 Apple Silicon）仍由 FFmpeg 驱动：自动探测 NVENC / AMF / QSV / VAAPI / VideoToolbox，探测失败回退 CPU libx264。
+
+## Web / WASM
+
+浏览器里跑不了 Rust 引擎，所以 Web 版把下载/分析交给 **FerrisLoad API 服务**（即 Docker 镜像里的同一个服务器）：
 
 ```bash
-flutter build apk --release --split-per-abi
+# 本地起 API 服务（多架构：amd64 / arm64 / armv7）
+docker compose --profile api up -d
 ```
 
-Other platforms:
-
-```bash
-flutter build windows --release
-flutter build macos --release
-flutter build linux --release
-flutter build ios --release
-```
-
-## Release outputs
-
-The GitHub Actions workflow in `.github/workflows/release.yml` produces:
-
-- Android split APKs for `arm64-v8a`, `armeabi-v7a`, and `x86_64`
-- Windows `x64` portable ZIP
-- macOS `x64` ZIP and macOS `arm64` ZIP
-- Linux `x64` portable tarball
-- Multi-arch Docker API image on GHCR for `linux/amd64`, `linux/arm64`, and `linux/arm/v7`
-
-If the workflow is started from a tag like `v1.2.0`, it also creates a GitHub Release and attaches the desktop/mobile artifacts automatically.
-
-## Usage
-
-1. Paste a source link into **Source URL**.
-   - An `.m3u8` or direct media link can be downloaded immediately.
-   - A web page (generic, YouTube, Bilibili) can be analyzed first to detect streams.
-2. Set the **Output file** name and, optionally, a **Save location**.
-3. Adjust **Download options** (concurrency, retries, video/audio bitrate). Bitrate `0` keeps the source bitrate.
-4. Press **Download** to fetch directly, or **Analyze source** first and then download the selected core stream.
-5. While a download is running, edit the URL or file name and press **Download** again to start another independent task.
-6. When finished, the saved file path is shown and added to **History**.
-
-For appearance tuning, open the settings sheet and switch between static Pantone palettes, dynamic Monet, Amoled Monet, and Amoled Pantone profiles. On supported Android devices, Monet profiles pull the system wallpaper palette automatically.
-
-For sites that require login or human verification, open the authorization browser, complete it yourself, and import the session; FerrisLoad reuses that authorized context for analysis and download.
+- 构建：`flutter build web --release`（JS）或 `flutter build web --release --wasm`（WASM）。
+- 网页端在「设置」里填入 API 地址（默认 `http://localhost:3000`）；非本机地址强制要求 `https`，避免会话凭据明文传输。
+- 分析（`POST /inspect`）、下载（`POST /download` + 轮询 `GET /status/:id`）与原生端共用同一套引擎，界面一致。
 
 ## Docker API
 
-The API container runs the real Rust downloader, not a simulated progress loop. It can accept either:
-
-- a direct `.m3u8` or media URL in `url`
-- a page URL in `url` and it will inspect the page and pick the best detected candidate automatically
-- an explicit `media_url` (and optional `audio_url`) if your caller already knows the exact streams
-
-Run locally:
-
-```bash
-docker build -f Dockerfile.api -t ferrisload-api .
-docker run --rm -p 3000:3000 -e DOWNLOAD_DIR=/app/downloads -v $(pwd)/downloads:/app/downloads ferrisload-api
-```
-
-Example request:
-
-```bash
-curl -X POST http://localhost:3000/download \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "url": "https://example.com/video/master.m3u8",
-    "output_filename": "demo.mp4",
-    "concurrency": 8,
-    "retries": 3,
-    "video_bitrate": 0,
-    "audio_bitrate": 0,
-    "keep_temp": false
-  }'
-```
-
-The API exposes:
+容器里跑的是真正的下载器（不是模拟进度）。接口：
 
 - `GET /health`
-- `POST /download`
+- `POST /inspect`（返回页面/直链的候选流列表，Web 端分析用）
+- `POST /download`（可直接给 `url`，或给 `media_url` / `audio_url` 指定精确流）
 - `GET /status/:task_id`
 - `GET /tasks`
 
-Internally, the API server is split into dedicated modules for request models, task storage, and download orchestration. Task status updates now use a concurrent task store instead of a single async mutex, which reduces contention when multiple downloads stream progress at the same time.
-
-## How M3U8 download works
-
-1. Download and parse the playlist. For a master playlist the highest-resolution / highest-bandwidth variant is selected.
-2. If the stream is AES-128 encrypted, the key and IV are fetched and each segment is decrypted (AES-128-CBC, PKCS7).
-3. Segments are downloaded concurrently with bounded concurrency and exponential backoff retries. If the concurrent pass fails and concurrency is greater than one, temporary segment output is cleaned up and the same playlist is retried with single-threaded downloading before the failure is surfaced. Successful segment output is merged into a single `.ts` file in a writable temporary directory.
-4. The `.ts` is transcoded to `.mp4` (FFmpeg or Android `MediaCodec`). The output is validated to ensure a non-trivial file was produced.
-5. On Android the result is exported to your chosen folder or the system media collection; the temporary file is removed.
-
-## Validation
-
 ```bash
-flutter analyze lib
-cargo check --manifest-path rust/Cargo.toml
-cargo check --manifest-path rust/Cargo.toml --bin m3u8_api_server
+docker build -f Dockerfile.api -t ferrisload-api .
+docker run --rm -p 3000:3000 -e DOWNLOAD_DIR=/app/downloads \
+  -v $(pwd)/downloads:/app/downloads ferrisload-api
 ```
 
-## Responsible use
+**API 安全（默认开启）**：
 
-FerrisLoad is intended for content you own or are authorized to download. It does not circumvent access controls, DRM, paywalls, rate limits, or anti-bot challenges. Respect each site's terms of service and applicable law.
+- **SSRF 防护**：API 是网络暴露面，默认拒绝会解析到内网/回环/链路本地地址的目标（云元数据端点、Docker 内网、宿主机 loopback 都挡在门外）。确有需要（如从 NAS 下载）时设 `FERRISLOAD_ALLOW_PRIVATE_NETWORKS=1`。
+- **可选 Bearer 鉴权**：设 `FERRISLOAD_API_TOKEN=xxx` 后，除 `GET /health` 外的所有端点都要求 `Authorization: Bearer xxx`，防止公开端口被当成开放下载代理。Web 端在设置里填入同样的令牌即可。
+- 非 root 运行、HEALTHCHECK、TLS 校验、路径穿越消毒、请求体上限等保持不变。
+
+CI（GitHub Actions）会构建并推送 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 三架构镜像到 GHCR。
+
+## 安全与隐私
+
+- 只允许 `http/https` 目标，网络层与解析层都有 scheme 白名单（防 SSRF / 本地文件读取）。
+- 自定义请求头做了 CR/LF 注入校验；Cookie 等凭据只在内存里，不落盘。
+- HLS 密钥、DASH 片段 URL 同样强制 `http/https`。
+- TLS 校验默认全开；内置客户端对某些 P-384 证书链兼容性差时自动切换到 rustls 后备。
+- 输出文件名做了路径穿越消毒。
+- Web 端把会话凭据转给 API 服务时，非本机地址强制 HTTPS（`ApiDownloadEngine` 传输安全校验）。
+- CI 每天/每次提交跑安全扫描：`cargo audit`（Rust 漏洞）、`flutter pub outdated`（Dart 依赖）、Trivy（容器漏洞 + 密钥 + 配置错误）。
+- 请只下载你拥有或已获授权的资源。
+
+## 验证
+
+```bash
+flutter analyze
+flutter test
+cargo test --manifest-path rust/Cargo.toml
+cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked -- -D warnings
+```
+
+CI 还会额外构建 Web（JS + WASM）与 iOS（arm64，未签名），并对 Rust/Dart/容器依赖做安全扫描。
 
 ## License
 
-See the repository for license details.
+见 [LICENSE](LICENSE)。

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
+import 'package:m3u8_downloader/src/app/app_theme.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
 import 'package:m3u8_downloader/src/home/source_input.dart';
 
@@ -65,8 +66,10 @@ class HomeInputCard extends StatelessWidget {
                 maxLines: 2,
                 keyboardType: TextInputType.url,
                 textInputAction: TextInputAction.done,
-                autocorrect: false,
-                enableSuggestions: false,
+                // Do NOT disable autocorrect/suggestions here: on many Android
+                // IMEs (Gboard / Chinese keyboards) those flags switch the
+                // field into a "privacy keyboard" mode that hides the normal
+                // candidate bar and is unpleasant to type URLs in.
                 decoration: InputDecoration(
                   labelText: l.text('input_source'),
                   hintText: l.text('source_hint'),
@@ -113,6 +116,10 @@ class HomeInputCard extends StatelessWidget {
             TextFormField(
               controller: fileNameController,
               enabled: !analyzing,
+              keyboardType: TextInputType.text,
+              textInputAction: TextInputAction.done,
+              // Same as the URL field: no autocorrect/suggestions flags so the
+              // normal keyboard (not the IME "privacy keyboard") is shown.
               decoration: InputDecoration(
                 labelText: l.text('file_name'),
                 prefixIcon: const Icon(Icons.video_file_outlined),
@@ -126,7 +133,7 @@ class HomeInputCard extends StatelessWidget {
             ),
             const SizedBox(height: 14),
             InkWell(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: FerrisShapes.of(context).md,
               onTap: analyzing ? null : onPickDir,
               child: Ink(
                 padding: const EdgeInsets.symmetric(
@@ -134,7 +141,7 @@ class HomeInputCard extends StatelessWidget {
                   vertical: 14,
                 ),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: FerrisShapes.of(context).md,
                   color: cs.surfaceContainerHigh,
                   border: Border.all(color: cs.outlineVariant),
                 ),
@@ -252,7 +259,7 @@ class HomeInputCard extends StatelessWidget {
               curve: FerrisMotion.emphasized,
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: FerrisShapes.of(context).md,
                 color: cs.surfaceContainer,
                 border: Border.all(
                   color: cs.outlineVariant.withValues(alpha: 0.6),

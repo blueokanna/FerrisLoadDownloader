@@ -74,6 +74,170 @@ impl AccelType {
 enum TranscoderKind {
     Ffmpeg(AccelType),
     AndroidHardware,
+    /// Native iOS AVFoundation / VideoToolbox hardware H.264 pipeline.
+    /// AVAssetWriter selects the hardware encoder automatically on every
+    /// Apple device (A-series and M-series chips); there is no software
+    /// H.264 encoder on iOS, so this is the only correct backend there.
+    IosVideoToolbox,
+}
+
+/// FFI into the native iOS transcoder (`ios/Runner/VideoToolboxBridge.m`).
+///
+/// The symbols are provided by the Runner app target, which links the Rust
+/// static library; they only exist on iOS, hence the `cfg` gate.
+#[cfg(target_os = "ios")]
+extern "C" {
+    fn ferrisload_videotoolbox_available() -> i32;
+    fn ferrisload_videotoolbox_transcode(
+        input: *const std::os::raw::c_char,
+        output: *const std::os::raw::c_char,
+        video_bitrate: i32,
+        audio_bitrate: i32,
+        expected_ms: i64,
+        errbuf: *mut std::os::raw::c_char,
+        errbuf_len: usize,
+    ) -> i32;
+    fn ferrisload_videotoolbox_mux(
+        video: *const std::os::raw::c_char,
+        audio: *const std::os::raw::c_char,
+        output: *const std::os::raw::c_char,
+        expected_ms: i64,
+        errbuf: *mut std::os::raw::c_char,
+        errbuf_len: usize,
+    ) -> i32;
+}
+
+/// Thin Rust wrappers around the iOS VideoToolbox FFI. They mirror the
+/// Android JNI helpers: bound the operation with a wall-clock timeout on the
+/// Rust side (defense in depth — the Objective-C side also has internal
+/// bounded waits) and surface the native error string.
+#[cfg(target_os = "ios")]
+mod ios_videotoolbox {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::c_char;
+    use std::time::Duration;
+
+    use anyhow::{anyhow, Context, Result};
+
+    const ERROR_BUF_LEN: usize = 512;
+
+    pub fn available() -> bool {
+        // SAFETY: no arguments; a plain boolean probe into a fixed symbol.
+        unsafe { ferrisload_videotoolbox_available() != 0 }
+    }
+
+    fn take_error(errbuf: &[c_char]) -> String {
+        // SAFETY: errbuf is always NUL-terminated by the C side on failure.
+        unsafe { CStr::from_ptr(errbuf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn transcode(
+        input: &str,
+        output: &str,
+        video_bitrate: u32,
+        audio_bitrate: u32,
+        expected_duration: Option<f64>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let input_c = CString::new(input).context("iOS input path contains NUL")?;
+        let output_c = CString::new(output).context("iOS output path contains NUL")?;
+        let expected_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
+        let (tx, rx) = std::sync::mpsc::channel::<Result<()>>();
+        std::thread::Builder::new()
+            .name("ferrisload-ios-videotoolbox".into())
+            .spawn(move || {
+                let result = (|| {
+                    let mut errbuf = [0 as c_char; ERROR_BUF_LEN];
+                    // SAFETY: all pointers are valid for the call; errbuf is a
+                    // writable buffer of the declared length.
+                    let ok = unsafe {
+                        ferrisload_videotoolbox_transcode(
+                            input_c.as_ptr(),
+                            output_c.as_ptr(),
+                            video_bitrate as i32,
+                            audio_bitrate as i32,
+                            expected_ms,
+                            errbuf.as_mut_ptr(),
+                            errbuf.len(),
+                        )
+                    };
+                    if ok != 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "iOS VideoToolbox transcode failed: {}",
+                            take_error(&errbuf)
+                        ))
+                    }
+                })();
+                let _ = tx.send(result);
+            })
+            .context("Failed to spawn iOS transcoder thread")?;
+        rx.recv_timeout(timeout).map_err(|_| {
+            anyhow!(
+                "iOS VideoToolbox transcode timed out after {}s",
+                timeout.as_secs()
+            )
+        })?
+    }
+
+    pub fn mux(
+        video: &str,
+        audio: &str,
+        output: &str,
+        expected_duration: Option<f64>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let video_c = CString::new(video).context("iOS video path contains NUL")?;
+        let audio_c = CString::new(audio).context("iOS audio path contains NUL")?;
+        let output_c = CString::new(output).context("iOS output path contains NUL")?;
+        let expected_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
+        let (tx, rx) = std::sync::mpsc::channel::<Result<()>>();
+        std::thread::Builder::new()
+            .name("ferrisload-ios-videotoolbox-mux".into())
+            .spawn(move || {
+                let result = (|| {
+                    let mut errbuf = [0 as c_char; ERROR_BUF_LEN];
+                    // SAFETY: see `transcode`.
+                    let ok = unsafe {
+                        ferrisload_videotoolbox_mux(
+                            video_c.as_ptr(),
+                            audio_c.as_ptr(),
+                            output_c.as_ptr(),
+                            expected_ms,
+                            errbuf.as_mut_ptr(),
+                            errbuf.len(),
+                        )
+                    };
+                    if ok != 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "iOS VideoToolbox mux failed: {}",
+                            take_error(&errbuf)
+                        ))
+                    }
+                })();
+                let _ = tx.send(result);
+            })
+            .context("Failed to spawn iOS mux thread")?;
+        rx.recv_timeout(timeout).map_err(|_| {
+            anyhow!(
+                "iOS VideoToolbox mux timed out after {}s",
+                timeout.as_secs()
+            )
+        })?
+    }
+}
+
+/// Wall-clock cap for a single iOS VideoToolbox operation, derived from the
+/// expected media duration (same philosophy as the Android JNI guard).
+#[cfg(target_os = "ios")]
+fn ios_videotoolbox_timeout(expected_duration: Option<f64>) -> Duration {
+    let estimated = expected_duration.unwrap_or(0.0) * 4.0 + 300.0;
+    Duration::from_secs_f64(estimated.clamp(1800.0, 4.0 * 3600.0))
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +305,79 @@ fn command_with_timeout(
             None
         }
     }
+}
+
+/// A fake non-zero exit status used to signal "timed out" to callers that
+/// only inspect `output.status.success()`.
+const FFMPEG_TIMEOUT_EXIT: i32 = 124;
+
+/// Cached synthetic non-successful `ExitStatus`. `ExitStatus::from_raw` is
+/// unstable, so we obtain a genuine non-zero status by running one
+/// guaranteed-to-fail child the first time a timeout occurs, then reuse it.
+fn failed_exit_status() -> std::process::ExitStatus {
+    static FAILED: std::sync::OnceLock<std::process::ExitStatus> = std::sync::OnceLock::new();
+    *FAILED.get_or_init(|| {
+        std::process::Command::new("ferrisload-ffmpeg-timeout-sentinel")
+            .status()
+            .ok()
+            .filter(|status| !status.success())
+            .unwrap_or_else(|| {
+                // Extremely unlikely fallback: a command that always fails.
+                let mut child = std::process::Command::new("cmd")
+                    .arg("/c")
+                    .arg("exit 1")
+                    .spawn()
+                    .expect("failed to spawn timeout status probe");
+                child
+                    .wait()
+                    .expect("failed to wait for timeout status probe")
+            })
+    })
+}
+
+/// Run `ffmpeg`/`ffprobe` with a wall-clock timeout so a hung hardware
+/// encoder or a wedged driver can never stall a download forever.
+///
+/// On timeout the process is killed and a synthetic `Output` with a
+/// non-zero status (and a descriptive `stderr`) is returned, so callers
+/// that check `status.success()` treat it exactly like a failed run —
+/// including falling back to the CPU encoder.
+fn run_ffmpeg(
+    ffmpeg_path: &Path,
+    args: &[String],
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut command = Command::new(ffmpeg_path);
+    command.args(args);
+    match command_with_timeout(&mut command, timeout) {
+        Some(result) => result.context("FFmpeg process failed"),
+        None => Ok(std::process::Output {
+            status: failed_exit_status(),
+            stdout: Vec::new(),
+            stderr: format!(
+                "FFmpeg timed out after {} seconds (encoder may be hung)",
+                timeout.as_secs()
+            )
+            .into_bytes(),
+        }),
+    }
+}
+
+/// Derive a sane conversion/merge timeout from the input media duration.
+///
+/// - Hardware-accelerated encode is typically faster than realtime, so a
+///   hung GPU encoder is aborted after a short cap (15 minutes).
+/// - CPU (software) encode can legitimately take many times the source
+///   length, so it gets a generous cap (6 hours) with a 30 minute floor.
+///   Unknown durations fall back to those floors.
+fn ffmpeg_transcode_timeout(input_duration: Option<f64>, hardware: bool) -> Duration {
+    let estimated = input_duration.unwrap_or(0.0) * 3.0 + 60.0;
+    let seconds = if hardware {
+        estimated.clamp(120.0, 15.0 * 60.0)
+    } else {
+        estimated.clamp(1800.0, 6.0 * 3600.0)
+    };
+    Duration::from_secs_f64(seconds)
 }
 
 fn external_command_works(spec: &ExternalCommandSpec) -> bool {
@@ -412,6 +649,7 @@ fn provision_ytdlp_command(reporter: &ProgressReporter) -> Result<ExternalComman
 pub struct ProgressUpdate {
     pub message: String,
     pub progress: f64,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -480,6 +718,19 @@ pub(crate) fn emit_progress(
     reporter(ProgressUpdate {
         message: message.into(),
         progress,
+        error: None,
+    });
+}
+
+/// Report a terminal failure through the progress stream.
+///
+/// Must be called while the `StreamSink` backing `reporter` is still alive;
+/// the Dart side treats a non-empty `error` as the task ending in failure.
+pub(crate) fn emit_terminal_error(reporter: &ProgressReporter, error: &anyhow::Error) {
+    reporter(ProgressUpdate {
+        message: String::new(),
+        progress: 0.0,
+        error: Some(format!("{error:#}")),
     });
 }
 
@@ -515,7 +766,7 @@ impl AndroidMediaCodecTranscoder {
         Self { jvm }
     }
 
-    fn with_media_transcoder<T, F>(&self, operation: F) -> Result<T>
+    fn with_media_transcoder<T, F>(&self, timeout: Duration, operation: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut JNIEnv, JClass) -> Result<T> + Send + 'static,
@@ -541,8 +792,25 @@ impl AndroidMediaCodecTranscoder {
                 let _ = tx.send(result);
             })
             .map_err(|e| anyhow!("JNI thread spawn failed: {}", e))?;
-        rx.recv()
-            .map_err(|_| anyhow!("JNI worker thread terminated unexpectedly"))?
+        // A wedged MediaCodec/MediaMuxer native call must never hang the
+        // download forever: bound the whole JNI operation with a hard cap.
+        // (Kotlin already has its own per-step stall detection; this is the
+        // last-resort guard on the Rust side.)
+        rx.recv_timeout(timeout).map_err(|_| {
+            anyhow!(
+                "Android media transcoder timed out after {}s",
+                timeout.as_secs()
+            )
+        })?
+    }
+
+    /// Derive a hard wall-clock cap for a single JNI media operation from the
+    /// expected media duration (falling back to a 30-minute floor). Android
+    /// hardware transcode is typically faster than realtime, so this is a
+    /// generous ceiling that only fires when the pipeline is genuinely stuck.
+    fn jni_operation_timeout(expected_duration: Option<f64>) -> Duration {
+        let estimated = expected_duration.unwrap_or(0.0) * 4.0 + 300.0;
+        Duration::from_secs_f64(estimated.clamp(1800.0, 4.0 * 3600.0))
     }
 
     pub fn transcode(
@@ -561,8 +829,9 @@ impl AndroidMediaCodecTranscoder {
         let input_ts = input_ts.to_string();
         let output_mp4 = output_mp4.to_string();
         let expected_duration_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
+        let timeout = Self::jni_operation_timeout(expected_duration);
 
-        self.with_media_transcoder(move |env, class| {
+        self.with_media_transcoder(timeout, move |env, class| {
             let input_ts_jstring = jni_string!(env, &input_ts, "input_ts");
             let output_mp4_jstring = jni_string!(env, &output_mp4, "output_mp4");
 
@@ -604,8 +873,9 @@ impl AndroidMediaCodecTranscoder {
         let audio_path = audio_path.to_string();
         let output_mp4 = output_mp4.to_string();
         let expected_duration_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
+        let timeout = Self::jni_operation_timeout(expected_duration);
 
-        self.with_media_transcoder(move |env, class| {
+        self.with_media_transcoder(timeout, move |env, class| {
             let video_jstring = jni_string!(env, &video_path, "video_path");
             let audio_jstring = jni_string!(env, &audio_path, "audio_path");
             let output_jstring = jni_string!(env, &output_mp4, "output_mp4");
@@ -632,6 +902,133 @@ impl AndroidMediaCodecTranscoder {
                 Ok(())
             } else {
                 Err(anyhow!("Java MediaMuxer merge failed"))
+            }
+        })
+    }
+
+    /// Segment-based transcode: feed every `{prefix}_{i:05}.part` file in
+    /// `segment_dir` into a single decode→encode→mux pipeline with a
+    /// continuous, re-based PTS timeline (the equivalent of feeding ffmpeg's
+    /// concat demuxer). This is the root-cause fix for HLS streams whose
+    /// naively concatenated TS resets PTS at every segment boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transcode_segments(
+        &self,
+        segment_dir: &str,
+        prefix: &str,
+        total_segments: usize,
+        output_mp4: &str,
+        video_bitrate: u32,
+        audio_bitrate: u32,
+        expected_duration: Option<f64>,
+    ) -> Result<()> {
+        if audio_bitrate > 0 {
+            bail!(
+                "Android MediaCodec does not currently support audio bitrate conversion; use 0 to preserve AAC audio"
+            );
+        }
+        let segment_dir = segment_dir.to_string();
+        let prefix = prefix.to_string();
+        let total_segments = u32::try_from(total_segments)
+            .map_err(|_| anyhow!("too many HLS segments for the Android transcoder"))?;
+        let output_mp4 = output_mp4.to_string();
+        let expected_duration_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
+        let timeout = Self::jni_operation_timeout(expected_duration);
+
+        self.with_media_transcoder(timeout, move |env, class| {
+            let dir_jstring = jni_string!(env, &segment_dir, "segment_dir");
+            let prefix_jstring = jni_string!(env, &prefix, "prefix");
+            let output_jstring = jni_string!(env, &output_mp4, "output_mp4");
+
+            let result = env
+                .call_static_method(
+                    class,
+                    "transcodeDir",
+                    "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;IIJ)Z",
+                    &[
+                        JValue::Object(&dir_jstring),
+                        JValue::Object(&prefix_jstring),
+                        JValue::Int(total_segments as i32),
+                        JValue::Object(&output_jstring),
+                        JValue::Int(video_bitrate as i32),
+                        JValue::Int(audio_bitrate as i32),
+                        JValue::Long(expected_duration_ms),
+                    ],
+                )
+                .map_err(|e| anyhow!("JNI call_static_method transcodeDir failed: {}", e))?;
+
+            let success = result
+                .z()
+                .map_err(|e| anyhow!("JNI get boolean return failed: {}", e))?;
+
+            if success {
+                Ok(())
+            } else {
+                Err(anyhow!("Java MediaCodec segment transcode failed"))
+            }
+        })
+    }
+
+    /// Segment-based mux of a video stream and a separate audio stream (HLS
+    /// audio renditions). Each segment is read by its own extractor and the
+    /// PTS timeline is re-based continuously across segments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mux_segments(
+        &self,
+        video_dir: &str,
+        video_prefix: &str,
+        video_total: usize,
+        audio_dir: &str,
+        audio_prefix: &str,
+        audio_total: usize,
+        output_mp4: &str,
+        expected_duration: Option<f64>,
+    ) -> Result<()> {
+        let video_dir = video_dir.to_string();
+        let video_prefix = video_prefix.to_string();
+        let video_total = u32::try_from(video_total)
+            .map_err(|_| anyhow!("too many HLS video segments for the Android transcoder"))?;
+        let audio_dir = audio_dir.to_string();
+        let audio_prefix = audio_prefix.to_string();
+        let audio_total = u32::try_from(audio_total)
+            .map_err(|_| anyhow!("too many HLS audio segments for the Android transcoder"))?;
+        let output_mp4 = output_mp4.to_string();
+        let expected_duration_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
+        let timeout = Self::jni_operation_timeout(expected_duration);
+
+        self.with_media_transcoder(timeout, move |env, class| {
+            let video_dir_jstring = jni_string!(env, &video_dir, "video_dir");
+            let video_prefix_jstring = jni_string!(env, &video_prefix, "video_prefix");
+            let audio_dir_jstring = jni_string!(env, &audio_dir, "audio_dir");
+            let audio_prefix_jstring = jni_string!(env, &audio_prefix, "audio_prefix");
+            let output_jstring = jni_string!(env, &output_mp4, "output_mp4");
+
+            let result = env
+                .call_static_method(
+                    class,
+                    "muxDirs",
+                    "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;ILjava/lang/String;J)Z",
+                    &[
+                        JValue::Object(&video_dir_jstring),
+                        JValue::Object(&video_prefix_jstring),
+                        JValue::Int(video_total as i32),
+                        JValue::Object(&audio_dir_jstring),
+                        JValue::Object(&audio_prefix_jstring),
+                        JValue::Int(audio_total as i32),
+                        JValue::Object(&output_jstring),
+                        JValue::Long(expected_duration_ms),
+                    ],
+                )
+                .map_err(|e| anyhow!("JNI call_static_method muxDirs failed: {}", e))?;
+
+            let success = result
+                .z()
+                .map_err(|e| anyhow!("JNI get boolean return failed: {}", e))?;
+
+            if success {
+                Ok(())
+            } else {
+                Err(anyhow!("Java MediaMuxer segment mux failed"))
             }
         })
     }
@@ -940,10 +1337,11 @@ pub async fn hls2mp4_run(
     keep_temp: bool,
 ) -> Result<()> {
     let reporter = sink_progress_reporter(sink);
-    flutter_rust_bridge::spawn_blocking_with(
+    let worker = reporter.clone();
+    let outcome = flutter_rust_bridge::spawn_blocking_with(
         move || {
             hls2mp4_core(
-                reporter,
+                worker,
                 url,
                 concurrency,
                 output,
@@ -956,7 +1354,28 @@ pub async fn hls2mp4_run(
         (),
     )
     .await
-    .map_err(|e| anyhow!("hls2mp4 background task failed: {e}"))?
+    .map_err(|e| anyhow!("hls2mp4 background task failed: {e}"));
+    deliver_pipeline_outcome(&reporter, outcome)
+}
+
+/// Collapse the FRB task outcome into the stream: forward any pipeline error
+/// as a terminal event so the Dart side can display the real reason, then
+/// always succeed (the stream itself carries the outcome).
+fn deliver_pipeline_outcome(
+    reporter: &ProgressReporter,
+    outcome: Result<Result<()>>,
+) -> Result<()> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            emit_terminal_error(reporter, &error);
+            Ok(())
+        }
+        Err(error) => {
+            emit_terminal_error(reporter, &error);
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1251,13 +1670,17 @@ fn augment_youtube_candidates_with_ytdlp(
     if !request_context.referer.trim().is_empty() {
         command.args(["--referer", request_context.referer.trim()]);
     }
-    if !request_context.origin.trim().is_empty() {
+    if !request_context.origin.trim().is_empty()
+        && is_safe_ytdlp_header_value(request_context.origin.trim())
+    {
         command.args([
             "--add-header",
             &format!("Origin:{}", request_context.origin.trim()),
         ]);
     }
-    if !request_context.cookie.trim().is_empty() {
+    if !request_context.cookie.trim().is_empty()
+        && is_safe_ytdlp_header_value(request_context.cookie.trim())
+    {
         command.args([
             "--add-header",
             &format!("Cookie:{}", request_context.cookie.trim()),
@@ -1266,7 +1689,11 @@ fn augment_youtube_candidates_with_ytdlp(
     for header in &request_context.headers {
         let name = header.name.trim();
         let value = header.value.trim();
-        if !name.is_empty() && !value.is_empty() && is_safe_ytdlp_header_name(name) {
+        if !name.is_empty()
+            && !value.is_empty()
+            && is_safe_ytdlp_header_name(name)
+            && is_safe_ytdlp_header_value(value)
+        {
             command.args(["--add-header", &format!("{}:{}", name, value)]);
         }
     }
@@ -1445,6 +1872,13 @@ fn is_safe_ytdlp_header_name(name: &str) -> bool {
         && name.chars().all(|character| character.is_ascii_graphic())
 }
 
+/// Rejects header values that could smuggle extra headers into yt-dlp's
+/// `--add-header` value (CR/LF/control bytes). Spaces and non-ASCII are
+/// legal per RFC 7230 and preserved.
+fn is_safe_ytdlp_header_value(value: &str) -> bool {
+    value.bytes().all(is_valid_header_value_byte)
+}
+
 fn find_ytdlp_output(temp_dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(temp_dir)
         .ok()?
@@ -1541,13 +1975,17 @@ fn run_ytdlp_site_pipeline(
     if !request_context.referer.trim().is_empty() {
         command.args(["--referer", request_context.referer.trim()]);
     }
-    if !request_context.origin.trim().is_empty() {
+    if !request_context.origin.trim().is_empty()
+        && is_safe_ytdlp_header_value(request_context.origin.trim())
+    {
         command.args([
             "--add-headers",
             &format!("Origin:{}", request_context.origin.trim()),
         ]);
     }
-    if !request_context.cookie.trim().is_empty() {
+    if !request_context.cookie.trim().is_empty()
+        && is_safe_ytdlp_header_value(request_context.cookie.trim())
+    {
         command.args([
             "--add-headers",
             &format!("Cookie:{}", request_context.cookie.trim()),
@@ -1556,7 +1994,11 @@ fn run_ytdlp_site_pipeline(
     for entry in &request_context.headers {
         let name = entry.name.trim();
         let value = entry.value.trim();
-        if !name.is_empty() && !value.is_empty() && is_safe_ytdlp_header_name(name) {
+        if !name.is_empty()
+            && !value.is_empty()
+            && is_safe_ytdlp_header_name(name)
+            && is_safe_ytdlp_header_value(value)
+        {
             command.args(["--add-headers", &format!("{}:{}", name, value)]);
         }
     }
@@ -1589,10 +2031,38 @@ fn run_ytdlp_site_pipeline(
 
     let lines = BufReader::new(stdout).lines();
     let mut reported_output = None;
-    for line in lines {
-        let line = line.context("Failed to read yt-dlp stdout")?;
+    // Throttle yt-dlp progress events (yt-dlp emits multiple lines per
+    // second) so the UI only sees ~1% steps instead of a flood of messages.
+    let mut last_reported_coarse = i64::MIN;
+    // A wedged yt-dlp (stalled network / hung extractor) must not stall the
+    // download forever: read stdout on a worker thread and abort when the
+    // main loop hears nothing for a long time.
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    std::thread::Builder::new()
+        .name("ytdlp-stdout".into())
+        .spawn(move || {
+            for line in lines {
+                if stdout_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("Failed to spawn yt-dlp stdout reader")?;
+    loop {
+        let line = match stdout_rx.recv_timeout(Duration::from_secs(300)) {
+            Ok(line) => line.context("Failed to read yt-dlp stdout")?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                bail!("yt-dlp stalled for 5 minutes without progress; aborting");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if let Some((message, progress)) = parse_ytdlp_progress(line.trim()) {
-            emit_progress(&reporter, message, progress);
+            let coarse = (progress * 100.0) as i64;
+            if coarse - last_reported_coarse >= 1 || progress >= 0.999 {
+                last_reported_coarse = coarse;
+                emit_progress(&reporter, message, progress);
+            }
         } else if let Some(path) = line.trim().strip_prefix("FERRISLOAD_OUTPUT:") {
             reported_output = Some(PathBuf::from(path.trim()));
         }
@@ -1663,10 +2133,11 @@ pub async fn download_media_run(
     keep_temp: bool,
 ) -> Result<()> {
     let reporter = sink_progress_reporter(sink);
-    flutter_rust_bridge::spawn_blocking_with(
+    let worker = reporter.clone();
+    let outcome = flutter_rust_bridge::spawn_blocking_with(
         move || {
             download_media_with_context_core(
-                reporter,
+                worker,
                 page_url,
                 media_url,
                 audio_url,
@@ -1682,7 +2153,8 @@ pub async fn download_media_run(
         (),
     )
     .await
-    .map_err(|e| anyhow!("download background task failed: {e}"))?
+    .map_err(|e| anyhow!("download background task failed: {e}"));
+    deliver_pipeline_outcome(&reporter, outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1701,10 +2173,11 @@ pub async fn download_media_with_context(
     request_context: RequestContext,
 ) -> Result<()> {
     let reporter = sink_progress_reporter(sink);
-    flutter_rust_bridge::spawn_blocking_with(
+    let worker = reporter.clone();
+    let outcome = flutter_rust_bridge::spawn_blocking_with(
         move || {
             download_media_with_context_core(
-                reporter,
+                worker,
                 page_url,
                 media_url,
                 audio_url,
@@ -1720,7 +2193,8 @@ pub async fn download_media_with_context(
         (),
     )
     .await
-    .map_err(|e| anyhow!("download background task failed: {e}"))?
+    .map_err(|e| anyhow!("download background task failed: {e}"));
+    deliver_pipeline_outcome(&reporter, outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1925,6 +2399,8 @@ pub(crate) fn download_media_with_context_core(
             merge_media_streams(
                 &video_temp,
                 &audio_temp,
+                None,
+                None,
                 &output,
                 video_bitrate.max(0) as u32,
                 audio_bitrate.max(0) as u32,
@@ -2035,6 +2511,8 @@ fn run_dash_pipeline(
             merge_media_streams(
                 &video_temp,
                 &audio_temp,
+                None,
+                None,
                 output,
                 video_bitrate.max(0) as u32,
                 audio_bitrate.max(0) as u32,
@@ -2072,6 +2550,11 @@ fn run_dash_pipeline(
 }
 
 #[allow(clippy::too_many_arguments)]
+// The `video_segments`/`audio_segments` plumbing is consumed only on Android
+// (the segment-based transcoder); on desktop these bindings are assigned and
+// passed as `None`, so the compiler's `unused_assignments`/`unused_mut` lints
+// would otherwise fire for the non-Android target.
+#[allow(unused_assignments, unused_mut)]
 pub(crate) fn run_hls_pipeline(
     reporter: &ProgressReporter,
     url: &str,
@@ -2086,6 +2569,18 @@ pub(crate) fn run_hls_pipeline(
     emit_progress(reporter, "Initializing...", 0.0);
 
     init_runtime_logging();
+
+    // The Android MediaMuxer/MediaCodec backends fail silently (or leave no
+    // file) when the output's parent directory does not exist — e.g. when the
+    // external files dir has not been materialised yet. Create it up-front so
+    // a missing directory can never cause a spurious "no output file".
+    if let Some(parent) = Path::new(output).parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create output directory: {}", parent.display())
+            })?;
+        }
+    }
 
     let concurrency = concurrency.max(1) as usize;
     let retries = retries.max(1) as u8;
@@ -2138,6 +2633,22 @@ pub(crate) fn run_hls_pipeline(
                 0.015,
             );
         }
+        TranscoderKind::IosVideoToolbox if requires_reencode => {
+            check_pb.finish_with_message("Selected iOS VideoToolbox hardware encoder");
+            emit_progress(
+                reporter,
+                "Selected hardware encoder: Apple VideoToolbox (A/M-series)",
+                0.015,
+            );
+        }
+        TranscoderKind::IosVideoToolbox => {
+            check_pb.finish_with_message("Selected iOS AVFoundation remux");
+            emit_progress(
+                reporter,
+                "Selected iOS AVFoundation (hardware H.264 if re-encoding)",
+                0.015,
+            );
+        }
     }
 
     info!("M3U8 URL: {}", url);
@@ -2184,6 +2695,11 @@ pub(crate) fn run_hls_pipeline(
     info!("Temporary primary stream: {}", temp_primary_str);
 
     let mut external_audio_plan: Option<(MediaPlaylist, Url, String)> = None;
+    // Per-stream segment metadata handed to the Android segment-based
+    // transcoder (see `SegmentInput`). Filled in below from the playlists;
+    // ignored on desktop where ffmpeg consumes the merged TS / concat list.
+    let mut video_segments: Option<SegmentInput> = None;
+    let mut audio_segments: Option<SegmentInput> = None;
     // Sum of the media playlist's EXTINF durations. Used after conversion to
     // detect silent truncation (e.g. only the first few seconds surviving),
     // which previously wasted all the download traffic on a broken output.
@@ -2220,6 +2736,7 @@ pub(crate) fn run_hls_pipeline(
             let Playlist::MediaPlaylist(media_playlist) = media_pl else {
                 bail!("Master playlist's referenced playlist is not a media playlist");
             };
+            let video_total = media_playlist.segments.len();
             expected_duration = Some(
                 media_playlist
                     .segments
@@ -2276,13 +2793,20 @@ pub(crate) fn run_hls_pipeline(
                 retries,
                 &temp_primary_str,
                 &temp_dir,
+                "v",
                 &multi_progress,
                 video_reporter,
                 request_context.clone(),
             )?;
+            video_segments = Some(SegmentInput {
+                dir: temp_dir.clone(),
+                prefix: "v".to_string(),
+                total: video_total,
+            });
         }
         Playlist::MediaPlaylist(mp) => {
             info!("Media Playlist found, {} segments", mp.segments.len());
+            let video_total = mp.segments.len();
             expected_duration = Some(
                 mp.segments
                     .iter()
@@ -2296,14 +2820,21 @@ pub(crate) fn run_hls_pipeline(
                 retries,
                 &temp_primary_str,
                 &temp_dir,
+                "v",
                 &multi_progress,
                 reporter.clone(),
                 request_context.clone(),
             )?;
+            video_segments = Some(SegmentInput {
+                dir: temp_dir.clone(),
+                prefix: "v".to_string(),
+                total: video_total,
+            });
         }
     }
 
     if let Some((audio_playlist, audio_base_url, rendition_name)) = external_audio_plan {
+        let audio_total = audio_playlist.segments.len();
         emit_progress(
             reporter,
             format!("Downloading HLS audio rendition: {}", rendition_name),
@@ -2316,13 +2847,21 @@ pub(crate) fn run_hls_pipeline(
             retries,
             &temp_audio_str,
             &temp_dir,
+            "a",
             &multi_progress,
             staged_progress_reporter(reporter.clone(), "Audio", 0.48, 0.92),
             request_context.clone(),
         )?;
+        audio_segments = Some(SegmentInput {
+            dir: temp_dir.clone(),
+            prefix: "a".to_string(),
+            total: audio_total,
+        });
         merge_media_streams(
             &temp_primary,
             &temp_audio,
+            video_segments,
+            audio_segments,
             output,
             video_bitrate,
             audio_bitrate,
@@ -2332,6 +2871,7 @@ pub(crate) fn run_hls_pipeline(
     } else {
         convert_to_mp4(
             &temp_primary_str,
+            video_segments,
             output,
             video_bitrate,
             audio_bitrate,
@@ -2406,9 +2946,19 @@ fn staged_progress_reporter(
 ) -> ProgressReporter {
     let span = (end - start).max(0.0);
     Arc::new(move |update| {
+        // Forward terminal error events verbatim (do not stage their progress).
+        let (message, progress) = if update.error.is_some() {
+            (update.message, update.progress)
+        } else {
+            (
+                format!("{}: {}", stage, update.message),
+                start + update.progress.clamp(0.0, 1.0) * span,
+            )
+        };
         parent(ProgressUpdate {
-            message: format!("{}: {}", stage, update.message),
-            progress: start + update.progress.clamp(0.0, 1.0) * span,
+            message,
+            progress,
+            error: update.error,
         });
     })
 }
@@ -2746,6 +3296,7 @@ fn transcode_input_to_output(
 ) -> Result<()> {
     convert_to_mp4(
         input_path.to_string_lossy().as_ref(),
+        None,
         output,
         video_bitrate,
         audio_bitrate,
@@ -2800,26 +3351,27 @@ fn ensure_output_file_ready(path: &Path) -> Result<()> {
     } else {
         PathBuf::from("ffprobe")
     };
-    let ffprobe_available = Command::new(&ffprobe)
-        .arg("-version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
+    let ffprobe_available =
+        run_ffmpeg(&ffprobe, &["-version".to_string()], Duration::from_secs(20))
+            .map(|output| output.status.success())
+            .unwrap_or(false);
     if ffprobe_available {
-        let probe = Command::new(&ffprobe)
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=codec_type",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-            ])
-            .arg(path)
-            .output()
-            .context("Failed to run ffprobe media validation")?;
+        let probe = run_ffmpeg(
+            &ffprobe,
+            &[
+                "-v".to_string(),
+                "error".to_string(),
+                "-select_streams".to_string(),
+                "v:0".to_string(),
+                "-show_entries".to_string(),
+                "stream=codec_type".to_string(),
+                "-of".to_string(),
+                "default=noprint_wrappers=1:nokey=1".to_string(),
+                path.to_string_lossy().to_string(),
+            ],
+            Duration::from_secs(20),
+        )
+        .context("Failed to run ffprobe media validation")?;
         let stream_type = String::from_utf8_lossy(&probe.stdout);
         if !probe.status.success() || !stream_type.lines().any(|line| line.trim() == "video") {
             bail!(
@@ -3196,10 +3748,10 @@ fn join_manifest_url(
 mod tests {
     use super::{
         bilibili_playurl_api_url, canonical_site_context, checksum_for_release_asset,
-        has_mp4_signature, hls_response_bytes, normalize_source_url, parse_ytdlp_progress,
-        playlist_base_url, resolve_dash_download_plan_from_manifest, resolve_hls_byte_range,
-        select_best_hls_variant, select_hls_audio_rendition, should_auto_inspect_download_target,
-        youtube_itag_from_media_url, ByteRange, Playlist,
+        has_mp4_signature, hls_response_bytes, is_valid_header_value_byte, normalize_source_url,
+        parse_ytdlp_progress, playlist_base_url, resolve_dash_download_plan_from_manifest,
+        resolve_hls_byte_range, select_best_hls_variant, select_hls_audio_rendition,
+        should_auto_inspect_download_target, youtube_itag_from_media_url, ByteRange, Playlist,
     };
     use crate::hls::parse_playlist;
     use url::Url;
@@ -3272,6 +3824,26 @@ mod tests {
         assert!(
             youtube_itag_from_media_url("https://video.example/playback?itag=137%2B140").is_none()
         );
+    }
+
+    #[test]
+    fn accepts_space_and_obs_text_in_header_values_but_rejects_crlf() {
+        // A real-world User-Agent contains spaces and must validate.
+        assert!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                .bytes()
+                .all(is_valid_header_value_byte)
+        );
+        assert!("Mozilla/5.0 (中文设备) Chrome/120"
+            .bytes()
+            .all(is_valid_header_value_byte));
+        assert!(!b"\r".iter().copied().all(is_valid_header_value_byte));
+        assert!(!b"\n".iter().copied().all(is_valid_header_value_byte));
+        assert!(!b"\x00".iter().copied().all(is_valid_header_value_byte));
+        assert!(!b"\x7f".iter().copied().all(is_valid_header_value_byte));
+        assert!(!"text/html\r\nX-Evil: 1"
+            .bytes()
+            .all(is_valid_header_value_byte));
     }
 
     #[test]
@@ -3487,9 +4059,12 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *yt-dlp.exe\n";
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_media_streams(
     video_path: &Path,
     audio_path: &Path,
+    video_segments: Option<SegmentInput>,
+    audio_segments: Option<SegmentInput>,
     output_path: &str,
     video_bitrate: u32,
     audio_bitrate: u32,
@@ -3501,18 +4076,46 @@ fn merge_media_streams(
     #[cfg(target_os = "android")]
     {
         if let Some(transcoder) = ANDROID_HW_TRANSCODER.get() {
+            // Prefer the segment-based muxer (per-segment extractors with a
+            // continuous PTS timeline — concat-demuxer equivalent) and only
+            // fall back to the naively-concatenated TS files on failure.
+            let mux_with_fallback = |target: &str| -> Result<()> {
+                match (&video_segments, &audio_segments) {
+                    (Some(video), Some(audio)) => {
+                        match transcoder.mux_segments(
+                            video.dir.to_string_lossy().as_ref(),
+                            &video.prefix,
+                            video.total,
+                            audio.dir.to_string_lossy().as_ref(),
+                            &audio.prefix,
+                            audio.total,
+                            target,
+                            expected_duration,
+                        ) {
+                            Ok(()) => return Ok(()),
+                            Err(error) => warn!(
+                                "Android segment-based mux failed ({}); falling back to merged streams",
+                                error
+                            ),
+                        }
+                    }
+                    _ => {}
+                }
+                transcoder.mux(
+                    video_path.to_string_lossy().as_ref(),
+                    audio_path.to_string_lossy().as_ref(),
+                    target,
+                    expected_duration,
+                )
+            };
+
             if !requires_reencode {
                 emit_progress(
                     &reporter,
                     "Merging streams with Android MediaMuxer (no re-encoding)",
                     0.9,
                 );
-                match transcoder.mux(
-                    video_path.to_string_lossy().as_ref(),
-                    audio_path.to_string_lossy().as_ref(),
-                    output_path,
-                    expected_duration,
-                ) {
+                match mux_with_fallback(output_path) {
                     Ok(_) => return Ok(()),
                     Err(e) => warn!(
                         "Android MediaMuxer merge failed, falling back if possible: {}",
@@ -3529,12 +4132,7 @@ fn merge_media_streams(
                     "Preparing separate streams with Android MediaMuxer",
                     0.88,
                 );
-                let mux_result = transcoder.mux(
-                    video_path.to_string_lossy().as_ref(),
-                    audio_path.to_string_lossy().as_ref(),
-                    mux_input.to_string_lossy().as_ref(),
-                    expected_duration,
-                );
+                let mux_result = mux_with_fallback(mux_input.to_string_lossy().as_ref());
 
                 if let Err(error) = mux_result {
                     warn!(
@@ -3565,6 +4163,28 @@ fn merge_media_streams(
                 let _ = std::fs::remove_file(&mux_input);
             }
         }
+    }
+
+    // iOS has no FFmpeg and no software encoder: merge + (re-)encode with the
+    // native AVFoundation / VideoToolbox hardware pipeline. The muxer itself
+    // validates the output duration against the expected value.
+    #[cfg(target_os = "ios")]
+    {
+        emit_progress(
+            &reporter,
+            "Merging streams with Apple VideoToolbox hardware encoder",
+            0.92,
+        );
+        let timeout = ios_videotoolbox_timeout(expected_duration);
+        ios_videotoolbox::mux(
+            video_path.to_string_lossy().as_ref(),
+            audio_path.to_string_lossy().as_ref(),
+            output_path,
+            expected_duration,
+            timeout,
+        )?;
+        info!("iOS VideoToolbox mux complete: {}", output_path);
+        return Ok(());
     }
 
     let ffmpeg_path = resolve_ffmpeg_path()
@@ -3676,8 +4296,14 @@ fn run_ffmpeg_merge(
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
+        // Generate missing PTS and ignore DTS errors so independently-encoded
+        // HLS segments that were naively concatenated (PTS restarts at zero at
+        // every segment boundary) are re-stamped into a continuous timeline.
+        // `+genpts` alone only fills absent timestamps; `+igndts` additionally
+        // stops ffmpeg from dropping frames when the DTS goes backwards, which
+        // was a second root cause of "only the first few seconds survive".
         "-fflags".to_string(),
-        "+genpts".to_string(),
+        "+genpts+igndts".to_string(),
     ];
     if let Some(concat) = video_concat {
         args.extend([
@@ -3719,22 +4345,7 @@ fn run_ffmpeg_merge(
             "-c:a".to_string(),
             "aac".to_string(),
         ]);
-        match accel {
-            AccelType::Nvidia => args.extend([
-                "-preset".to_string(),
-                "p4".to_string(),
-                "-rc".to_string(),
-                "vbr".to_string(),
-            ]),
-            AccelType::Cpu => args.extend(["-preset".to_string(), "medium".to_string()]),
-            AccelType::LinuxVaapi => args.extend([
-                "-vaapi_device".to_string(),
-                "/dev/dri/renderD128".to_string(),
-                "-vf".to_string(),
-                "format=nv12,hwupload".to_string(),
-            ]),
-            AccelType::Amd | AccelType::IntelQuickSync | AccelType::AppleVideoToolbox => {}
-        }
+        push_accel_encode_args(&mut args, accel);
         if video_bitrate > 0 {
             args.push("-b:v".to_string());
             args.push(format!("{}k", video_bitrate));
@@ -3757,10 +4368,12 @@ fn run_ffmpeg_merge(
     ]);
     args.push(output_path.to_string());
 
-    Command::new(ffmpeg_path)
-        .args(&args)
-        .output()
-        .context("FFmpeg merge process failed")
+    // Bound the merge/encode run so a hung hardware encoder cannot stall
+    // the download indefinitely; derive the timeout from the input length.
+    let input_duration = probe_media_duration(video_path, ffmpeg_path);
+    let hardware = requires_reencode && accel != AccelType::Cpu;
+    let timeout = ffmpeg_transcode_timeout(input_duration, hardware);
+    run_ffmpeg(ffmpeg_path, &args, timeout)
 }
 
 fn detect_access_challenge(status: u16, body: &str) -> Option<String> {
@@ -3920,9 +4533,6 @@ fn create_http_client_for_context(
     _source_url: Option<&str>,
     _request_context: &RequestContext,
 ) -> Result<SyncHttpClient> {
-    // The client itself carries TLS roots and timeouts; the per-request
-    // headers (referer/origin/cookie/custom) are attached by
-    // `request_headers` at each call site.
     SyncHttpClient::with_timeouts(Duration::from_secs(10), Duration::from_secs(45))
 }
 
@@ -3975,8 +4585,6 @@ fn request_headers(
         if name.is_empty() || value.is_empty() {
             continue;
         }
-        // Validate the header name against HTTP token rules before
-        // forwarding, preventing header injection.
         if !name
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && byte != b':' && byte != b' ')
@@ -3984,11 +4592,7 @@ fn request_headers(
             bail!("Invalid HTTP header name in request context: {:?}", name);
         }
         // Validate the header value: CR/LF/control bytes would enable
-        // response-splitting / header injection.
-        if !value
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() || byte == b'\t')
-        {
+        if !value.bytes().all(is_valid_header_value_byte) {
             bail!(
                 "Invalid HTTP header value in request context (contains CR/LF/control bytes): {:?}",
                 value
@@ -4000,13 +4604,17 @@ fn request_headers(
     Ok(headers)
 }
 
-/// Reject header values containing CR/LF or other control bytes, which would
+/// RFC 7230 field-value byte rule: `VCHAR` (0x21-0x7E), `SP` (0x20),
+/// `HTAB` (0x09) and `obs-text` (0x80-0xFF) are legal in a header value.
+/// CR, LF, NUL and the remaining control bytes are rejected because they
 /// enable response-splitting / header injection when forwarded upstream.
+fn is_valid_header_value_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' ' | 0x21..=0x7E | 0x80..=0xFF)
+}
+
+/// Reject header values with control characters (like CR/LF) to prevent injection attacks, while allowing spaces, tabs, and non-ASCII text.
 fn validate_header_value(value: &str, header_name: &str) -> Result<()> {
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_graphic() || byte == b'\t')
-    {
+    if !value.bytes().all(is_valid_header_value_byte) {
         bail!("Invalid HTTP header value for {header_name:?} (contains CR/LF/control bytes)");
     }
     Ok(())
@@ -4087,6 +4695,13 @@ fn select_transcoder_backend() -> Result<TranscoderKind> {
         return Ok(TranscoderKind::AndroidHardware);
     }
 
+    // iOS has no embedded FFmpeg and no software H.264 encoder: the only
+    // backend is the native AVFoundation / VideoToolbox hardware pipeline.
+    #[cfg(target_os = "ios")]
+    if ios_videotoolbox::available() {
+        return Ok(TranscoderKind::IosVideoToolbox);
+    }
+
     if let Some(ffmpeg_path) = resolve_ffmpeg_path() {
         let accel = detect_acceleration(&ffmpeg_path)?;
         return Ok(TranscoderKind::Ffmpeg(accel));
@@ -4109,6 +4724,17 @@ fn select_transcoder_backend() -> Result<TranscoderKind> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Identifies a set of HLS segment files on disk that the Android
+/// segment-based transcoder consumes one-by-one (the equivalent of feeding
+/// ffmpeg's concat demuxer). On non-Android platforms this is ignored.
+#[derive(Clone, Debug)]
+struct SegmentInput {
+    dir: PathBuf,
+    prefix: String,
+    total: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn download_and_merge(
     playlist: MediaPlaylist,
     base_url: Option<Url>,
@@ -4116,6 +4742,7 @@ fn download_and_merge(
     retries: u8,
     output_file: &str,
     temp_dir: &Path,
+    segment_prefix: &str,
     multi_progress: &MultiProgress,
     reporter: ProgressReporter,
     request_context: RequestContext,
@@ -4128,6 +4755,7 @@ fn download_and_merge(
             retries,
             output_file,
             temp_dir,
+            segment_prefix,
             multi_progress,
             reporter.clone(),
             request_context.clone(),
@@ -4139,7 +4767,7 @@ fn download_and_merge(
                     concurrency,
                     error
                 );
-                cleanup_segment_temp_files(temp_dir, playlist.segments.len(), output_file);
+                cleanup_segment_temp_files(temp_dir, output_file);
                 emit_progress(
                     &reporter,
                     "Multi-thread download failed. Retrying in single-thread mode...",
@@ -4156,6 +4784,7 @@ fn download_and_merge(
         retries,
         output_file,
         temp_dir,
+        segment_prefix,
         multi_progress,
         reporter,
         request_context,
@@ -4241,16 +4870,16 @@ fn hls_response_bytes(status: u16, data: &[u8], byte_range: Option<(u64, u64)>) 
 fn download_hls_resource(
     client: &SyncHttpClient,
     request: &HlsResourceRequest,
+    headers: &[(String, String)],
     retries: u8,
 ) -> Result<Vec<u8>> {
     for attempt in 1..=retries {
-        let headers: Vec<(String, String)> = Vec::new();
         let result = match request.byte_range {
             Some((start, end)) => client
-                .get_range(&request.url, &headers, start, end)
+                .get_range(&request.url, headers, start, end)
                 .map(|(status, _, body)| (status, body)),
             None => client
-                .get(&request.url, &headers)
+                .get(&request.url, headers)
                 .map(|(status, _, body)| (status, body)),
         };
 
@@ -4312,6 +4941,7 @@ fn download_and_merge_once(
     retries: u8,
     output_file: &str,
     temp_dir: &Path,
+    segment_prefix: &str,
     multi_progress: &MultiProgress,
     reporter: ProgressReporter,
     request_context: RequestContext,
@@ -4327,6 +4957,12 @@ fn download_and_merge_once(
     if total == 0 {
         bail!("MediaPlaylist contains no segments");
     }
+
+    let segment_headers = match &base_url {
+        Some(base) => request_headers(base, &request_context)?,
+        None => Vec::new(),
+    };
+    let segment_headers_shared = Arc::new(segment_headers);
 
     let download_pb = multi_progress.add(ProgressBar::new(total as u64));
     download_pb.set_style(
@@ -4376,14 +5012,8 @@ fn download_and_merge_once(
         } else {
             Url::parse(key_uri)?
         };
-        // Enforce an http/https-only allow-list for key URIs too (a
-        // malicious playlist must not redirect the client to file://,
-        // ftp://, data:, etc.).
         if !matches!(key_url.scheme(), "http" | "https") {
-            bail!(
-                "Refusing non-HTTP(S) HLS key URL: {}",
-                key_url.scheme()
-            );
+            bail!("Refusing non-HTTP(S) HLS key URL: {}", key_url.scheme());
         }
         let key_url_string = key_url.to_string();
         let key_bytes = if let Some(cached) = key_cache.get(&key_url_string) {
@@ -4395,6 +5025,7 @@ fn download_and_merge_once(
                     url: key_url_string.clone(),
                     byte_range: None,
                 },
+                &segment_headers_shared,
                 retries,
             )?;
             if bytes.len() != 16 {
@@ -4427,10 +5058,6 @@ fn download_and_merge_once(
     }
 
     let resolve_url = |uri: &str| -> Result<String> {
-        // Resolve the segment/key URI against the playlist base, then
-        // enforce an http/https-only allow-list so a malicious playlist
-        // cannot redirect the client to file://, ftp://, data:, etc.
-        // (defense in depth against SSRF / local-file access).
         let resolved = if let Some(base) = &base_url {
             base.join(uri)?
         } else {
@@ -4495,14 +5122,10 @@ fn download_and_merge_once(
     let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let temp_dir = temp_dir.to_path_buf();
-
-    // Bounded-concurrency synchronous downloader. Segment work is
-    // dispatched to a fixed pool of worker threads; each worker pulls the
-    // next pending index from a shared atomic cursor, so no semaphore is
-    // needed and no work is duplicated.
     let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let worker_count = concurrency.min(total).max(1);
     let errors: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+    let last_reported_pct = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let client_shared = client.clone();
     let completed_shared = completed.clone();
     let pb_shared = download_pb.clone();
@@ -4510,6 +5133,8 @@ fn download_and_merge_once(
     let temp_dir_shared = temp_dir.clone();
     let next_shared = next_index.clone();
     let errors_shared = errors.clone();
+    let last_reported_shared = last_reported_pct.clone();
+    let segment_headers_shared = segment_headers_shared.clone();
     let segment_requests_shared = segment_requests;
     let init_requests_shared = init_requests;
     let segment_crypto_shared = segment_crypto;
@@ -4523,6 +5148,8 @@ fn download_and_merge_once(
             let pb = pb_shared.clone();
             let reporter = reporter_shared.clone();
             let temp_dir = temp_dir_shared.clone();
+            let last_reported = last_reported_shared.clone();
+            let headers = segment_headers_shared.clone();
             let segment_requests = &segment_requests_shared;
             let init_requests = &init_requests_shared;
             let segment_crypto = &segment_crypto_shared;
@@ -4543,15 +5170,17 @@ fn download_and_merge_once(
 
                     let mut buffer = Vec::new();
                     if let Some(init_request) = init_request {
-                        let init_data = download_hls_resource(&client, &init_request, retries)?;
+                        let init_data =
+                            download_hls_resource(&client, &init_request, &headers, retries)?;
                         let init_data = decrypt_hls_resource(init_data, key.as_ref())?;
                         buffer.extend_from_slice(&init_data);
                     }
-                    let segment_data = download_hls_resource(&client, &segment_request, retries)?;
+                    let segment_data =
+                        download_hls_resource(&client, &segment_request, &headers, retries)?;
                     let segment_data = decrypt_hls_resource(segment_data, key.as_ref())?;
                     buffer.extend_from_slice(&segment_data);
 
-                    let file_name = format!("seg_{:05}.part", idx);
+                    let file_name = format!("{}_{:05}.part", segment_prefix, idx);
                     let tmp_path = temp_dir.join(file_name);
                     std::fs::write(&tmp_path, &buffer).with_context(|| {
                         format!(
@@ -4563,12 +5192,23 @@ fn download_and_merge_once(
 
                     let count = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     pb.set_position(count);
-                    pb.set_message(format!("Downloading segments [{}/{}]", count, total));
-                    emit_progress(
-                        &reporter,
-                        format!("Downloading segments [{}/{}]", count, total),
-                        (count as f64) / (total as f64) * 0.9,
-                    );
+
+                    let total_u64 = total as u64;
+                    let coarse = ((count as f64) / (total as f64) * 900.0) as u64;
+                    let is_final = count >= total_u64;
+                    let should_emit = is_final
+                        || coarse.saturating_sub(
+                            last_reported.load(std::sync::atomic::Ordering::Relaxed),
+                        ) >= 9;
+                    if should_emit {
+                        last_reported.store(coarse, std::sync::atomic::Ordering::Relaxed);
+                        pb.set_message(format!("Downloading segments [{}/{}]", count, total));
+                        emit_progress(
+                            &reporter,
+                            format!("Downloading segments [{}/{}]", count, total),
+                            (count as f64) / (total as f64) * 0.9,
+                        );
+                    }
                     Ok(())
                 })();
 
@@ -4588,23 +5228,18 @@ fn download_and_merge_once(
 
     download_pb.finish_with_message("All segments downloaded");
 
-    // Write a concat-demuxer list for ffmpeg so conversion can consume the
-    // individual segment files (robust against PTS/DTS discontinuities) instead
-    // of the single naively-concatenated stream. fMP4 streams (those using
-    // EXT-X-MAP) cannot use the concat demuxer because each segment is only a
-    // fragment, so they keep using the merged file. Android's MediaCodec
-    // backend cannot read a concat list either, so there the segments are
-    // deleted after merging to save space.
     let is_fmp4 = segments.iter().any(|segment| segment.map.is_some());
     let use_concat = !is_fmp4 && cfg!(not(target_os = "android"));
+    // Keep the per-segment `.part` files when a later stage needs them:
+    // ffmpeg's concat demuxer (desktop) and the Android segment-based
+    // transcoder both consume the individual segment files.
+    let keep_segments = use_concat || cfg!(target_os = "android");
     let concat_list_path = PathBuf::from(format!("{}.concat.txt", output_file));
     if use_concat {
         let mut list_content = String::new();
         for i in 0..total {
-            let segment_path = temp_dir.join(format!("seg_{:05}.part", i));
+            let segment_path = temp_dir.join(format!("{}_{:05}.part", segment_prefix, i));
             let absolute = std::path::absolute(&segment_path).unwrap_or(segment_path);
-            // ffmpeg's concat demuxer is POSIX-oriented: use forward slashes so
-            // Windows drive paths like C:/... are parsed reliably.
             let normalized = absolute.to_string_lossy().replace('\\', "/");
             let escaped = normalized.replace('\'', "'\\''");
             list_content.push_str(&format!("file '{}'\n", escaped));
@@ -4635,7 +5270,7 @@ fn download_and_merge_once(
         .with_context(|| format!("Failed to create output TS file: {}", output_file))?;
 
     for i in 0..total {
-        let file_name = format!("seg_{:05}.part", i);
+        let file_name = format!("{}_{:05}.part", segment_prefix, i);
         let tmp_path = temp_dir.join(&file_name);
 
         let mut segment = std::fs::File::open(&tmp_path)
@@ -4644,7 +5279,7 @@ fn download_and_merge_once(
         std::io::copy(&mut segment, &mut output)
             .with_context(|| format!("Failed to write to output TS: {}", output_file))?;
 
-        if !use_concat {
+        if !keep_segments {
             let _ = std::fs::remove_file(&tmp_path);
         }
         merge_pb.inc(1);
@@ -4655,10 +5290,19 @@ fn download_and_merge_once(
     Ok(())
 }
 
-fn cleanup_segment_temp_files(temp_dir: &Path, total: usize, output_file: &str) {
-    for index in 0..total {
-        let file_name = format!("seg_{:05}.part", index);
-        let _ = std::fs::remove_file(temp_dir.join(file_name));
+fn cleanup_segment_temp_files(temp_dir: &Path, output_file: &str) {
+    // Remove every per-segment `.part` file regardless of its stream prefix.
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".part"))
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
     let _ = std::fs::remove_file(output_file);
     let concat_list = PathBuf::from(format!("{}.concat.txt", output_file));
@@ -4666,10 +5310,11 @@ fn cleanup_segment_temp_files(temp_dir: &Path, total: usize, output_file: &str) 
 }
 
 fn detect_acceleration(ffmpeg_path: &Path) -> Result<AccelType> {
-    let output = Command::new(ffmpeg_path)
-        .args(["-hide_banner", "-encoders"])
-        .output()
-        .context("Failed to run ffmpeg")?;
+    let output = run_ffmpeg(
+        ffmpeg_path,
+        &["-hide_banner".to_string(), "-encoders".to_string()],
+        Duration::from_secs(30),
+    )?;
 
     let list = String::from_utf8_lossy(&output.stdout);
     let candidates = [
@@ -4693,32 +5338,73 @@ fn detect_acceleration(ffmpeg_path: &Path) -> Result<AccelType> {
 
 fn probe_ffmpeg_encoder(ffmpeg_path: &Path, accel: AccelType) -> bool {
     let mut args = vec![
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=64x64:r=1",
-        "-frames:v",
-        "1",
-        "-an",
-        "-c:v",
-        accel.encoder(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-f".to_string(),
+        "lavfi".to_string(),
+        "-i".to_string(),
+        "color=c=black:s=64x64:r=1".to_string(),
+        "-frames:v".to_string(),
+        "1".to_string(),
+        "-an".to_string(),
+        "-c:v".to_string(),
+        accel.encoder().to_string(),
     ];
-    if accel == AccelType::LinuxVaapi {
-        args.extend([
-            "-vaapi_device",
-            "/dev/dri/renderD128",
-            "-vf",
-            "format=nv12,hwupload",
-        ]);
-    }
-    args.extend(["-f", "null", "-"]);
+    match accel {
+        AccelType::LinuxVaapi => args.extend([
+            "-vaapi_device".to_string(),
+            "/dev/dri/renderD128".to_string(),
+            "-vf".to_string(),
+            "format=nv12,hwupload".to_string(),
+        ]),
 
-    match Command::new(ffmpeg_path).args(args).output() {
+        AccelType::IntelQuickSync => args.extend([
+            "-init_hw_device".to_string(),
+            "qsv=hw".to_string(),
+            "-filter_hw_device".to_string(),
+            "hw".to_string(),
+            "-vf".to_string(),
+            "format=nv12,hwupload=extra_hw_frames=64".to_string(),
+        ]),
+
+        AccelType::Nvidia | AccelType::Amd | AccelType::AppleVideoToolbox | AccelType::Cpu => {}
+    }
+    args.extend(["-f".to_string(), "null".to_string(), "-".to_string()]);
+
+    match run_ffmpeg(ffmpeg_path, &args, Duration::from_secs(30)) {
         Ok(output) => output.status.success(),
         Err(_) => false,
+    }
+}
+
+/// Appends the hardware-acceleration specific arguments (device init, frame
+/// upload filters, encoder presets) for a real transcode run.
+fn push_accel_encode_args(args: &mut Vec<String>, accel: AccelType) {
+    match accel {
+        AccelType::Nvidia => args.extend([
+            "-preset".to_string(),
+            "p4".to_string(),
+            "-rc".to_string(),
+            "vbr".to_string(),
+        ]),
+        AccelType::Cpu => args.extend(["-preset".to_string(), "medium".to_string()]),
+        AccelType::LinuxVaapi => args.extend([
+            "-vaapi_device".to_string(),
+            "/dev/dri/renderD128".to_string(),
+            "-vf".to_string(),
+            "format=nv12,hwupload".to_string(),
+        ]),
+        AccelType::IntelQuickSync => args.extend([
+            "-init_hw_device".to_string(),
+            "qsv=hw".to_string(),
+            "-filter_hw_device".to_string(),
+            "hw".to_string(),
+            "-vf".to_string(),
+            "format=nv12,hwupload=extra_hw_frames=64".to_string(),
+        ]),
+        // AMF and VideoToolbox accept software frames and upload internally.
+        AccelType::Amd | AccelType::AppleVideoToolbox => {}
     }
 }
 
@@ -4748,25 +5434,22 @@ fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
 }
 
 fn probe_media_duration(path: &Path, ffmpeg_path: &Path) -> Option<f64> {
-    // Prefer the ffprobe binary that ships next to the resolved ffmpeg.
     let executable_name = if cfg!(target_os = "windows") {
         "ffprobe.exe"
     } else {
         "ffprobe"
     };
     let ffprobe_path = ffmpeg_path.with_file_name(executable_name);
-    let probe = Command::new(&ffprobe_path)
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
+    let probe_args = [
+        "-v".to_string(),
+        "error".to_string(),
+        "-show_entries".to_string(),
+        "format=duration".to_string(),
+        "-of".to_string(),
+        "default=noprint_wrappers=1:nokey=1".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let probe = run_ffmpeg(&ffprobe_path, &probe_args, Duration::from_secs(20)).ok()?;
     if probe.status.success() {
         if let Ok(text) = String::from_utf8(probe.stdout) {
             if let Ok(seconds) = text.trim().parse::<f64>() {
@@ -4777,12 +5460,12 @@ fn probe_media_duration(path: &Path, ffmpeg_path: &Path) -> Option<f64> {
         }
     }
 
-    // Fallback: parse the `Duration:` line from `ffmpeg -i`.
-    let inspect = Command::new(ffmpeg_path)
-        .args(["-hide_banner", "-i"])
-        .arg(path)
-        .output()
-        .ok()?;
+    let inspect_args = [
+        "-hide_banner".to_string(),
+        "-i".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let inspect = run_ffmpeg(ffmpeg_path, &inspect_args, Duration::from_secs(20)).ok()?;
     let stderr = String::from_utf8_lossy(&inspect.stderr);
     parse_ffmpeg_duration(&stderr)
 }
@@ -4807,8 +5490,7 @@ fn validate_output_duration(
         );
         return Ok(());
     };
-    // Tolerate up to 15% drift or 5 seconds (whichever is larger), which covers
-    // EXTINF rounding and container rounding without masking real truncation.
+
     let tolerance = (expected * 0.85).max(expected - 5.0);
     if actual + 1.0 < tolerance {
         bail!(
@@ -4824,6 +5506,7 @@ fn validate_output_duration(
 #[allow(clippy::too_many_arguments)]
 fn convert_to_mp4(
     input_ts: &str,
+    video_segments: Option<SegmentInput>,
     output_path: &str,
     video_bitrate: u32,
     audio_bitrate: u32,
@@ -4859,8 +5542,6 @@ fn convert_to_mp4(
 
             let ffmpeg_path = resolve_ffmpeg_path()
                 .ok_or_else(|| anyhow!("FFmpeg became unavailable before conversion"))?;
-            // Prefer the concat demuxer (segment list) over the single merged TS
-            // file; fall back to the merged file if the list is unavailable.
             let concat_list = concat_list_for_input(Path::new(input_ts));
             let used_concat = concat_list.is_some();
 
@@ -4909,9 +5590,6 @@ fn convert_to_mp4(
                 bail!("MP4 transcode failed with {}", selected_accel.label());
             }
 
-            // Detect silent truncation (e.g. only the first few seconds) that
-            // ffmpeg reports as success, and retry once without the concat
-            // demuxer before giving up with a clear error.
             if let Err(error) = validate_output_duration(
                 Path::new(output_path),
                 expected_duration,
@@ -4979,6 +5657,7 @@ fn convert_to_mp4(
                 );
             }
             android_hardware_transcode(
+                video_segments,
                 input_ts,
                 output_path,
                 video_bitrate,
@@ -5000,7 +5679,66 @@ fn convert_to_mp4(
 
             Ok(())
         }
+        TranscoderKind::IosVideoToolbox => {
+            emit_progress(
+                &reporter,
+                "Using Apple VideoToolbox hardware H.264 encoder",
+                0.955,
+            );
+            ios_hardware_transcode(
+                input_ts,
+                output_path,
+                video_bitrate,
+                audio_bitrate,
+                expected_duration,
+            )?;
+            convert_pb.finish_with_message("VideoToolbox transcode complete");
+            info!("Output file: {}", output_path);
+
+            let out_meta = std::fs::metadata(output_path)
+                .context("Transcode output file not found after iOS VideoToolbox")?;
+            if out_meta.len() < 1024 {
+                bail!(
+                    "Transcode output file is too small ({} bytes), likely corrupted",
+                    out_meta.len()
+                );
+            }
+
+            Ok(())
+        }
     }
+}
+
+/// Transcode a single input (merged TS / direct media) to MP4 using the
+/// native iOS AVFoundation / VideoToolbox hardware pipeline.
+#[cfg(target_os = "ios")]
+fn ios_hardware_transcode(
+    input_ts: &str,
+    output_mp4: &str,
+    video_bitrate: u32,
+    audio_bitrate: u32,
+    expected_duration: Option<f64>,
+) -> Result<()> {
+    let timeout = ios_videotoolbox_timeout(expected_duration);
+    ios_videotoolbox::transcode(
+        input_ts,
+        output_mp4,
+        video_bitrate,
+        audio_bitrate,
+        expected_duration,
+        timeout,
+    )
+}
+
+#[cfg(not(target_os = "ios"))]
+fn ios_hardware_transcode(
+    _input_ts: &str,
+    _output_mp4: &str,
+    _video_bitrate: u32,
+    _audio_bitrate: u32,
+    _expected_duration: Option<f64>,
+) -> Result<()> {
+    bail!("Apple VideoToolbox transcoding is only available on iOS")
 }
 
 fn run_ffmpeg_conversion(
@@ -5017,18 +5755,10 @@ fn run_ffmpeg_conversion(
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
-        // Generate missing PTS/DTS and tolerate non-monotonic timestamps at
-        // segment boundaries. Without this, remuxing/transcoding a stream that
-        // was naively concatenated from independently-encoded HLS segments can
-        // stop after the first few seconds while still exiting successfully.
         "-fflags".to_string(),
-        "+genpts".to_string(),
+        "+genpts+igndts".to_string(),
     ];
     if let Some(concat_list) = concat_list {
-        // Use the concat demuxer with a list of the downloaded segment files.
-        // This is far more robust than a single concatenated TS file because
-        // ffmpeg re-timestamps every segment instead of choking on the first
-        // PTS/DTS discontinuity it encounters.
         args.extend([
             "-f".to_string(),
             "concat".to_string(),
@@ -5056,22 +5786,7 @@ fn run_ffmpeg_conversion(
             "-c:a".to_string(),
             "aac".to_string(),
         ]);
-        match accel {
-            AccelType::Nvidia => args.extend([
-                "-preset".to_string(),
-                "p4".to_string(),
-                "-rc".to_string(),
-                "vbr".to_string(),
-            ]),
-            AccelType::Cpu => args.extend(["-preset".to_string(), "medium".to_string()]),
-            AccelType::LinuxVaapi => args.extend([
-                "-vaapi_device".to_string(),
-                "/dev/dri/renderD128".to_string(),
-                "-vf".to_string(),
-                "format=nv12,hwupload".to_string(),
-            ]),
-            AccelType::Amd | AccelType::IntelQuickSync | AccelType::AppleVideoToolbox => {}
-        }
+        push_accel_encode_args(&mut args, accel);
         if video_bitrate > 0 {
             args.extend(["-b:v".to_string(), format!("{}k", video_bitrate)]);
         }
@@ -5089,12 +5804,6 @@ fn run_ffmpeg_conversion(
     }
 
     args.extend([
-        // Keep the MP4 muxer from shifting, buffering or dropping the start of
-        // the timeline when segment timestamps are not perfectly monotonic.
-        // `make_zero` normalizes negative timestamps to zero, and zeroing the
-        // mux preload/delay prevents the muxer from discarding the head of the
-        // stream, which previously produced outputs that only contained the
-        // first few seconds.
         "-avoid_negative_ts".to_string(),
         "make_zero".to_string(),
         "-muxpreload".to_string(),
@@ -5106,13 +5815,22 @@ fn run_ffmpeg_conversion(
         output_path.to_string(),
     ]);
 
-    Command::new(ffmpeg_path)
-        .args(&args)
-        .output()
-        .context("FFmpeg conversion process failed")
+    let input_duration = probe_media_duration(Path::new(input_path), ffmpeg_path);
+    let hardware = video_bitrate > 0 && accel != AccelType::Cpu;
+    let timeout = ffmpeg_transcode_timeout(input_duration, hardware);
+    run_ffmpeg(ffmpeg_path, &args, timeout)
 }
 
+/// Convert an HLS TS / segment set to MP4 on Android.
+///
+/// `segments` (when present) enables the segment-based pipeline: each
+/// `{prefix}_{i:05}.part` file is fed to the codec independently with a
+/// continuous PTS timeline — the equivalent of ffmpeg's concat demuxer, and
+/// immune to the PTS resets that a naively concatenated TS exhibits. On any
+/// segment-path failure we fall back to the legacy single-file path so a
+/// download can never regress relative to previous behavior.
 fn android_hardware_transcode(
+    segments: Option<SegmentInput>,
     input_ts: &str,
     output_mp4: &str,
     video_bitrate: u32,
@@ -5132,6 +5850,28 @@ fn android_hardware_transcode(
             anyhow!("Android MediaCodec transcoder not registered; JNI_OnLoad failed")
         })?;
 
+        if let Some(segments) = segments {
+            match transcoder.transcode_segments(
+                segments.dir.to_string_lossy().as_ref(),
+                &segments.prefix,
+                segments.total,
+                output_mp4,
+                video_bitrate,
+                audio_bitrate,
+                expected_duration,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // The segment pipeline is the preferred path but never a
+                    // hard requirement: degrade to the merged-TS pipeline.
+                    warn!(
+                        "Android segment-based transcode failed ({}); falling back to merged stream",
+                        error
+                    );
+                }
+            }
+        }
+
         transcoder.transcode(
             input_ts,
             output_mp4,
@@ -5143,6 +5883,7 @@ fn android_hardware_transcode(
 
     #[cfg(not(target_os = "android"))]
     {
+        let _ = segments;
         let _ = input_ts;
         let _ = output_mp4;
         let _ = video_bitrate;
@@ -5211,10 +5952,6 @@ pub extern "C" fn JNI_OnLoad(
 
     match jvm.attach_current_thread() {
         Ok(mut env) => {
-            // NOTE: We can NOT cache MediaTranscoder class here because JNI_OnLoad runs
-            // during System.loadLibrary before the app classloader has loaded the class.
-            // The class will be cached later via registerMediaTranscoderClass() called from Kotlin.
-
             if let Ok(thread_class) = env.find_class("android/app/ActivityThread") {
                 if let Ok(app_obj) = env.call_static_method(
                     thread_class,
@@ -5243,25 +5980,3 @@ pub extern "C" fn JNI_OnLoad(
 
     jni::sys::JNI_VERSION_1_6 as i32
 }
-
-/*
-#[flutter_rust_bridge::frb()]
-#[cfg(target_os = "android")]
-pub fn init_android_context_from_dart(jvm_ptr: i64, context_ptr: i64) -> Result<()> {
-    use jni::objects::JObject;
-    use jni::sys::jobject;
-
-    let jvm = unsafe { jni::JavaVM::from_raw(jvm_ptr as *mut jni::sys::JavaVM) }?;
-    let jvm = Arc::new(jvm);
-
-    let global_context = {
-        let mut env = jvm.attach_current_thread()?;
-        let context_obj = unsafe { JObject::from_raw(context_ptr as jobject) };
-        env.new_global_ref(context_obj)?
-    };
-
-    init_android_context(jvm, global_context)?;
-    info!("鉁� Android Context initialized from Dart");
-    Ok(())
-}
-*/

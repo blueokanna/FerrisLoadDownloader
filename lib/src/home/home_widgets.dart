@@ -59,31 +59,40 @@ class SectionCard extends StatelessWidget {
     required this.subtitle,
     required this.icon,
     required this.child,
+    this.trailing,
   });
 
   final String title;
   final String subtitle;
   final IconData icon;
   final Widget child;
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context);
     final cs = t.colorScheme;
+    final shapes = FerrisShapes.of(context);
+    final spacing = FerrisSpacing.of(context);
     return AnimatedContainer(
       duration: FerrisMotion.medium,
       curve: FerrisMotion.emphasized,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: shapes.card,
         color: cs.surfaceContainerLow,
         border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.55)),
       ),
       child: Material(
         color: Colors.transparent,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: shapes.card,
         clipBehavior: Clip.antiAlias,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(22, 22, 22, 24),
+          padding: EdgeInsets.fromLTRB(
+            spacing.lg,
+            spacing.lg,
+            spacing.lg,
+            spacing.xl,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -121,9 +130,13 @@ class SectionCard extends StatelessWidget {
                       ],
                     ),
                   ),
+                  if (trailing != null) ...[
+                    const SizedBox(width: 8),
+                    trailing!,
+                  ],
                 ],
               ),
-              const SizedBox(height: 20),
+              SizedBox(height: spacing.lg),
               child,
             ],
           ),
@@ -159,14 +172,14 @@ class CandidateTile extends StatelessWidget {
         curve: FerrisMotion.emphasized,
         scale: selected ? 1 : 0.986,
         child: InkWell(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: FerrisShapes.of(context).md,
           onTap: onTap,
           child: AnimatedContainer(
             duration: FerrisMotion.medium,
             curve: FerrisMotion.emphasized,
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: FerrisShapes.of(context).md,
               border: Border.all(
                 color: selected
                     ? cs.primary
@@ -349,24 +362,35 @@ class _RevealMotionState extends State<RevealMotion>
 }
 
 class MiniChip extends StatelessWidget {
-  const MiniChip({super.key, required this.label});
+  const MiniChip({super.key, required this.label, this.icon});
 
   final String label;
+  final IconData? icon;
 
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context);
     final cs = t.colorScheme;
+    final shapes = FerrisShapes.of(context);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: shapes.pill,
         color: cs.surfaceContainerHighest,
         border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.28)),
       ),
-      child: Text(
-        label,
-        style: t.textTheme.labelSmall?.copyWith(fontWeight: FontWeight.w700),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 14, color: cs.onSurfaceVariant),
+            const SizedBox(width: 5),
+          ],
+          Text(
+            label,
+            style: t.textTheme.labelSmall?.copyWith(fontWeight: FontWeight.w700),
+          ),
+        ],
       ),
     );
   }
@@ -386,11 +410,12 @@ class RuntimeCapabilitiesPanel extends StatelessWidget {
     final t = Theme.of(context);
     final cs = t.colorScheme;
 
+    final shapes = FerrisShapes.of(context);
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: shapes.md,
         color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
         border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.5)),
       ),
@@ -588,7 +613,7 @@ class _CapabilityIndicator extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
       decoration: BoxDecoration(
         color: background,
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: FerrisShapes.of(context).pill,
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -642,7 +667,7 @@ class DisplayPreviewCard extends StatelessWidget {
       height: 234,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: FerrisShapes.of(context).card,
         color: cs.surfaceContainer,
         border: Border.all(color: cs.outlineVariant),
       ),
@@ -679,7 +704,7 @@ class DisplayPreviewCard extends StatelessWidget {
               width: double.infinity,
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: FerrisShapes.of(context).md,
                 color: cs.surface,
                 border: Border.all(color: cs.outlineVariant),
               ),
@@ -736,6 +761,7 @@ class ThemePaletteCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = Theme.of(context);
     final cs = t.colorScheme;
+    final shapes = FerrisShapes.of(context);
     return AnimatedSlide(
       duration: FerrisMotion.medium,
       curve: FerrisMotion.emphasized,
@@ -745,7 +771,7 @@ class ThemePaletteCard extends StatelessWidget {
         curve: FerrisMotion.emphasized,
         scale: selected ? 1 : 0.972,
         child: InkWell(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: shapes.md,
           onTap: onTap,
           child: AnimatedContainer(
             duration: FerrisMotion.medium,
@@ -753,7 +779,7 @@ class ThemePaletteCard extends StatelessWidget {
             width: 172,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: shapes.md,
               color: selected ? cs.primaryContainer : cs.surfaceContainerHigh,
               border: Border.all(
                 color: selected ? cs.primary : cs.outlineVariant,
@@ -766,7 +792,7 @@ class ThemePaletteCard extends StatelessWidget {
                 Container(
                   height: 58,
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: shapes.sm,
                     color: profile.canvasLight,
                   ),
                   child: Row(
@@ -833,7 +859,7 @@ class InspectionWarningTile extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: FerrisShapes.of(context).md,
         color: parsed.background,
         border: Border.all(color: parsed.border),
       ),
@@ -993,6 +1019,7 @@ class StatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final shapes = FerrisShapes.of(context);
     final brightness = ThemeData.estimateBrightnessForColor(color);
     final foreground =
         brightness == Brightness.dark ? Colors.white : Colors.black87;
@@ -1001,7 +1028,7 @@ class StatusBadge extends StatelessWidget {
       curve: FerrisMotion.emphasized,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: shapes.pill,
         color: color,
         border: Border.all(color: foreground.withValues(alpha: 0.08)),
       ),
@@ -1051,9 +1078,10 @@ class SmoothLinearProgressIndicator extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final target = value?.clamp(0.0, 1.0);
+    final radius = FerrisShapes.of(context).xs;
     if (target == null) {
       return ClipRRect(
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: radius,
         child: LinearProgressIndicator(
           minHeight: minHeight,
           color: color,
@@ -1067,7 +1095,7 @@ class SmoothLinearProgressIndicator extends StatelessWidget {
       duration: FerrisMotion.medium,
       curve: FerrisMotion.linear,
       builder: (context, animatedValue, _) => ClipRRect(
-        borderRadius: BorderRadius.circular(4),
+        borderRadius: radius,
         child: LinearProgressIndicator(
           minHeight: minHeight,
           value: animatedValue,
@@ -1185,15 +1213,17 @@ class BatteryBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = Theme.of(context);
     final cs = t.colorScheme;
+    final shapes = FerrisShapes.of(context);
+    final spacing = FerrisSpacing.of(context);
     return AnimatedContainer(
       duration: FerrisMotion.medium,
       curve: FerrisMotion.emphasized,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: shapes.md,
         color: cs.tertiaryContainer,
       ),
       child: Padding(
-        padding: const EdgeInsets.all(18),
+        padding: EdgeInsets.all(spacing.lg),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [

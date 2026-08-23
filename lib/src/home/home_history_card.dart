@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
+import 'package:m3u8_downloader/src/app/app_theme.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
 
 class HomeHistoryCard extends StatelessWidget {
@@ -48,7 +49,7 @@ class HomeHistoryCard extends StatelessWidget {
                           width: double.infinity,
                           padding: const EdgeInsets.all(14),
                           decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(18),
+                            borderRadius: FerrisShapes.of(context).md,
                             color: cs.surfaceContainerHighest
                                 .withValues(alpha: 0.45),
                           ),

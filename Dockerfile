@@ -89,7 +89,7 @@ COPY --from=builder /app/build/linux/x64/release/bundle/ ./
 RUN mkdir -p downloads
 
 # 设置环境变量
-ENV FFMPEG_PATH=/usr/bin/ffmpeg
+ENV FERRISLOAD_FFMPEG_PATH=/usr/bin/ffmpeg
 ENV DOWNLOAD_DIR=/app/downloads
 
 # 暴露端口（可选，用于API模式）

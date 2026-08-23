@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
+import 'package:m3u8_downloader/src/app/app_theme.dart';
 import 'package:m3u8_downloader/src/home/home_page_controller.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
-import 'package:m3u8_downloader/src/rust/api/downloader.dart';
 
 class HomeStatusCard extends StatelessWidget {
   const HomeStatusCard({
@@ -13,8 +13,6 @@ class HomeStatusCard extends StatelessWidget {
     required this.progress,
     required this.running,
     required this.analyzing,
-    required this.selectedCandidate,
-    required this.inspection,
     required this.stage,
     required this.stageRevision,
     required this.recoveryMessage,
@@ -29,8 +27,6 @@ class HomeStatusCard extends StatelessWidget {
   final double progress;
   final bool running;
   final bool analyzing;
-  final MediaCandidate? selectedCandidate;
-  final MediaInspectionResult? inspection;
   final HomeWorkflowStage stage;
   final int stageRevision;
   final String? recoveryMessage;
@@ -136,36 +132,16 @@ class HomeStatusCard extends StatelessWidget {
     };
   }
 
-  int _phaseIndex() {
-    return switch (stage) {
-      HomeWorkflowStage.idle ||
-      HomeWorkflowStage.inspecting ||
-      HomeWorkflowStage.ready ||
-      HomeWorkflowStage.authRedirect =>
-        0,
-      HomeWorkflowStage.preparing ||
-      HomeWorkflowStage.backend ||
-      HomeWorkflowStage.playlist ||
-      HomeWorkflowStage.transfer ||
-      HomeWorkflowStage.segments =>
-        1,
-      HomeWorkflowStage.merge || HomeWorkflowStage.transcode => 2,
-      HomeWorkflowStage.exporting ||
-      HomeWorkflowStage.completed ||
-      HomeWorkflowStage.failed =>
-        3,
-    };
-  }
-
   @override
   Widget build(BuildContext context) {
     final l = AppLocalizations.of(context);
     final t = Theme.of(context);
     final cs = t.colorScheme;
+    final stageLabel = _stageLabel(l);
 
     return SectionCard(
       title: l.text('status'),
-      subtitle: status ?? l.text('status'),
+      subtitle: stageLabel,
       icon: Icons.podcasts_rounded,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -176,7 +152,7 @@ class HomeStatusCard extends StatelessWidget {
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: FerrisShapes.of(context).md,
               color: cs.surfaceContainerHigh,
               border: Border.all(
                 color: cs.outlineVariant.withValues(alpha: 0.55),
@@ -223,97 +199,38 @@ class HomeStatusCard extends StatelessWidget {
                     ),
                   ),
                 ),
-                const SizedBox(width: 10),
+                const SizedBox(width: 12),
                 Expanded(
                   child: AnimatedSwitcher(
                     duration: FerrisMotion.medium,
                     switchInCurve: FerrisMotion.decelerate,
                     switchOutCurve: FerrisMotion.accelerate,
                     transitionBuilder: ferrisFadeScaleTransition,
-                    child: Row(
-                      key: ValueKey('stage-$stageRevision-$stage'),
-                      children: [
-                        Icon(_stageIcon(), size: 18),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            _stageLabel(l),
-                            maxLines: 1,
+                    child: status != null
+                        ? Text(
+                            status!,
+                            key: ValueKey('status-msg-$status'),
+                            maxLines: 2,
                             overflow: TextOverflow.ellipsis,
-                            style: t.textTheme.titleSmall?.copyWith(
-                              fontWeight: FontWeight.w800,
+                            style: t.textTheme.bodyMedium?.copyWith(
+                              fontWeight: FontWeight.w600,
+                            ),
+                          )
+                        : Text(
+                            stageLabel,
+                            key: const ValueKey('status-stage'),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: t.textTheme.bodyMedium?.copyWith(
+                              fontWeight: FontWeight.w600,
                             ),
                           ),
-                        ),
-                      ],
-                    ),
                   ),
                 ),
-                StatusBadge(label: _stageLabel(l), color: _stageTone(cs)),
               ],
             ),
           ),
           const SizedBox(height: 16),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final compact = constraints.maxWidth < 360;
-              final pills = [
-                _WorkflowPhasePill(
-                  label: l.text('status_phase_inspect'),
-                  state: _phaseIndex() > 0
-                      ? _WorkflowPhaseState.completed
-                      : _phaseIndex() == 0
-                          ? _WorkflowPhaseState.active
-                          : _WorkflowPhaseState.idle,
-                ),
-                _WorkflowPhasePill(
-                  label: l.text('status_phase_acquire'),
-                  state: _phaseIndex() > 1
-                      ? _WorkflowPhaseState.completed
-                      : _phaseIndex() == 1
-                          ? _WorkflowPhaseState.active
-                          : _WorkflowPhaseState.idle,
-                ),
-                _WorkflowPhasePill(
-                  label: l.text('status_phase_assemble'),
-                  state: _phaseIndex() > 2
-                      ? _WorkflowPhaseState.completed
-                      : _phaseIndex() == 2
-                          ? _WorkflowPhaseState.active
-                          : _WorkflowPhaseState.idle,
-                ),
-                _WorkflowPhasePill(
-                  label: l.text('status_phase_deliver'),
-                  state: _phaseIndex() == 3
-                      ? _WorkflowPhaseState.active
-                      : _phaseIndex() > 3
-                          ? _WorkflowPhaseState.completed
-                          : _WorkflowPhaseState.idle,
-                ),
-              ];
-
-              if (compact) {
-                final itemWidth = (constraints.maxWidth - 8) / 2;
-                return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    for (final pill in pills)
-                      SizedBox(width: itemWidth, child: pill),
-                  ],
-                );
-              }
-
-              return Row(
-                children: [
-                  for (final pill in pills) ...[
-                    Expanded(child: pill),
-                    if (pill != pills.last) const SizedBox(width: 8),
-                  ],
-                ],
-              );
-            },
-          ),
           AnimatedSwitcher(
             duration: FerrisMotion.medium,
             switchInCurve: FerrisMotion.decelerate,
@@ -329,7 +246,7 @@ class HomeStatusCard extends StatelessWidget {
                     margin: const EdgeInsets.only(top: 14),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: FerrisShapes.of(context).md,
                       color: cs.tertiaryContainer.withValues(alpha: 0.72),
                     ),
                     child: Column(
@@ -358,43 +275,6 @@ class HomeStatusCard extends StatelessWidget {
             minHeight: 8,
             value: (running || analyzing) && progress <= 0 ? null : progress,
           ),
-          const SizedBox(height: 16),
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: [
-              _StatusMetaPill(
-                label: l.text('source_page'),
-                value: _sourceLabel(),
-                color: cs.primaryContainer,
-              ),
-              _StatusMetaPill(
-                label: l.text('extractor'),
-                value: selectedCandidate?.extractor ??
-                    inspection?.extractor ??
-                    '-',
-                color: cs.secondaryContainer,
-              ),
-              _StatusMetaPill(
-                label: l.text('stream'),
-                value: selectedCandidate?.protocol ?? '-',
-                color: cs.tertiaryContainer,
-              ),
-            ],
-          ),
-          AnimatedSwitcher(
-            duration: FerrisMotion.medium,
-            switchInCurve: FerrisMotion.decelerate,
-            switchOutCurve: FerrisMotion.accelerate,
-            transitionBuilder: ferrisFadeScaleTransition,
-            child: status != null
-                ? Padding(
-                    key: ValueKey('status-$status'),
-                    padding: const EdgeInsets.only(top: 16),
-                    child: Text(status!, style: t.textTheme.bodyLarge),
-                  )
-                : const SizedBox.shrink(),
-          ),
           AnimatedSwitcher(
             duration: FerrisMotion.medium,
             switchInCurve: FerrisMotion.decelerate,
@@ -407,22 +287,47 @@ class HomeStatusCard extends StatelessWidget {
                     margin: const EdgeInsets.only(top: 14),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: FerrisShapes.of(context).md,
                       color: cs.errorContainer,
+                      border: Border.all(
+                        color: cs.error.withValues(alpha: 0.28),
+                      ),
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          error!,
-                          style: t.textTheme.bodyMedium?.copyWith(
-                            color: cs.onErrorContainer,
-                          ),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: cs.error.withValues(alpha: 0.14),
+                              ),
+                              child: Icon(
+                                Icons.error_outline_rounded,
+                                size: 20,
+                                color: cs.onErrorContainer,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                error!,
+                                style: t.textTheme.bodyMedium?.copyWith(
+                                  color: cs.onErrorContainer,
+                                  height: 1.4,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                         if (onRetry != null) ...[
-                          const SizedBox(height: 12),
-                          SizedBox(
-                            width: double.infinity,
+                          const SizedBox(height: 14),
+                          Align(
+                            alignment: Alignment.centerLeft,
                             child: FilledButton.icon(
                               onPressed: onRetry,
                               icon: const Icon(Icons.refresh_rounded),
@@ -464,7 +369,7 @@ class HomeStatusCard extends StatelessWidget {
                     margin: const EdgeInsets.only(top: 14),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(18),
+                      borderRadius: FerrisShapes.of(context).md,
                       color: cs.primaryContainer.withValues(alpha: 0.45),
                     ),
                     child: Column(
@@ -482,114 +387,6 @@ class HomeStatusCard extends StatelessWidget {
                     ),
                   )
                 : const SizedBox.shrink(),
-          ),
-        ],
-      ),
-    );
-  }
-
-  String _sourceLabel() {
-    final pageUrl = selectedCandidate?.pageUrl ?? inspection?.pageUrl;
-    if (pageUrl == null || pageUrl.isEmpty) {
-      return '-';
-    }
-    final parsed = Uri.tryParse(pageUrl);
-    return parsed?.host.isNotEmpty == true ? parsed!.host : pageUrl;
-  }
-}
-
-enum _WorkflowPhaseState { idle, active, completed }
-
-class _WorkflowPhasePill extends StatelessWidget {
-  const _WorkflowPhasePill({required this.label, required this.state});
-
-  final String label;
-  final _WorkflowPhaseState state;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = Theme.of(context);
-    final cs = t.colorScheme;
-    final background = switch (state) {
-      _WorkflowPhaseState.idle => cs.surfaceContainerHigh.withValues(
-          alpha: 0.48,
-        ),
-      _WorkflowPhaseState.active => cs.primaryContainer,
-      _WorkflowPhaseState.completed => cs.secondaryContainer,
-    };
-    final foreground = switch (state) {
-      _WorkflowPhaseState.idle => cs.onSurfaceVariant,
-      _WorkflowPhaseState.active => cs.onPrimaryContainer,
-      _WorkflowPhaseState.completed => cs.onSecondaryContainer,
-    };
-
-    return AnimatedContainer(
-      duration: FerrisMotion.medium,
-      curve: FerrisMotion.emphasized,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        color: background,
-      ),
-      child: Text(
-        label,
-        textAlign: TextAlign.center,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-        style: t.textTheme.labelMedium?.copyWith(
-          color: foreground,
-          fontWeight: FontWeight.w700,
-        ),
-      ),
-    );
-  }
-}
-
-class _StatusMetaPill extends StatelessWidget {
-  const _StatusMetaPill({
-    required this.label,
-    required this.value,
-    required this.color,
-  });
-
-  final String label;
-  final String value;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = Theme.of(context);
-    final brightness = ThemeData.estimateBrightnessForColor(color);
-    final foreground =
-        brightness == Brightness.dark ? Colors.white : Colors.black87;
-
-    return Container(
-      constraints: const BoxConstraints(minWidth: 96),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        color: color,
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            label,
-            style: t.textTheme.labelSmall?.copyWith(
-              color: foreground.withValues(alpha: 0.78),
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-          const SizedBox(height: 3),
-          Text(
-            value,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: t.textTheme.labelLarge?.copyWith(
-              color: foreground,
-              fontWeight: FontWeight.w800,
-            ),
           ),
         ],
       ),

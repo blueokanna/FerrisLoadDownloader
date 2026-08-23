@@ -1,11 +1,12 @@
-import 'dart:io';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
 import 'package:m3u8_downloader/src/app/app_settings.dart';
 import 'package:m3u8_downloader/src/app/auth_browser_page.dart';
+import 'package:m3u8_downloader/src/app/download_engine.dart';
+import 'package:m3u8_downloader/src/app/local_file_utils.dart';
 import 'package:m3u8_downloader/src/app/platform_bridge.dart';
+import 'package:m3u8_downloader/src/app/platform_utils.dart';
 import 'package:m3u8_downloader/src/home/home_candidates_card.dart';
 import 'package:m3u8_downloader/src/home/home_download_tasks_card.dart';
 import 'package:m3u8_downloader/src/home/home_page_controller.dart';
@@ -32,6 +33,9 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  // Not `final`: recreated in `didUpdateWidget` when the web API settings
+  // change, so it must be reassignable.
+  late DownloadEngine _engine;
   final _formKey = GlobalKey<FormState>();
   final _urlCtrl = TextEditingController();
   final _fileNameCtrl = TextEditingController(text: 'video.mp4');
@@ -56,7 +60,25 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _engine = createDownloadEngine(
+      apiBaseUrl: widget.settings.apiBaseUrl,
+      apiToken: widget.settings.apiToken,
+    );
     _checkBattery();
+  }
+
+  @override
+  void didUpdateWidget(HomePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // On the web the engine is bound to the API base URL + token; recreate it
+    // when the user changes those settings so requests use the new endpoint.
+    if (oldWidget.settings.apiBaseUrl != widget.settings.apiBaseUrl ||
+        oldWidget.settings.apiToken != widget.settings.apiToken) {
+      _engine = createDownloadEngine(
+        apiBaseUrl: widget.settings.apiBaseUrl,
+        apiToken: widget.settings.apiToken,
+      );
+    }
   }
 
   @override
@@ -82,7 +104,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _pickDir() async {
-    if (_pageController.value.analyzing) {
+    if (_pageController.value.analyzing || FerrisPlatform.isWeb) {
+      // The web build saves to the API server, so there is no local directory.
       return;
     }
     final dir = await FilePicker.getDirectoryPath();
@@ -92,12 +115,18 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<String> _tempOutputPathFor(String name, String? chosenDir) async {
-    if (Platform.isAndroid) {
+    if (FerrisPlatform.isWeb) {
+      // The web build sends only the file name; the API server owns the path.
+      return name;
+    }
+    if (FerrisPlatform.isAndroid) {
       final safe = await MediaStoreBridge.getAppPrivateDir();
-      return safe.isNotEmpty ? '$safe${Platform.pathSeparator}$name' : name;
+      return safe.isNotEmpty
+          ? '$safe${FerrisPlatform.pathSeparator}$name'
+          : name;
     }
     if (chosenDir != null && chosenDir.isNotEmpty) {
-      final separator = Platform.pathSeparator;
+      final separator = FerrisPlatform.pathSeparator;
       return chosenDir.endsWith(separator)
           ? '$chosenDir$name'
           : '$chosenDir$separator$name';
@@ -122,19 +151,26 @@ class _HomePageState extends State<HomePage> {
   }
 
   String _suggestFileName(MediaCandidate candidate) {
-    final raw = candidate.title.trim().isEmpty
-        ? 'video'
-        : candidate.title.trim();
+    final raw =
+        candidate.title.trim().isEmpty ? 'video' : candidate.title.trim();
     final sanitized = raw.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
     return _normalizeOutputName(sanitized);
   }
 
+  /// Strip CR/LF and other control bytes from a pasted header value so a
+  /// multi-line clipboard paste can never reach the Rust engine and trigger
+  /// a header-injection guard (or corrupt an upstream request). Non-ASCII
+  /// characters are preserved.
+  String _sanitizeHeaderValue(String value) {
+    return value.replaceAll(RegExp(r'[\x00-\x08\x0A-\x1F\x7F]'), '');
+  }
+
   RequestContext _requestContext() {
     return RequestContext(
-      userAgent: _userAgentCtrl.text.trim(),
-      referer: _refererCtrl.text.trim(),
-      origin: _originCtrl.text.trim(),
-      cookie: _cookieCtrl.text.trim(),
+      userAgent: _sanitizeHeaderValue(_userAgentCtrl.text.trim()),
+      referer: _sanitizeHeaderValue(_refererCtrl.text.trim()),
+      origin: _sanitizeHeaderValue(_originCtrl.text.trim()),
+      cookie: _sanitizeHeaderValue(_cookieCtrl.text.trim()),
       headers: _parseHeaderEntries(_headersCtrl.text),
     );
   }
@@ -151,7 +187,7 @@ class _HomePageState extends State<HomePage> {
         continue;
       }
       final name = trimmed.substring(0, index).trim();
-      final value = trimmed.substring(index + 1).trim();
+      final value = _sanitizeHeaderValue(trimmed.substring(index + 1).trim());
       if (name.isEmpty || value.isEmpty) {
         continue;
       }
@@ -292,7 +328,7 @@ class _HomePageState extends State<HomePage> {
     _pageController.beginAnalyze(l.text('analyzing'));
 
     try {
-      final inspection = await inspectMediaWithContext(
+      final inspection = await _engine.inspect(
         url: targetUrl,
         requestContext: requestContext,
       );
@@ -302,9 +338,8 @@ class _HomePageState extends State<HomePage> {
       if (inspection.pageUrl.isNotEmpty) {
         _replaceSourceText(inspection.pageUrl);
       }
-      final selectedCandidate = inspection.candidates.isNotEmpty
-          ? inspection.candidates.first
-          : null;
+      final selectedCandidate =
+          inspection.candidates.isNotEmpty ? inspection.candidates.first : null;
       _pageController.completeAnalyze(
         inspection,
         selectedCandidate: selectedCandidate,
@@ -356,16 +391,13 @@ class _HomePageState extends State<HomePage> {
     final enteredUrl = extractSourceUrl(_urlCtrl.text)!;
     _replaceSourceText(enteredUrl);
     final selectedCandidate = vm.selectedCandidate;
-    final candidateMatchesInput =
-        selectedCandidate != null &&
+    final candidateMatchesInput = selectedCandidate != null &&
         (selectedCandidate.pageUrl == enteredUrl ||
             selectedCandidate.mediaUrl == enteredUrl);
-    final pageUrl = candidateMatchesInput
-        ? selectedCandidate.pageUrl
-        : enteredUrl;
-    final mediaUrl = candidateMatchesInput
-        ? selectedCandidate.mediaUrl
-        : enteredUrl;
+    final pageUrl =
+        candidateMatchesInput ? selectedCandidate.pageUrl : enteredUrl;
+    final mediaUrl =
+        candidateMatchesInput ? selectedCandidate.mediaUrl : enteredUrl;
     final audioUrl = candidateMatchesInput ? selectedCandidate.audioUrl : null;
     final sourcePage = pageUrl;
 
@@ -385,9 +417,11 @@ class _HomePageState extends State<HomePage> {
     );
 
     await MediaStoreBridge.startForegroundService();
+    var lastNotifiedPercent = -1;
+    var lastNotifiedMessage = <String>{};
 
     try {
-      await for (final event in downloadMediaWithContext(
+      await for (final event in _engine.download(
         pageUrl: pageUrl,
         mediaUrl: mediaUrl,
         audioUrl: audioUrl,
@@ -402,60 +436,82 @@ class _HomePageState extends State<HomePage> {
         if (!mounted) {
           return;
         }
+        final terminalError = event.error;
+        if (terminalError != null && terminalError.isNotEmpty) {
+          _pageController.failDownloadTask(
+            taskId,
+            terminalError,
+            status: null,
+            progress: 0,
+          );
+          shouldAutoOpenAuthBrowser = _shouldAutoOpenAuthBrowser(
+            skipAutoAuth: false,
+            errorText: terminalError,
+          );
+          return;
+        }
         _pageController.updateDownloadTask(
           taskId,
           event.message,
           event.progress,
         );
-        await MediaStoreBridge.updateForegroundProgress(
-          (event.progress * 100).round(),
-          event.message,
-        );
+        final percent = (event.progress * 100).round();
+        final isNewMessage = !lastNotifiedMessage.contains(event.message);
+        if (isNewMessage || percent - lastNotifiedPercent >= 1) {
+          lastNotifiedPercent = percent;
+          lastNotifiedMessage = {event.message};
+          await MediaStoreBridge.updateForegroundProgress(
+            percent,
+            event.message,
+          );
+        }
       }
 
       if (!mounted) {
         return;
       }
-      final outputFile = File(output);
-      if (!await outputFile.exists() || await outputFile.length() == 0) {
-        _pageController.failDownloadTask(
-          taskId,
-          l.text('output_not_created'),
-          status: null,
-          progress: 0,
-        );
-        return;
-      }
 
-      String finalPath = output;
-      if (Platform.isAndroid) {
-        String? savedPath;
-        if (chosenDir != null && chosenDir.isNotEmpty) {
-          savedPath = await MediaStoreBridge.saveToPath(
-            output,
-            chosenDir,
-            fileName,
-          );
-        } else {
-          savedPath = await MediaStoreBridge.saveViaMediaStore(
-            output,
-            fileName,
-          );
-        }
-        if (savedPath == null) {
+      String finalPath;
+      if (_engine.writesLocalFiles) {
+        if (!await localFileExists(output) ||
+            await localFileLength(output) == 0) {
           _pageController.failDownloadTask(
             taskId,
-            '${l.text('export_failed')} $output',
+            l.text('output_not_created'),
             status: null,
+            progress: 0,
           );
           return;
         }
-        finalPath = savedPath;
-        try {
-          if (await outputFile.exists()) {
-            await outputFile.delete();
+        finalPath = output;
+        if (FerrisPlatform.isAndroid) {
+          String? savedPath;
+          if (chosenDir != null && chosenDir.isNotEmpty) {
+            savedPath = await MediaStoreBridge.saveToPath(
+              output,
+              chosenDir,
+              fileName,
+            );
+          } else {
+            savedPath = await MediaStoreBridge.saveViaMediaStore(
+              output,
+              fileName,
+            );
           }
-        } catch (_) {}
+          if (savedPath == null) {
+            _pageController.failDownloadTask(
+              taskId,
+              '${l.text('export_failed')} $output',
+              status: null,
+            );
+            return;
+          }
+          finalPath = savedPath;
+          await localFileDelete(output);
+        }
+      } else {
+        // Web: the file lives on the API server; surface its path.
+        finalPath = _engine.lastResultPath ?? output;
       }
 
       _pageController.completeDownloadTask(
@@ -660,7 +716,7 @@ class _HomePageState extends State<HomePage> {
   }) {
     final l = AppLocalizations.of(context);
     final children = <Widget>[
-      if (Platform.isAndroid && !vm.ignoringBattery)
+      if (FerrisPlatform.isAndroid && !vm.ignoringBattery)
         Padding(
           padding: const EdgeInsets.only(bottom: 12),
           child: BatteryBanner(
@@ -742,8 +798,6 @@ class _HomePageState extends State<HomePage> {
         progress: vm.progress,
         running: vm.running,
         analyzing: vm.analyzing,
-        selectedCandidate: vm.selectedCandidate,
-        inspection: vm.inspection,
         stage: vm.stage,
         stageRevision: vm.stageRevision,
         recoveryMessage: vm.recoveryMessage,

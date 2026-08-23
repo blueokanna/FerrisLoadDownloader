@@ -45,11 +45,16 @@ WORKDIR /app
 
 COPY --from=api-builder /app/rust/target/release/m3u8_api_server ./m3u8_api_server
 
-ENV FFMPEG_PATH=/usr/bin/ffmpeg
+ENV FERRISLOAD_FFMPEG_PATH=/usr/bin/ffmpeg
 ENV DOWNLOAD_DIR=/app/downloads
 ENV RUST_LOG=info
 ENV API_HOST=0.0.0.0
 ENV API_PORT=3000
+# 安全：留空 = 关闭鉴权；设置后所有端点（除 /health）要求 Bearer token。
+# 运行时可覆盖：docker run -e FERRISLOAD_API_TOKEN=...
+ENV FERRISLOAD_API_TOKEN=
+# 安全：默认拒绝内网/回环地址（SSRF 防护）；设为 1 允许本地网络媒体服务器。
+ENV FERRISLOAD_ALLOW_PRIVATE_NETWORKS=
 
 EXPOSE 3000
 

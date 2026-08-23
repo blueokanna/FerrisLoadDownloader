@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
 import 'package:m3u8_downloader/src/app/app_settings.dart';
 import 'package:m3u8_downloader/src/app/app_theme.dart';
+import 'package:m3u8_downloader/src/app/download_engine.dart';
 import 'package:m3u8_downloader/src/home/home_page.dart';
 import 'package:m3u8_downloader/src/home/home_settings_sheet.dart';
 
@@ -14,6 +15,8 @@ const _settings = AppSettings(
   themeMode: ThemeMode.light,
   localeTag: 'zh',
   autoOpenAuthBrowser: true,
+  apiBaseUrl: defaultApiBaseUrl,
+  apiToken: '',
 );
 
 Widget _buildApp(Key captureKey) {

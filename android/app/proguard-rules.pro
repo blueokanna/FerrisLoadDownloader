@@ -3,10 +3,19 @@
     public static *;
 }
 
-# Keep the transcode method specifically
+# Keep the transcode / mux / capabilityReport methods specifically with their
+# exact JNI-visible signatures (must match the Rust JNI call signatures):
+#   transcode(String input, String output, int vBitrate, int aBitrate, long expectedDurationMs) -> boolean
+#   transcodeDir(String dir, String prefix, int total, String output, int vBitrate, int aBitrate, long expectedDurationMs) -> boolean
+#   mux(String video, String audio, String output, long expectedDurationMs) -> boolean
+#   muxDirs(String videoDir, String videoPrefix, int videoTotal, String audioDir, String audioPrefix, int audioTotal, String output, long expectedDurationMs) -> boolean
+#   capabilityReport() -> String
 -keepclassmembers class com.bluevale.m3u8_downloader.MediaTranscoder {
-    public static boolean transcode(java.lang.String, java.lang.String, int, int);
-    public static boolean mux(java.lang.String, java.lang.String, java.lang.String);
+    public static boolean transcode(java.lang.String, java.lang.String, int, int, long);
+    public static boolean transcodeDir(java.lang.String, java.lang.String, int, java.lang.String, int, int, long);
+    public static boolean mux(java.lang.String, java.lang.String, java.lang.String, long);
+    public static boolean muxDirs(java.lang.String, java.lang.String, int, java.lang.String, java.lang.String, int, java.lang.String, long);
+    public static java.lang.String capabilityReport();
 }
 
 # Keep MainActivity (loads native Rust library)

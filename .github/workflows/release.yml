@@ -12,8 +12,7 @@ on:
         default: ''
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -68,6 +67,47 @@ jobs:
         run: |
           flutter analyze
           flutter test
+
+  security-scan:
+    name: Security scan (Rust / Dart / Container)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit (Rust dependency advisories)
+        working-directory: rust
+        run: cargo audit --deny warnings
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Check for outdated Dart dependencies
+        run: flutter pub outdated || true
+
+      - name: Scan repository with Trivy (vulns + secrets + misconfig)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          skip-dirs: build,rust/target,.dart_tool,ios/Pods
+          exit-code: '0'
 
   build-android:
     name: Build Android APKs
@@ -356,10 +396,117 @@ jobs:
           path: dist/linux/FerrisLoad-linux-x64.tar.gz
           retention-days: 7
 
+  build-web:
+    name: Build Web (JS + WASM)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build Web (JS fallback build)
+        run: flutter build web --release
+
+      - name: Package Web JS build
+        run: |
+          mkdir -p dist/web-js
+          cp -r build/web/* dist/web-js/
+
+      - name: Build Web (WASM)
+        run: flutter build web --release --wasm
+
+      - name: Package Web WASM build
+        run: |
+          mkdir -p dist/web-wasm
+          cp -r build/web/* dist/web-wasm/
+
+      - name: Upload Web JS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-js
+          path: dist/web-js/
+          retention-days: 7
+
+      - name: Upload Web WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-wasm
+          path: dist/web-wasm/
+          retention-days: 7
+
+  build-ios:
+    name: Build iOS arm64 (unsigned)
+    needs: validate
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-ios-${{ hashFiles('rust/Cargo.lock', 'rust/Cargo.toml') }}
+          restore-keys: rust-ios-
+
+      # Validates the `#[cfg(target_os = "ios")]` VideoToolbox FFI code that
+      # cannot be compiled on other hosts (needs the Apple SDK headers).
+      - name: Cross-check iOS Rust code
+        working-directory: rust
+        run: cargo check --target aarch64-apple-ios --lib --locked
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build iOS app (unsigned, for sideloading)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package iOS artifact
+        shell: bash
+        run: |
+          mkdir -p dist/ios
+          APP_PATH=$(find build/ios/iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          test -n "$APP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "dist/ios/FerrisLoad-ios-arm64-unsigned.zip"
+          ls -lah dist/ios
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-arm64
+          path: dist/ios/FerrisLoad-ios-arm64-unsigned.zip
+          retention-days: 7
+
   docker-api:
     name: Publish Docker API image
     needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     # QEMU-based arm builds can exceed one hour on a cold Cargo cache.
     timeout-minutes: 120
     steps:
@@ -414,11 +561,15 @@ jobs:
   create-release:
     name: Create GitHub Release
     if: (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '') && needs.build-android.outputs.release_signed == 'true'
+    permissions:
+      contents: write
     needs:
       - build-android
       - build-windows
       - build-macos
       - build-linux
+      - build-web
+      - build-ios
       - docker-api
     runs-on: ubuntu-latest
     steps:
@@ -473,4 +624,5 @@ jobs:
             artifacts/macos-x64/FerrisLoad-macos-x64.zip
             artifacts/macos-arm64/FerrisLoad-macos-arm64.zip
             artifacts/linux-x64/FerrisLoad-linux-x64.tar.gz
+            artifacts/ios-arm64/FerrisLoad-ios-arm64-unsigned.zip
             artifacts/SHA256SUMS

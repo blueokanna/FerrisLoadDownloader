@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
 import 'package:m3u8_downloader/src/app/app_settings.dart';
 import 'package:m3u8_downloader/src/app/app_theme.dart';
+import 'package:m3u8_downloader/src/app/platform_utils.dart';
 import 'package:m3u8_downloader/src/app/runtime_capabilities.dart';
 import 'package:m3u8_downloader/src/home/auth_context_editor.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
@@ -49,6 +50,17 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
   late AppSettings _draft = widget.settings;
   late final Future<PlatformCapabilitySnapshot> _capabilities =
       RuntimeCapabilityProbe.inspect();
+  late final TextEditingController _apiUrlCtrl =
+      TextEditingController(text: widget.settings.apiBaseUrl);
+  late final TextEditingController _apiTokenCtrl =
+      TextEditingController(text: widget.settings.apiToken);
+
+  @override
+  void dispose() {
+    _apiUrlCtrl.dispose();
+    _apiTokenCtrl.dispose();
+    super.dispose();
+  }
 
   void _updateDraft(AppSettings next) {
     setState(() => _draft = next);
@@ -96,6 +108,65 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
               delay: const Duration(milliseconds: 110),
               child: RuntimeCapabilitiesPanel(capabilities: _capabilities),
             ),
+            if (FerrisPlatform.isWeb) ...[
+              const SizedBox(height: 18),
+              RevealMotion(
+                delay: const Duration(milliseconds: 125),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(left: 2),
+                      child: Text(
+                        l.text('api_base_url'),
+                        style: t.textTheme.labelLarge,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: _apiUrlCtrl,
+                      enabled: widget.enabled,
+                      keyboardType: TextInputType.url,
+                      autocorrect: false,
+                      decoration: InputDecoration(
+                        hintText: 'http://localhost:3000',
+                        helperText: l.text('api_base_url_hint'),
+                        border: OutlineInputBorder(
+                          borderRadius: FerrisShapes.of(context).md,
+                        ),
+                      ),
+                      onChanged: (value) {
+                        final trimmed = value.trim();
+                        if (trimmed.isNotEmpty &&
+                            trimmed != widget.settings.apiBaseUrl) {
+                          _updateDraft(_draft.copyWith(apiBaseUrl: trimmed));
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 14),
+                    TextField(
+                      controller: _apiTokenCtrl,
+                      enabled: widget.enabled,
+                      autocorrect: false,
+                      obscureText: true,
+                      decoration: InputDecoration(
+                        hintText: 'Bearer token',
+                        helperText: l.text('api_token_hint'),
+                        border: OutlineInputBorder(
+                          borderRadius: FerrisShapes.of(context).md,
+                        ),
+                      ),
+                      onChanged: (value) {
+                        final trimmed = value.trim();
+                        if (trimmed != widget.settings.apiToken) {
+                          _updateDraft(_draft.copyWith(apiToken: trimmed));
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 18),
             RevealMotion(
               delay: const Duration(milliseconds: 140),
@@ -112,7 +183,7 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
                     curve: Curves.easeOutCubic,
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: FerrisShapes.of(context).md,
                       color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
                     ),
                     child: SegmentedButton<ThemeMode>(
@@ -191,7 +262,7 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
                           width: profile.id == item.id ? 20 : 6,
                           height: 6,
                           decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(999),
+                            borderRadius: FerrisShapes.of(context).pill,
                             color: profile.id == item.id
                                 ? cs.primary
                                 : cs.outlineVariant,
@@ -210,7 +281,7 @@ class _HomeSettingsSheetState extends State<HomeSettingsSheet> {
                 curve: Curves.easeOutCubic,
                 padding: const EdgeInsets.all(18),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: FerrisShapes.of(context).md,
                   color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
                 ),
                 child: Column(

@@ -243,12 +243,35 @@ class _AuthBrowserPageState extends State<AuthBrowserPage> {
                 javaScriptEnabled: true,
                 allowsBackForwardNavigationGestures: true,
                 thirdPartyCookiesEnabled: true,
+                // Defense in depth: never let any page (or a redirect from a
+                // page) reach local files or content providers.
+                allowFileAccess: false,
+                allowContentAccess: false,
+                allowFileAccessFromFileURLs: false,
+                allowUniversalAccessFromFileURLs: false,
                 userAgent: widget.seedContext.userAgent.isEmpty
                     ? null
                     : widget.seedContext.userAgent,
               ),
               onWebViewCreated: (controller) {
                 _controller = controller;
+              },
+              // Only http/https (and the harmless about:blank) may be
+              // loaded. Untrusted pages must not be able to navigate to
+              // file:, content:, intent:, javascript: or data: URLs, which
+              // would otherwise expose local resources to the page.
+              shouldOverrideUrlLoading: (controller, navigationAction) async {
+                final url = navigationAction.request.url;
+                if (url == null) {
+                  return NavigationActionPolicy.ALLOW;
+                }
+                final scheme = url.scheme.toLowerCase();
+                if (scheme == 'http' ||
+                    scheme == 'https' ||
+                    scheme == 'about') {
+                  return NavigationActionPolicy.ALLOW;
+                }
+                return NavigationActionPolicy.CANCEL;
               },
               onLoadStart: (controller, url) {
                 if (!mounted) return;

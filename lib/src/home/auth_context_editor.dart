@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
+import 'package:m3u8_downloader/src/app/app_theme.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
 
 class AuthorizationSettingsPanel extends StatelessWidget {
@@ -45,7 +46,7 @@ class AuthorizationSettingsPanel extends StatelessWidget {
       curve: Curves.easeOutCubic,
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: FerrisShapes.of(context).md,
         color: cs.surfaceContainerHigh.withValues(alpha: 0.52),
         border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.22)),
       ),
@@ -92,7 +93,7 @@ class AuthorizationSettingsPanel extends StatelessWidget {
             curve: FerrisMotion.emphasized,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: FerrisShapes.of(context).md,
               color: cs.surfaceContainer,
               border: Border.all(
                 color: cs.outlineVariant.withValues(alpha: 0.18),
@@ -193,7 +194,7 @@ class AuthorizationSettingsPanel extends StatelessWidget {
             curve: FerrisMotion.emphasized,
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: FerrisShapes.of(context).md,
               color: cs.surface.withValues(alpha: 0.76),
               border: Border.all(
                 color: cs.outlineVariant.withValues(alpha: 0.16),

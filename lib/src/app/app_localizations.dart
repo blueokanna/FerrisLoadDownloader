@@ -155,6 +155,12 @@ class AppLocalizations {
       'dark': 'Dark',
       'theme': 'Theme',
       'language': 'Language',
+      'api_base_url': 'API server URL (web build)',
+      'api_base_url_hint':
+          'Base URL of the FerrisLoad API server, e.g. http://localhost:3000. Non-local servers must use https.',
+      'api_token': 'API token (optional)',
+      'api_token_hint':
+          'Optional bearer token; matches the server FERRISLOAD_API_TOKEN. Leave empty when the server has no token.',
       'battery': 'Battery optimization',
       'battery_hint':
           'Disable restrictions to keep long downloads alive in the background',

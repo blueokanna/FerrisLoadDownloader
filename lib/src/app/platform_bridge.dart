@@ -1,14 +1,14 @@
-import 'dart:io';
-
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
+
+import 'platform_utils.dart';
 
 class MediaStoreBridge {
   static const MethodChannel _channel =
       MethodChannel('com.blue.ferrisload/media_store');
 
   static Future<void> requestPermissions() async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return;
     }
     await [Permission.storage, Permission.manageExternalStorage].request();
@@ -16,7 +16,7 @@ class MediaStoreBridge {
   }
 
   static Future<String> getAppPrivateDir() async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return '';
     }
     try {
@@ -32,7 +32,7 @@ class MediaStoreBridge {
     String fileName, {
     String subDir = 'FerrisLoad',
   }) async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return srcPath;
     }
     try {
@@ -52,7 +52,7 @@ class MediaStoreBridge {
     String destDir,
     String fileName,
   ) async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return srcPath;
     }
     try {
@@ -67,7 +67,7 @@ class MediaStoreBridge {
   }
 
   static Future<void> startForegroundService() async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return;
     }
     try {
@@ -76,7 +76,7 @@ class MediaStoreBridge {
   }
 
   static Future<void> stopForegroundService() async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return;
     }
     try {
@@ -86,7 +86,7 @@ class MediaStoreBridge {
 
   static Future<void> updateForegroundProgress(
       int progress, String status) async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return;
     }
     try {
@@ -98,7 +98,7 @@ class MediaStoreBridge {
   }
 
   static Future<bool> isIgnoringBatteryOptimizations() async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return true;
     }
     try {
@@ -111,7 +111,7 @@ class MediaStoreBridge {
   }
 
   static Future<void> requestIgnoreBatteryOptimizations() async {
-    if (!Platform.isAndroid) {
+    if (!FerrisPlatform.isAndroid) {
       return;
     }
     try {

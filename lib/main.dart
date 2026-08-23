@@ -1,4 +1,5 @@
 import 'package:dynamic_color/dynamic_color.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:m3u8_downloader/src/app/app_localizations.dart';
@@ -12,10 +13,15 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await MediaStoreBridge.requestPermissions();
   final settings = await AppSettings.load();
-  try {
-    await RustLib.init();
-  } catch (error) {
-    debugPrint('RustLib.init() failed: $error');
+  // The Rust bridge only exists in native builds. On the web (WASM) the
+  // download engine talks to the FerrisLoad HTTP API instead, so skipping
+  // initialization here is expected and must not fail the app.
+  if (!kIsWeb) {
+    try {
+      await RustLib.init();
+    } catch (error) {
+      debugPrint('RustLib.init() failed: $error');
+    }
   }
   runApp(FerrisLoadApp(initialSettings: settings));
 }

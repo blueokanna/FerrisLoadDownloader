@@ -43,15 +43,40 @@ object MediaStoreHelper {
         }
 
         return try {
+            val safeName = sanitizeFileName(fileName)
+            val safeSubDir = sanitizeSubDir(subDir)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(context, srcFile, fileName, mimeType, subDir)
+                saveViaMediaStore(context, srcFile, safeName, mimeType, safeSubDir)
             } else {
-                saveViaDirectCopy(context, srcFile, fileName, subDir)
+                saveViaDirectCopy(context, srcFile, safeName, safeSubDir)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save file to Downloads: ${e.message}", e)
             null
         }
+    }
+
+    /**
+     * Strips path separators, reserved characters and control bytes from a
+     * caller-provided file name so it can never escape the destination
+     * directory (path traversal) or break MediaStore's display name.
+     */
+    private fun sanitizeFileName(fileName: String): String {
+        val cleaned = fileName
+            .replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1f]"), "_")
+            .trim('.', ' ')
+        return cleaned.ifEmpty { "video.mp4" }
+    }
+
+    /**
+     * Sanitizes a sub-directory name the same way, so `../..` or
+     * `foo/../../etc` cannot redirect the destination outside Downloads.
+     */
+    private fun sanitizeSubDir(subDir: String): String {
+        val cleaned = subDir
+            .replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1f]"), "_")
+            .trim('.', ' ')
+        return cleaned.ifEmpty { "FerrisLoad" }
     }
 
     /**
@@ -74,7 +99,9 @@ object MediaStoreHelper {
         return try {
             val dir = File(destDir)
             if (!dir.exists()) dir.mkdirs()
-            val destFile = File(dir, fileName)
+            // Defense in depth: never let a caller-provided file name escape
+            // the chosen directory (path traversal).
+            val destFile = File(dir, sanitizeFileName(fileName))
             srcFile.copyTo(destFile, overwrite = true)
             MediaScannerConnection.scanFile(
                 context,

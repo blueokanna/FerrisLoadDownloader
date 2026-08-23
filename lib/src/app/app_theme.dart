@@ -207,21 +207,24 @@ ThemeData buildAppTheme(
       filled: true,
       isDense: true,
       fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+      border: OutlineInputBorder(
+        borderRadius: FerrisShapes.standard.input,
+        borderSide: BorderSide.none,
+      ),
       enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: FerrisShapes.standard.input,
         borderSide: BorderSide(color: scheme.outlineVariant),
       ),
       focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: FerrisShapes.standard.input,
         borderSide: BorderSide(color: scheme.primary, width: 2),
       ),
       errorBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: FerrisShapes.standard.input,
         borderSide: BorderSide(color: scheme.error),
       ),
       focusedErrorBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: FerrisShapes.standard.input,
         borderSide: BorderSide(color: scheme.error, width: 2),
       ),
     ),
@@ -232,7 +235,9 @@ ThemeData buildAppTheme(
       surfaceTintColor: Colors.transparent,
       margin: EdgeInsets.zero,
       elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      shape: RoundedRectangleBorder(
+        borderRadius: FerrisShapes.standard.card,
+      ),
     ),
     filledButtonTheme: FilledButtonThemeData(
       style: FilledButton.styleFrom(
@@ -258,7 +263,9 @@ ThemeData buildAppTheme(
     segmentedButtonTheme: SegmentedButtonThemeData(
       style: ButtonStyle(
         shape: WidgetStatePropertyAll(
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          RoundedRectangleBorder(
+            borderRadius: FerrisShapes.standard.md,
+          ),
         ),
       ),
     ),
@@ -275,7 +282,9 @@ ThemeData buildAppTheme(
       behavior: SnackBarBehavior.floating,
       backgroundColor: scheme.surfaceContainerHigh,
       contentTextStyle: TextStyle(color: scheme.onSurface),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      shape: RoundedRectangleBorder(
+        borderRadius: FerrisShapes.standard.md,
+      ),
     ),
     bottomSheetTheme: BottomSheetThemeData(
       backgroundColor: scheme.surface,
@@ -288,7 +297,9 @@ ThemeData buildAppTheme(
     dialogTheme: DialogThemeData(
       backgroundColor: scheme.surface,
       surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      shape: RoundedRectangleBorder(
+        borderRadius: FerrisShapes.standard.xl,
+      ),
     ),
     navigationBarTheme: NavigationBarThemeData(
       backgroundColor: scheme.surface,
@@ -314,7 +325,9 @@ ThemeData buildAppTheme(
       tileColor: elevatedSurface.withValues(
         alpha: brightness == Brightness.dark ? 0.7 : 0.56,
       ),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      shape: RoundedRectangleBorder(
+        borderRadius: FerrisShapes.standard.md,
+      ),
     ),
     textSelectionTheme: TextSelectionThemeData(
       cursorColor: scheme.primary,
@@ -331,5 +344,172 @@ ThemeData buildAppTheme(
     dividerTheme: DividerThemeData(
       color: scheme.outlineVariant.withValues(alpha: 0.35),
     ),
+    extensions: [
+      FerrisShapes.standard,
+      FerrisSpacing.standard,
+    ],
   );
+}
+
+/// Material 3 shape tokens for this app, exposed as a `ThemeExtension` so
+/// every widget reads radii from the theme instead of hard-coding them.
+///
+/// Follows the Material 3 reference shape scale:
+///   xs=4, sm=8, md=12, lg=16, xl=28.
+@immutable
+class FerrisShapes extends ThemeExtension<FerrisShapes> {
+  const FerrisShapes({
+    required this.xs,
+    required this.sm,
+    required this.md,
+    required this.lg,
+    required this.xl,
+    required this.card,
+    required this.input,
+    required this.pill,
+  });
+
+  /// 4dp — small controls, progress rails, inline separators.
+  final BorderRadius xs;
+
+  /// 8dp — compact chips, list tiles, small surfaces.
+  final BorderRadius sm;
+
+  /// 12dp — text fields, medium surfaces, dialog internals.
+  final BorderRadius md;
+
+  /// 16dp — cards, bottom sheets, navigation drawers.
+  final BorderRadius lg;
+
+  /// 28dp — large containers, dialogs, sheets.
+  final BorderRadius xl;
+
+  /// Standard surface radius for app cards (16dp).
+  final BorderRadius card;
+
+  /// Radius for input fields / search surfaces (12dp).
+  final BorderRadius input;
+
+  /// Fully rounded (pill / stadium) shape.
+  final BorderRadius pill;
+
+  static const FerrisShapes standard = FerrisShapes(
+    xs: BorderRadius.all(Radius.circular(4)),
+    sm: BorderRadius.all(Radius.circular(8)),
+    md: BorderRadius.all(Radius.circular(12)),
+    lg: BorderRadius.all(Radius.circular(16)),
+    xl: BorderRadius.all(Radius.circular(28)),
+    card: BorderRadius.all(Radius.circular(16)),
+    input: BorderRadius.all(Radius.circular(12)),
+    pill: BorderRadius.all(Radius.circular(999)),
+  );
+
+  static FerrisShapes of(BuildContext context) =>
+      Theme.of(context).extension<FerrisShapes>() ?? standard;
+
+  @override
+  FerrisShapes copyWith({
+    BorderRadius? xs,
+    BorderRadius? sm,
+    BorderRadius? md,
+    BorderRadius? lg,
+    BorderRadius? xl,
+    BorderRadius? card,
+    BorderRadius? input,
+    BorderRadius? pill,
+  }) {
+    return FerrisShapes(
+      xs: xs ?? this.xs,
+      sm: sm ?? this.sm,
+      md: md ?? this.md,
+      lg: lg ?? this.lg,
+      xl: xl ?? this.xl,
+      card: card ?? this.card,
+      input: input ?? this.input,
+      pill: pill ?? this.pill,
+    );
+  }
+
+  @override
+  FerrisShapes lerp(FerrisShapes? other, double t) {
+    if (other == null) {
+      return this;
+    }
+    return FerrisShapes(
+      xs: BorderRadius.lerp(xs, other.xs, t)!,
+      sm: BorderRadius.lerp(sm, other.sm, t)!,
+      md: BorderRadius.lerp(md, other.md, t)!,
+      lg: BorderRadius.lerp(lg, other.lg, t)!,
+      xl: BorderRadius.lerp(xl, other.xl, t)!,
+      card: BorderRadius.lerp(card, other.card, t)!,
+      input: BorderRadius.lerp(input, other.input, t)!,
+      pill: BorderRadius.lerp(pill, other.pill, t)!,
+    );
+  }
+}
+
+/// Consistent spacing scale so surfaces, cards and stacks align everywhere.
+@immutable
+class FerrisSpacing extends ThemeExtension<FerrisSpacing> {
+  const FerrisSpacing({
+    required this.unit,
+    required this.xs,
+    required this.sm,
+    required this.md,
+    required this.lg,
+    required this.xl,
+  });
+
+  final double unit;
+  final double xs;
+  final double sm;
+  final double md;
+  final double lg;
+  final double xl;
+
+  static const FerrisSpacing standard = FerrisSpacing(
+    unit: 8,
+    xs: 4,
+    sm: 8,
+    md: 12,
+    lg: 16,
+    xl: 24,
+  );
+
+  static FerrisSpacing of(BuildContext context) =>
+      Theme.of(context).extension<FerrisSpacing>() ?? standard;
+
+  @override
+  FerrisSpacing copyWith({
+    double? unit,
+    double? xs,
+    double? sm,
+    double? md,
+    double? lg,
+    double? xl,
+  }) {
+    return FerrisSpacing(
+      unit: unit ?? this.unit,
+      xs: xs ?? this.xs,
+      sm: sm ?? this.sm,
+      md: md ?? this.md,
+      lg: lg ?? this.lg,
+      xl: xl ?? this.xl,
+    );
+  }
+
+  @override
+  FerrisSpacing lerp(FerrisSpacing? other, double t) {
+    if (other == null) {
+      return this;
+    }
+    return FerrisSpacing(
+      unit: unit + (other.unit - unit) * t,
+      xs: xs + (other.xs - xs) * t,
+      sm: sm + (other.sm - sm) * t,
+      md: md + (other.md - md) * t,
+      lg: lg + (other.lg - lg) * t,
+      xl: xl + (other.xl - xl) * t,
+    );
+  }
 }

@@ -106,9 +106,23 @@ docker run -p 3000:3000 \
 
 **API端点:**
 - `POST /download` - 开始下载任务
+- `POST /inspect` - 分析页面/直链，返回候选流列表（Web 端使用）
 - `GET /status/:task_id` - 查询下载状态
 - `GET /tasks` - 列出任务
 - `GET /health` - 健康检查
+
+**API 安全（强烈建议）：**
+
+- **SSRF 防护默认开启**：拒绝解析到内网/回环/链路本地地址的目标。需要从本地网络（如 NAS）下载时，加 `-e FERRISLOAD_ALLOW_PRIVATE_NETWORKS=1`。
+- **可选 Bearer 鉴权**：加 `-e FERRISLOAD_API_TOKEN=你的令牌` 后，除 `/health` 外的所有端点都要求 `Authorization: Bearer 你的令牌`，避免公开端口被滥用。
+
+```bash
+# 带鉴权的推荐启动方式
+docker run -p 3000:3000 \
+  -e FERRISLOAD_API_TOKEN=change-me \
+  -v $(pwd)/downloads:/app/downloads \
+  m3u8-downloader:api
+```
 
 **下载请求体示例:**
 ```json

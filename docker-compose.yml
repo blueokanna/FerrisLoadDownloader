@@ -39,6 +39,10 @@ services:
       - API_PORT=3000
       - DOWNLOAD_DIR=/app/downloads
       - RUST_LOG=info
+      # 可选：设置后所有端点（除 /health）需要 Authorization: Bearer <token>
+      # - FERRISLOAD_API_TOKEN=change-me
+      # 可选：设为 1 允许下载内网/回环地址（如 NAS 上的媒体服务器）
+      # - FERRISLOAD_ALLOW_PRIVATE_NETWORKS=1
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/health"]
       interval: 30s
