@@ -2,7 +2,7 @@
 name = "rust_lib_m3u8_downloader"
 version = "0.1.3"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 license-file = "../LICENSE"
 authors = ["blueokanna"]
 description = "FerrisLoad application runtime and Flutter bridge"

@@ -39,7 +39,7 @@ jobs:
           cache: true
 
       - name: Setup Rust MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Validate Rust MSRV and no_std core
         working-directory: rust
