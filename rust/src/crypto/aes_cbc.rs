@@ -185,8 +185,8 @@ mod tests {
             .expect("iv must be 16 bytes")
             .to_owned();
         let mut out = Vec::with_capacity(plaintext.len());
-        for block in plaintext.chunks_exact(16) {
-            let mut block = *<&[u8; 16]>::try_from(block).expect("block");
+        for block in plaintext.as_chunks::<16>().0 {
+            let mut block = *block;
             for (b, p) in block.iter_mut().zip(previous.iter()) {
                 *b ^= p;
             }
