@@ -81,10 +81,10 @@ enum TranscoderKind {
     IosVideoToolbox,
 }
 
-/// FFI into the native iOS transcoder (`ios/Runner/VideoToolboxBridge.m`).
-///
-/// The symbols are provided by the Runner app target, which links the Rust
-/// static library; they only exist on iOS, hence the `cfg` gate.
+// FFI into the native iOS transcoder (`ios/Runner/VideoToolboxBridge.m`).
+//
+// The symbols are provided by the Runner app target, which links the Rust
+// static library; they only exist on iOS, hence the `cfg` gate.
 #[cfg(target_os = "ios")]
 extern "C" {
     fn ferrisload_videotoolbox_available() -> i32;
@@ -118,6 +118,13 @@ mod ios_videotoolbox {
     use std::time::Duration;
 
     use anyhow::{anyhow, Context, Result};
+
+    // The `extern "C"` items live in the parent module; bring them into scope
+    // explicitly (they do not resolve through parent-module lookup).
+    use super::{
+        ferrisload_videotoolbox_available, ferrisload_videotoolbox_mux,
+        ferrisload_videotoolbox_transcode,
+    };
 
     const ERROR_BUF_LEN: usize = 512;
 
@@ -4187,6 +4194,8 @@ fn merge_media_streams(
         return Ok(());
     }
 
+    // iOS always returns above; the FFmpeg path below serves Android/desktop.
+    #[cfg_attr(target_os = "ios", allow(unreachable_code))]
     let ffmpeg_path = resolve_ffmpeg_path()
         .ok_or_else(|| anyhow!("FFmpeg is required to merge separated audio and video streams"))?;
 
