@@ -485,13 +485,15 @@ jobs:
         shell: bash
         run: |
           set +e
-          flutter build ios --release --no-codesign > /tmp/ios_build.log 2>&1
+          # -v (verbose) is REQUIRED: without it flutter swallows the
+          # xcodebuild details and only prints "linker command failed".
+          flutter build ios --release --no-codesign -v > /tmp/ios_build.log 2>&1
           status=$?
           if [ "$status" -ne 0 ]; then
             echo "===== LINKER / UNDEFINED SYMBOLS ====="
-            grep -n -E "Undefined symbols|referenced from|ld: |framework .*not found|library not found|duplicate symbol|clang: error|error:" /tmp/ios_build.log | head -120 || true
-            echo "===== LAST 80 LINES OF BUILD LOG ====="
-            tail -n 80 /tmp/ios_build.log || true
+            grep -n -E "Undefined symbols|referenced from|ld: |framework .*not found|library not found|duplicate symbol|clang: error|error:" /tmp/ios_build.log | head -160 || true
+            echo "===== LAST 120 LINES OF BUILD LOG ====="
+            tail -n 120 /tmp/ios_build.log || true
           else
             tail -n 10 /tmp/ios_build.log || true
           fi
