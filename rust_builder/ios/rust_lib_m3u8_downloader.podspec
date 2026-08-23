@@ -40,12 +40,6 @@ A new Flutter FFI plugin project.
     'DEFINES_MODULE' => 'YES',
     # Flutter.framework does not contain a i386 slice.
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    # The Rust static library references system frameworks (Security for ring,
-    # CoreFoundation/SystemConfiguration for std) and possibly libc++ for C++
-    # runtime symbols. `-force_load` does not propagate cargo's `#[link]`
-    # directives to the app, so link them explicitly here. Note: there is NO
-    # linkable `os_log.framework` on Apple platforms - os_log symbols are
-    # provided by the system's libsystem_trace, so it must NOT be added here.
-    'OTHER_LDFLAGS' => '-force_load ${BUILT_PRODUCTS_DIR}/librust_lib_m3u8_downloader.a -lc++ -framework Security -framework SystemConfiguration -framework CoreFoundation',
+    'OTHER_LDFLAGS' => '-force_load ${BUILT_PRODUCTS_DIR}/librust_lib_m3u8_downloader.a -lc++ -lz -liconv -lresolv -framework Security -framework SystemConfiguration -framework CoreFoundation -framework CFNetwork',
   }
 end
