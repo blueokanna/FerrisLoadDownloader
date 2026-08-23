@@ -53,6 +53,10 @@ android_logger = "0.15.1"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 
+[features]
+api-server = []
+
 [[bin]]
 name = "m3u8_api_server"
 path = "src/bin/m3u8_api_server.rs"
+required-features = ["api-server"]

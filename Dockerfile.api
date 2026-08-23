@@ -19,11 +19,11 @@ RUN mkdir -p rust/src/bin rust/src/api \
     && printf '// cache warm-up\n' > rust/src/download_service.rs \
     && printf 'fn main() {}\n' > rust/src/bin/m3u8_api_server.rs \
     && printf '// build cache warm-up\n' > rust/src/frb_generated.rs \
-    && cargo build --manifest-path rust/Cargo.toml --release --locked --bin m3u8_api_server \
+    && cargo build --manifest-path rust/Cargo.toml --release --locked --features api-server --bin m3u8_api_server \
     && rm -rf rust/src
 
 COPY rust/src ./rust/src
-RUN cargo build --manifest-path rust/Cargo.toml --release --locked --bin m3u8_api_server
+RUN cargo build --manifest-path rust/Cargo.toml --release --locked --features api-server --bin m3u8_api_server
 
 FROM debian:bookworm-slim
 
