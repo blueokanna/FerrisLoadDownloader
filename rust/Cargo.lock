@@ -250,9 +250,7 @@ dependencies = [
 
 [[package]]
 name = "courierust"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2f6477e861bda6ac5cb23b1937bee64c962d47fc2d6a23686f02c92c498e48"
+version = "1.0.4"
 
 [[package]]
 name = "crc32fast"

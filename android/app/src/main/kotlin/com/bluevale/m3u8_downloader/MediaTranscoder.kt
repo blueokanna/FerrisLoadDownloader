@@ -899,10 +899,24 @@ object MediaTranscoder {
     }
 
     /**
-     * Rejects outputs that are significantly shorter than the duration expected from the HLS
-     * playlist. Android's MediaExtractor can silently stop early when reading naively-concatenated
-     * TS segments (timestamp discontinuities), which previously produced a "successful" output
-     * containing only the first few seconds after all the download traffic was already spent. When
+     * Rejects outputs whose duration is wrong versus what the HLS playlist
+     * promised. Two failure shapes are caught:
+     *
+     *  1. Catastrophic truncation — Android's MediaExtractor can silently stop
+     *     early when reading a naively-concatenated TS (timestamp
+     *     discontinuities), which used to produce a "successful" output
+     *     containing only the first few seconds after all download traffic was
+     *     already spent.
+     *  2. Timeline inflation — an encoder that re-times Surface input can
+     *     stretch the output (the "30 min becomes 60 min" failure), which is
+     *     just as wrong as a truncated one.
+     *
+     * The expected value is the SUM of the playlist EXTINF tags, and EXTINF is
+     * rounded UP per segment, so the real media is routinely a few seconds to
+     * a couple of minutes SHORTER than the sum for long streams (hundreds of
+     * segments). The lower bound therefore only rejects losing a significant
+     * fraction of the content (>= 20%), never a benign shortfall — otherwise a
+     * correct long download would be rejected and needlessly re-encoded. When
      * the expected duration is unknown (0) this check is skipped.
      */
     private fun verifyDuration(path: String, expectedMs: Long, what: String): Boolean {
@@ -936,7 +950,10 @@ object MediaTranscoder {
                     future.shutdownNow()
                 }
         if (actualMs <= 0) return true // cannot determine; do not block on it
-        val minTolerance = (expectedMs * 85L / 100L).coerceAtLeast(expectedMs - 5000L)
+        // 80% floor, or at worst 2 minutes short of the EXTINF sum for long
+        // content (tolerates per-segment EXTINF round-up + trailing partial
+        // segment); still catches the "only first few seconds" truncation.
+        val minTolerance = (expectedMs * 80L / 100L).coerceAtLeast(expectedMs - 120_000L)
         if (actualMs + 1000L < minTolerance) {
             Log.e(TAG, "$what duration check failed: expected≈${expectedMs}ms got ${actualMs}ms")
             return false

@@ -34,7 +34,7 @@ tzcraft = { version = "0.1.2", default-features = false, features = [
     "std",
     "serde",
 ] }
-courierust = { version = "1.0.4", path = "../courierust", default-features = false, features = [
+courierust = { version = "1.0.4", path = "../../Courierust", default-features = false, features = [
     "std",
 ] }
 ureq = { version = "3.4.0", default-features = false, features = [
