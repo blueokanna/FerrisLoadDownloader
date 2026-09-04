@@ -24,7 +24,7 @@ rust/           Rust core
   src/api_server/  optional HTTP API (Docker)
   src/crypto/   self-contained AES-128-CBC and SHA-256
   src/hls.rs    self-contained HLS playlist parser (resource-bounded)
-  src/net.rs    synchronous HTTP client (courierust, Mozilla roots; single TLS stack)
+  src/net.rs    synchronous HTTP client (courierust primary; rustls/ureq fallback for hosts the bespoke TLS stack cannot handshake with)
 android/        Android host: MediaCodec transcoder, MediaStore export, foreground service
 ```
 
@@ -90,7 +90,7 @@ docker run --rm -p 3000:3000 -e DOWNLOAD_DIR=/app/downloads \
 - Only `http/https` targets; scheme allow-lists at both the network and parsing layers (SSRF / local-file protection).
 - Custom request headers are validated against CR/LF injection; cookies and other credentials live in memory only, never on disk.
 - HLS keys and DASH segment URLs are forced to `http/https` as well.
-- TLS verification is always on; `courierust` 1.0.3 natively verifies P-256/P-384 certificate chains, so no second rustls-backed stack is needed.
+- TLS verification is always on. The primary engine is `courierust`; hosts whose certificate chains or TLS 1.3 signature schemes its bespoke stack rejects (a stricter verifier than rustls on some real-world deployments) automatically fall back to a rustls-backed engine, so a verifier quirk can never block a download.
 - Output file names are sanitized against path traversal.
 - Download only content you own or are authorized to access.
 

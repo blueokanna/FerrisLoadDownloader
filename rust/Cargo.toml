@@ -34,7 +34,13 @@ tzcraft = { version = "0.1.2", default-features = false, features = [
     "std",
     "serde",
 ] }
-courierust = "1.0.3"
+courierust = { version = "1.0.4", path = "../courierust", default-features = false, features = [
+    "std",
+] }
+ureq = { version = "3.4.0", default-features = false, features = [
+    "rustls",
+    "gzip",
+] }
 webpki-root-certs = "1.0.9"
 url = "2.5.8"
 dashmap = "6.2.1"

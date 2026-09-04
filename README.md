@@ -24,7 +24,7 @@ rust/           Rust 核心
   src/api_server/ 可选的 HTTP API 服务（Docker）
   src/crypto/   自研 AES-128-CBC 与 SHA-256（依赖标准库）
   src/hls.rs    自研 HLS 播放列表解析器（带资源上限）
-  src/net.rs    同步 HTTP 客户端（courierust，Mozilla 根证书；单一 TLS 栈）
+  src/net.rs    同步 HTTP 客户端（courierust 主引擎；rustls/ureq 后备，覆盖自研 TLS 栈握手不了的主机）
 android/        Android 宿主：MediaCodec 转码器、MediaStore 导出、前台服务
 ```
 
@@ -123,7 +123,7 @@ CI（GitHub Actions）会构建并推送 `linux/amd64`、`linux/arm64`、`linux/
 - 只允许 `http/https` 目标，网络层与解析层都有 scheme 白名单（防 SSRF / 本地文件读取）。
 - 自定义请求头做了 CR/LF 注入校验；Cookie 等凭据只在内存里，不落盘。
 - HLS 密钥、DASH 片段 URL 同样强制 `http/https`。
-- TLS 校验默认全开；`courierust` 1.0.3 原生支持 P-256 / P-384 证书链验签，不再需要第二套 rustls 后备栈。
+- TLS 校验默认全开。主引擎是 `courierust`；其自研 TLS 栈对某些真实部署的证书链 / TLS 1.3 签名算法校验比 rustls 更严格而拒绝时，会自动降级到 rustls 后备引擎——校验器的兼容性缺陷不会卡住任何下载。
 - 输出文件名做了路径穿越消毒。
 - Web 端把会话凭据转给 API 服务时，非本机地址强制 HTTPS（`ApiDownloadEngine` 传输安全校验）。
 - CI 每天/每次提交跑安全扫描：`cargo audit`（Rust 漏洞）、`flutter pub outdated`（Dart 依赖）、Trivy（容器漏洞 + 密钥 + 配置错误）。
