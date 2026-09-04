@@ -11,8 +11,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 
 /**
- * 前台服务：保持下载/转码在后台运行，不被系统杀死。
- * 同时持有 WakeLock 防止 CPU 休眠。
+ * Keeps download/transcode alive in the background; holds a WakeLock so
+ * CPU sleep cannot kill long-running jobs.
  */
 class DownloadForegroundService : Service() {
 
@@ -113,7 +113,7 @@ class DownloadForegroundService : Service() {
             wakeLock = pm.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "FerrisLoad::DownloadWakeLock"
-            ).apply { acquire(4 * 60 * 60 * 1000L) } // 最长 4 小时
+            ).apply { acquire(4 * 60 * 60 * 1000L) } // up to 4 h
             Log.i(TAG, "WakeLock acquired")
         }
     }

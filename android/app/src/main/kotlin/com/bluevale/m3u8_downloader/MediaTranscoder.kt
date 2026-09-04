@@ -53,18 +53,7 @@ object MediaTranscoder {
                 .toString()
     }
 
-    private const val TIMEOUT_US = 10_000L // 10ms per poll
     private const val MAX_STALL_MS = 30_000L // 30s stall → abort
-
-    // PTS re-basing threshold. MediaExtractor yields samples in DECODE order,
-    // so H.264/HEVC streams with B-frames legitimately step BACKWARD by a few
-    // frame periods inside every GOP. Re-basing on every backward step (the
-    // old `<= lastPts` test) rewrote the whole timeline of B-frame content:
-    // stretched duration, duplicated/lost timestamps, wrong effective fps.
-    // Only treat a backward jump bigger than this as a real discontinuity (an
-    // HLS/TS segment resetting its PTS back to ~0), which is always
-    // seconds-scale, never a sub-second B-frame reorder.
-    private const val PTS_REBASE_THRESHOLD_US = 500_000L // 500 ms
 
     private data class EncoderSession(val codec: MediaCodec, val surface: Surface)
 
@@ -95,8 +84,9 @@ object MediaTranscoder {
                 return false
             }
 
-            // 1) 尝试 remux（仅在不需要重新编码时）
-            if (vBitrate <= 0 && aBitrate <= 0) {
+            // 1) Try remux first (only when no re-encode is requested and the
+            //    stream is B-frame free; see `videoNeedsReencode`).
+            if (vBitrate <= 0 && aBitrate <= 0 && !videoNeedsReencode(inputPath)) {
                 val remuxOk = tryRemux(inputPath, outputPath)
                 if (remuxOk &&
                                 verifyOutput(outputPath) &&
@@ -105,7 +95,7 @@ object MediaTranscoder {
                     Log.i(TAG, "✅ Remux succeeded: ${File(outputPath).length()} bytes")
                     return true
                 }
-                // remux 失败、输出为空或时长被截断，清理后 fall through
+                // Remux failed/empty/truncated; clean up and fall through.
                 File(outputPath).delete()
                 Log.w(
                         TAG,
@@ -113,7 +103,7 @@ object MediaTranscoder {
                 )
             }
 
-            // 2) 硬件转码
+            // 2) Hardware transcode.
             val hwOk = hardwareTranscode(inputPath, outputPath, vBitrate, aBitrate)
             if (hwOk &&
                             verifyOutput(outputPath) &&
@@ -234,9 +224,23 @@ object MediaTranscoder {
             return false
         }
 
-        // 1) Stream-copy remux of every segment (preferred when no re-encode).
-        if (vBitrate <= 0 && aBitrate <= 0) {
-            val remuxOk = remuxSegments(segmentDir, prefix, total, outputPath)
+        // 1) Stream-copy remux of every segment. MediaMuxer (API 25+) writes a
+        //    proper ctts table when the video samples are fed in decode order
+        //    with their REAL (B-frame swinging) PTS, so even B-frame content
+        //    can be remuxed losslessly and at disk speed. Only when that is
+        //    impossible (old API, or the muxer rejects the stream) do we fall
+        //    back to hardware re-encoding.
+        val hasBframes = segmentVideoNeedsReencode(segmentDir, prefix, total)
+        val canMuxBframes = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1
+        if (vBitrate <= 0 && aBitrate <= 0 && (!hasBframes || canMuxBframes)) {
+            val remuxOk =
+                    remuxSegments(
+                            segmentDir,
+                            prefix,
+                            total,
+                            outputPath,
+                            allowBframes = hasBframes && canMuxBframes
+                    )
             if (remuxOk &&
                             verifyOutput(outputPath) &&
                             verifyDuration(outputPath, expectedDurationMs, "remux")
@@ -296,6 +300,16 @@ object MediaTranscoder {
             return false
         }
 
+        val hasBframes = segmentVideoNeedsReencode(videoDir, videoPrefix, videoTotal)
+        if (hasBframes && Build.VERSION.SDK_INT < Build.VERSION_CODES.N_MR1) {
+            Log.w(
+                    TAG,
+                    "muxDirs: video stream uses B-frames and the platform is pre-API-25; " +
+                            "stream copy is not possible, returning failure"
+            )
+            return false
+        }
+
         return try {
             val ok =
                     remuxDirs(
@@ -305,7 +319,8 @@ object MediaTranscoder {
                             audioDir,
                             audioPrefix,
                             audioTotal,
-                            outputPath
+                            outputPath,
+                            allowBframes = hasBframes
                     ) &&
                             verifyOutput(outputPath) &&
                             verifyDuration(outputPath, expectedDurationMs, "mux")
@@ -348,7 +363,9 @@ object MediaTranscoder {
             var lastPts = Long.MIN_VALUE
             var frames = 0
             val scratch = ByteBuffer.allocateDirect(4 * 1024 * 1024)
-            while (true) {
+            // A constant frame rate only needs a short sampling window;
+            // scanning a whole long input just to measure fps wastes I/O.
+            while (frames < 900) {
                 val sz = ext.readSampleData(scratch, 0)
                 if (sz < 0) break
                 val pts = ext.sampleTime
@@ -376,11 +393,103 @@ object MediaTranscoder {
     }
 
     /**
+     * Maps decode-order source PTS into a continuous feed timeline.
+     *
+     * A B-frame stream stores samples in decode order, so consecutive
+     * sampleTime values legitimately step backward inside each GOP. The
+     * decoder reorders to presentation order by itself, and it needs every
+     * frame's REAL PTS to do that; forcing a synthetic monotonic timeline
+     * makes the reordered Surface timestamps go backward and GraphicBufferSource
+     * drops the frames (the "going backward in time" flood). Only a large
+     * backward jump (> 500 ms) means a fresh segment whose PTS restarted;
+     * that segment is lifted so the overall timeline stays continuous.
+     */
+    private class DecoderPtsTimeline {
+        private var offsetUs = 0L
+        private var maxFedUs = Long.MIN_VALUE
+
+        fun next(rawUs: Long): Long {
+            val raw = if (rawUs < 0) 0L else rawUs
+            if (maxFedUs != Long.MIN_VALUE &&
+                    raw + offsetUs < maxFedUs - SEGMENT_RESET_US
+            ) {
+                offsetUs = maxFedUs - raw
+            }
+            val fed = raw + offsetUs
+            if (fed > maxFedUs) maxFedUs = fed
+            return fed
+        }
+
+        companion object {
+            private const val SEGMENT_RESET_US = 500_000L
+        }
+    }
+
+    /**
+     * True when the video stream in `path` cannot be losslessly stream-copied
+     * into an MP4. A backward PTS step between consecutive decode-order
+     * samples means the stream uses B-frame reordering; Android's MediaMuxer
+     * cannot represent that (it drops non-monotonic samples, or inflates the
+     * timeline when they are forced monotonic), so such content must be
+     * re-encoded into a B-frame-free stream instead of remuxed.
+     */
+    private fun videoNeedsReencode(path: String): Boolean {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(path)
+            val videoIdx = findTrackIdx(extractor, true)
+            if (videoIdx < 0) return false
+            extractor.selectTrack(videoIdx)
+            var previousPts = Long.MIN_VALUE
+            var seen = 0
+            // Walk decode order only (no sample data is copied). 20k samples
+            // (~11 min at 30 fps) is far beyond where B-frames can first appear.
+            while (seen < 20_000) {
+                val pts = extractor.sampleTime
+                if (seen > 0 && pts < previousPts) {
+                    Log.i(TAG, "videoNeedsReencode: B-frame reorder at sample $seen")
+                    return true
+                }
+                previousPts = pts
+                seen++
+                if (!extractor.advance()) break
+            }
+            return false
+        } catch (e: Exception) {
+            Log.w(TAG, "videoNeedsReencode probe failed: ${e.message}")
+            return false
+        } finally {
+            extractor.release()
+        }
+    }
+
+    /**
+     * Runs [videoNeedsReencode] over every segment. B-frames may start well
+     * after the first few segments; a mid-stream remux failure would waste an
+     * entire copy pass before falling back, so probe the whole set up front.
+     * The probe only walks sample timestamps (no data copy), which is cheap.
+     */
+    private fun segmentVideoNeedsReencode(dir: String, prefix: String, total: Int): Boolean {
+        for (i in 0 until total) {
+            val path = segmentPath(dir, prefix, i)
+            if (!File(path).exists()) continue
+            if (videoNeedsReencode(path)) return true
+        }
+        return false
+    }
+
+    /**
      * Stream-copy remux of one stream across all segments into `muxer`'s `dstIdx` track. Every
      * segment is opened with its own extractor and the PTS timeline is re-based continuously across
      * segment boundaries, so a per-segment PTS reset can never make the output non-monotonic. A
      * corrupt/unreadable segment is skipped rather than aborting the whole download (the duration
      * check still catches severe truncation).
+     *
+     * When `preserveBframes` is true (video tracks that contain B-frames, API 25+), each sample is
+     * fed with its REAL decode-order PTS (only whole segments whose PTS restarted are lifted).
+     * MediaMuxer then writes a proper ctts table and the B-frames stay lossless — this is the
+     * disk-speed path that avoids re-encoding entirely. Audio tracks are always flattened (their
+     * PTS must be strictly monotonic for the MP4 writer).
      */
     private fun writeSegmentTrack(
             segmentDir: String,
@@ -388,7 +497,8 @@ object MediaTranscoder {
             total: Int,
             video: Boolean,
             dstIdx: Int,
-            muxer: MediaMuxer
+            muxer: MediaMuxer,
+            preserveBframes: Boolean = false
     ): Int {
         val buf = ByteBuffer.allocateDirect(8 * 1024 * 1024)
         val info = MediaCodec.BufferInfo()
@@ -396,6 +506,24 @@ object MediaTranscoder {
         var ptsOffset = 0L
         var firstPts = -1L
         var samples = 0
+        val bframeTimeline = DecoderPtsTimeline()
+        // Map a source PTS to the PTS handed to the muxer. B-frame video keeps
+        // its real (swinging) decode-order PTS so MediaMuxer can emit ctts;
+        // everything else is clamped to a strictly monotonic timeline.
+        val mapPts: (Long) -> Long =
+                if (video && preserveBframes) {
+                    { raw -> bframeTimeline.next(raw) }
+                } else {
+                    { raw ->
+                        var adjusted = raw + ptsOffset
+                        if (adjusted <= lastPts) {
+                            ptsOffset += (lastPts - adjusted) + 1L
+                            adjusted = raw + ptsOffset
+                        }
+                        lastPts = adjusted
+                        adjusted
+                    }
+                }
         for (i in 0 until total) {
             val ext = MediaExtractor()
             try {
@@ -414,18 +542,12 @@ object MediaTranscoder {
                     if (sz < 0) break
                     info.offset = 0
                     info.size = sz
-                    val rawPts = ext.sampleTime
-                    var adjustedPts = rawPts + ptsOffset
-                    if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
-                        ptsOffset += (lastPts - adjustedPts) + 1L
-                        adjustedPts = rawPts + ptsOffset
-                    }
-                    lastPts = adjustedPts
-                    info.presentationTimeUs = adjustedPts
+                    val mappedPts = mapPts(ext.sampleTime)
+                    info.presentationTimeUs = mappedPts
                     info.flags = ext.sampleFlags
                     // Zero-base each track like the encoder output so audio
                     // and video stay aligned regardless of source PTS origin.
-                    if (firstPts < 0) firstPts = info.presentationTimeUs
+                    if (firstPts < 0) firstPts = mappedPts
                     if (firstPts > 0) info.presentationTimeUs -= firstPts
                     if (info.presentationTimeUs < 0) info.presentationTimeUs = 0
                     muxer.writeSampleData(dstIdx, buf, info)
@@ -446,7 +568,8 @@ object MediaTranscoder {
             segmentDir: String,
             prefix: String,
             total: Int,
-            outputPath: String
+            outputPath: String,
+            allowBframes: Boolean = false
     ): Boolean {
         val firstPath = segmentPath(segmentDir, prefix, 0)
         var probe: MediaExtractor? = null
@@ -485,7 +608,15 @@ object MediaTranscoder {
 
                 muxer.start()
                 val videoSamples =
-                        writeSegmentTrack(segmentDir, prefix, total, true, vOutIdx, muxer)
+                        writeSegmentTrack(
+                                segmentDir,
+                                prefix,
+                                total,
+                                true,
+                                vOutIdx,
+                                muxer,
+                                preserveBframes = allowBframes
+                        )
                 var audioSamples = 0
                 if (audioIdx >= 0 && aOutIdx >= 0) {
                     audioSamples =
@@ -513,7 +644,8 @@ object MediaTranscoder {
             audioDir: String,
             audioPrefix: String,
             audioTotal: Int,
-            outputPath: String
+            outputPath: String,
+            allowBframes: Boolean = false
     ): Boolean {
         val vFirst = segmentPath(videoDir, videoPrefix, 0)
         val aFirst = segmentPath(audioDir, audioPrefix, 0)
@@ -552,7 +684,15 @@ object MediaTranscoder {
 
                 muxer.start()
                 val videoSamples =
-                        writeSegmentTrack(videoDir, videoPrefix, videoTotal, true, vOutIdx, muxer)
+                        writeSegmentTrack(
+                                videoDir,
+                                videoPrefix,
+                                videoTotal,
+                                true,
+                                vOutIdx,
+                                muxer,
+                                preserveBframes = allowBframes
+                        )
                 val audioSamples =
                         writeSegmentTrack(audioDir, audioPrefix, audioTotal, false, aOutIdx, muxer)
                 muxer.stop()
@@ -621,39 +761,9 @@ object MediaTranscoder {
                             return false
                         }
                     } else {
-                        val estimated = w.toLong() * h * fps * 7L / 100L
-                        estimated.coerceIn(800_000L, 16_000_000L).toInt()
+                        defaultVideoBitrate(w, h, fps)
                     }
-            val encFmt =
-                    MediaFormat.createVideoFormat("video/avc", w, h).apply {
-                        setInteger(
-                                MediaFormat.KEY_COLOR_FORMAT,
-                                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-                        )
-                        setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
-                        setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                        // `KEY_OPERATING_RATE` is documented in *frames per
-                        // second* (not µs): asking for `fps * 1000` (e.g.
-                        // 30_000 fps for 30 fps content) confuses the codec's
-                        // rate scheduler and can make it re-time the output
-                        // timeline.  Pass the real rate only.
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-                        }
-                        // Deliberately do NOT set KEY_PRIORITY=0 (realtime).
-                        // This is an offline batch transcode fed as fast as the
-                        // hardware can consume it; realtime priority makes some
-                        // vendor encoders pace output against the wall clock
-                        // instead of the input timestamps, which stretches the
-                        // timeline (the source of “30 min becomes 60 min” and
-                        // “30 fps plays at ~15 fps” reports).  The default
-                        // non-realtime priority lets the encoder honor input
-                        // presentation timestamps.
-                        // No B-frames: lower encode latency and simpler decode on
-                        // low-end players; most AVC hardware encoders default to 0.
-                        setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                    }
+            val encFmt = createAvcEncodeFormat(w, h, fps, targetBitrate)
             val encoderSession = createAvcEncoder(encFmt, w, h, fps, targetBitrate)
             if (encoderSession == null) {
                 Log.e(TAG, "No AVC encoder (hardware or software) is available on this device")
@@ -703,24 +813,36 @@ object MediaTranscoder {
             var frames = 0
             var firstVideoPts = -1L
             var lastProgressMs = System.currentTimeMillis()
-            var lastVideoDecodePts = Long.MIN_VALUE
-            var videoPtsOffset = 0L
             var segmentIndex = 0
+            val ptsTimeline = DecoderPtsTimeline()
 
             val decInfo = MediaCodec.BufferInfo()
             val encInfo = MediaCodec.BufferInfo()
 
+            // Main pump: each iteration feeds every free decoder input buffer
+            // and drains every ready decoder/encoder output buffer, so the
+            // hardware codecs stay saturated and the loop only blocks when
+            // nothing is ready (no CPU spin). Feed PTS is the source PTS
+            // unchanged: B-frame streams store samples in decode order whose
+            // PTS steps backward inside each GOP, but the decoder reorders to
+            // presentation order and needs the REAL PTS to do that. A
+            // synthetic monotonic timeline made the reordered Surface
+            // timestamps go backward, which GraphicBufferSource then dropped.
             while (!encoderDone) {
-                // ── 1. Feed decoder across segments (continuous PTS) ──
+                var progressed = false
+
+                // ── 1. Feed decoder across segments until input queue full ──
                 if (!inputDone) {
-                    val idx = decoder.dequeueInputBuffer(TIMEOUT_US)
-                    if (idx >= 0) {
+                    while (true) {
+                        val feedIdx = decoder.dequeueInputBuffer(0)
+                        if (feedIdx < 0) break
+                        progressed = true
                         var fed = false
                         while (!fed) {
                             if (currentExtractor == null) {
                                 if (segmentIndex >= total) {
                                     decoder.queueInputBuffer(
-                                            idx,
+                                            feedIdx,
                                             0,
                                             0,
                                             0,
@@ -748,82 +870,101 @@ object MediaTranscoder {
                                 }
                             }
                             val ext = currentExtractor!!
-                            val buf = decoder.getInputBuffer(idx)!!
+                            val buf = decoder.getInputBuffer(feedIdx)!!
                             val sz = ext.readSampleData(buf, 0)
                             if (sz < 0) {
                                 ext.release()
                                 currentExtractor = null
                                 continue // exhausted: continue with next segment
                             }
-                            val rawPts = ext.sampleTime
-                            var adjustedPts = rawPts + videoPtsOffset
-                            if (adjustedPts < lastVideoDecodePts - PTS_REBASE_THRESHOLD_US) {
-                                videoPtsOffset += (lastVideoDecodePts - adjustedPts) + 1L
-                                adjustedPts = rawPts + videoPtsOffset
-                            }
-                            lastVideoDecodePts = adjustedPts
-                            decoder.queueInputBuffer(idx, 0, sz, adjustedPts, 0)
+                            decoder.queueInputBuffer(
+                                    feedIdx,
+                                    0,
+                                    sz,
+                                    ptsTimeline.next(ext.sampleTime),
+                                    0
+                            )
                             ext.advance()
                             fed = true
                         }
-                        lastProgressMs = System.currentTimeMillis()
+                        if (inputDone) break
                     }
+                    if (progressed) lastProgressMs = System.currentTimeMillis()
                 }
 
-                // ── 2. Drain decoder → Surface ──
+                // ── 2. Drain every ready decoder output → Surface ──
                 if (!decoderDone) {
-                    val idx = decoder.dequeueOutputBuffer(decInfo, TIMEOUT_US)
-                    if (idx >= 0) {
+                    while (true) {
+                        val drainIdx = decoder.dequeueOutputBuffer(decInfo, 0)
+                        if (drainIdx == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                        if (drainIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
+                        if (drainIdx < 0) break
+                        progressed = true
                         lastProgressMs = System.currentTimeMillis()
                         val eos = (decInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                        decoder.releaseOutputBuffer(idx, !eos)
+                        decoder.releaseOutputBuffer(drainIdx, !eos)
                         if (eos) {
                             decoderDone = true
                             encoder.signalEndOfInputStream()
+                            break
                         }
                     }
                 }
 
-                // ── 3. Drain encoder ──
-                val idx = encoder.dequeueOutputBuffer(encInfo, TIMEOUT_US)
-                when {
-                    idx >= 0 -> {
-                        lastProgressMs = System.currentTimeMillis()
-                        val data = encoder.getOutputBuffer(idx)!!
-                        if (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            encInfo.size = 0
-                        }
-                        if (encInfo.size > 0) {
-                            if (!muxerStarted) {
-                                videoMuxIdx = muxer.addTrack(encoder.outputFormat)
-                                muxer.start()
-                                muxerStarted = true
-                            }
-                            if (firstVideoPts < 0) {
-                                firstVideoPts = encInfo.presentationTimeUs
-                            }
-                            if (firstVideoPts > 0) {
-                                encInfo.presentationTimeUs -= firstVideoPts
-                            }
-                            if (encInfo.presentationTimeUs < 0) {
-                                encInfo.presentationTimeUs = 0
-                            }
-                            data.position(encInfo.offset)
-                            data.limit(encInfo.offset + encInfo.size)
-                            muxer.writeSampleData(videoMuxIdx, data, encInfo)
-                            frames++
-                        }
-                        encoder.releaseOutputBuffer(idx, false)
-                        if (encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                            encoderDone = true
-                        }
-                    }
-                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                // ── 3. Drain every ready encoder output → muxer ──
+                while (true) {
+                    val outIdx = encoder.dequeueOutputBuffer(encInfo, 0)
+                    if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                    if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (!muxerStarted) {
                             videoMuxIdx = muxer.addTrack(encoder.outputFormat)
                             muxer.start()
                             muxerStarted = true
                         }
+                        continue
+                    }
+                    if (outIdx < 0) break
+                    progressed = true
+                    lastProgressMs = System.currentTimeMillis()
+                    val data = encoder.getOutputBuffer(outIdx)!!
+                    if (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        encInfo.size = 0
+                    }
+                    if (encInfo.size > 0) {
+                        if (!muxerStarted) {
+                            videoMuxIdx = muxer.addTrack(encoder.outputFormat)
+                            muxer.start()
+                            muxerStarted = true
+                        }
+                        if (firstVideoPts < 0) {
+                            firstVideoPts = encInfo.presentationTimeUs
+                        }
+                        if (firstVideoPts > 0) {
+                            encInfo.presentationTimeUs -= firstVideoPts
+                        }
+                        if (encInfo.presentationTimeUs < 0) {
+                            encInfo.presentationTimeUs = 0
+                        }
+                        data.position(encInfo.offset)
+                        data.limit(encInfo.offset + encInfo.size)
+                        muxer.writeSampleData(videoMuxIdx, data, encInfo)
+                        frames++
+                    }
+                    encoder.releaseOutputBuffer(outIdx, false)
+                    if (encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        encoderDone = true
+                        break
+                    }
+                }
+
+                // Nothing was ready this pass (codecs still busy): yield the
+                // CPU briefly instead of spinning, then poll again.
+                if (!progressed && !encoderDone) {
+                    try {
+                        Thread.sleep(1L)
+                    } catch (ignored: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
                     }
                 }
 
@@ -900,7 +1041,7 @@ object MediaTranscoder {
 
     /**
      * Rejects outputs whose duration is wrong versus what the HLS playlist
-     * promised. Two failure shapes are caught:
+     * promised. Three failure shapes are caught:
      *
      *  1. Catastrophic truncation — Android's MediaExtractor can silently stop
      *     early when reading a naively-concatenated TS (timestamp
@@ -910,6 +1051,9 @@ object MediaTranscoder {
      *  2. Timeline inflation — an encoder that re-times Surface input can
      *     stretch the output (the "30 min becomes 60 min" failure), which is
      *     just as wrong as a truncated one.
+     *  3. Zero-duration output — a muxer that ended up with an empty (or all
+     *     samples dropped) video track still produces an MP4 whose container
+     *     reports 0:00. Such a file must never be delivered as a success.
      *
      * The expected value is the SUM of the playlist EXTINF tags, and EXTINF is
      * rounded UP per segment, so the real media is routinely a few seconds to
@@ -921,6 +1065,9 @@ object MediaTranscoder {
      */
     private fun verifyDuration(path: String, expectedMs: Long, what: String): Boolean {
         if (expectedMs <= 0) return true
+        val minTolerance = (expectedMs * 80L / 100L).coerceAtLeast(expectedMs - 120_000L)
+        val maxTolerance = expectedMs + maxOf(30_000L, expectedMs / 5L)
+
         val future = java.util.concurrent.Executors.newSingleThreadExecutor()
         val actualMs =
                 try {
@@ -949,20 +1096,96 @@ object MediaTranscoder {
                 } finally {
                     future.shutdownNow()
                 }
-        if (actualMs <= 0) return true // cannot determine; do not block on it
-        // 80% floor, or at worst 2 minutes short of the EXTINF sum for long
-        // content (tolerates per-segment EXTINF round-up + trailing partial
-        // segment); still catches the "only first few seconds" truncation.
-        val minTolerance = (expectedMs * 80L / 100L).coerceAtLeast(expectedMs - 120_000L)
+
+        val referenceMs = if (actualMs > 0) actualMs else probeDurationMs(path)
+        if (referenceMs <= 0) {
+            // The container carries no readable timeline. Accepting it would
+            // deliver a 0:00 file as success, so treat it as a failed output.
+            Log.e(
+                    TAG,
+                    "$what duration check failed: no usable duration in output (expected≈${expectedMs}ms)"
+            )
+            return false
+        }
+        return durationWithinBounds(referenceMs, minTolerance, maxTolerance, expectedMs, what)
+    }
+
+    /**
+     * Secondary duration source when MediaMetadataRetriever reports nothing.
+     * Prefers the per-track KEY_DURATION metadata that MediaExtractor exposes
+     * for MP4 (cheap, no sample I/O); only if that is absent walks the last
+     * samples to recover a timeline. Returns ms, or -1 for an unreadable file.
+     */
+    private fun probeDurationMs(path: String): Long {
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        return try {
+            val task =
+                    executor.submit(
+                            java.util.concurrent.Callable<Long> {
+                                val extractor = MediaExtractor()
+                                try {
+                                    extractor.setDataSource(path)
+                                    var longestUs = -1L
+                                    var sawTrack = false
+                                    for (i in 0 until extractor.trackCount) {
+                                        sawTrack = true
+                                        val format = extractor.getTrackFormat(i)
+                                        if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                                            val durationUs =
+                                                    runCatching {
+                                                                format.getLong(
+                                                                        MediaFormat.KEY_DURATION
+                                                                )
+                                                            }
+                                                            .getOrDefault(-1L)
+                                            if (durationUs > longestUs) longestUs = durationUs
+                                        }
+                                    }
+                                    if (longestUs <= 0 && sawTrack) {
+                                        // No track durations in the container;
+                                        // recover the timeline by walking samples
+                                        // (decode order, without copying data).
+                                        for (i in 0 until extractor.trackCount) {
+                                            extractor.selectTrack(i)
+                                            var lastPts = Long.MIN_VALUE
+                                            while (true) {
+                                                val pts = extractor.sampleTime
+                                                if (pts > lastPts) lastPts = pts
+                                                if (!extractor.advance()) break
+                                            }
+                                            extractor.unselectTrack(i)
+                                            if (lastPts > longestUs) longestUs = lastPts
+                                        }
+                                    }
+                                    if (longestUs <= 0) -1L else (longestUs / 1000L).coerceAtLeast(1L)
+                                } catch (error: Exception) {
+                                    Log.e(TAG, "probeDurationMs failed: ${error.message}", error)
+                                    -1L
+                                } finally {
+                                    extractor.release()
+                                }
+                            }
+                    )
+            task.get(20, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (error: Exception) {
+            Log.e(TAG, "probeDurationMs timed out or failed: ${error.message}", error)
+            -1L
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    private fun durationWithinBounds(
+            actualMs: Long,
+            minTolerance: Long,
+            maxTolerance: Long,
+            expectedMs: Long,
+            what: String
+    ): Boolean {
         if (actualMs + 1000L < minTolerance) {
             Log.e(TAG, "$what duration check failed: expected≈${expectedMs}ms got ${actualMs}ms")
             return false
         }
-        // Upper bound: an output that is significantly LONGER than the playlist
-        // says (e.g. a doubled timeline from an encoder that re-times Surface
-        // input) is just as wrong as a truncated one.  Allow normal container
-        // slack (trailing frames / segment rounding): up to 120% + 30 s.
-        val maxTolerance = expectedMs + maxOf(30_000L, expectedMs / 5L)
         if (actualMs > maxTolerance) {
             Log.e(
                     TAG,
@@ -1029,7 +1252,9 @@ object MediaTranscoder {
                 info.size = size
                 val rawPts = extractor.sampleTime
                 var adjustedPts = rawPts + ptsOffset
-                if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
+                // MediaMuxer REQUIRES per-track monotonic PTS (B-frame decode
+                // order steps backward; the MP4 writer drops such samples).
+                if (adjustedPts <= lastPts) {
                     ptsOffset += (lastPts - adjustedPts) + 1L
                     adjustedPts = rawPts + ptsOffset
                 }
@@ -1104,7 +1329,7 @@ object MediaTranscoder {
             val buf = ByteBuffer.allocateDirect(8 * 1024 * 1024)
             val info = MediaCodec.BufferInfo()
 
-            // 逐轨道写入，每个轨道独立 extractor，避免 PTS 交叉
+            // Write each track with its own extractor to avoid PTS interleaving.
             val pairs = mutableListOf(videoIdx to vOutIdx)
             if (audioIdx >= 0 && aOutIdx >= 0) pairs.add(audioIdx to aOutIdx)
 
@@ -1125,7 +1350,9 @@ object MediaTranscoder {
                     info.size = sz
                     val rawPts = ext.sampleTime
                     var adjustedPts = rawPts + ptsOffset
-                    if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
+                    // MediaMuxer REQUIRES per-track monotonic PTS (B-frame
+                    // decode order steps backward; MP4 writer drops samples).
+                    if (adjustedPts <= lastPts) {
                         ptsOffset += (lastPts - adjustedPts) + 1L
                         adjustedPts = rawPts + ptsOffset
                     }
@@ -1149,7 +1376,7 @@ object MediaTranscoder {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  HARDWARE TRANSCODE — Surface 模式：Decoder → Surface → Encoder
+    //  HARDWARE TRANSCODE - Surface mode: Decoder -> Surface -> Encoder
     // ═══════════════════════════════════════════════════════════════════════
 
     private fun hardwareTranscode(
@@ -1192,7 +1419,7 @@ object MediaTranscoder {
             val fps = measureSegmentFps(inputPath).coerceAtLeast(1)
             Log.i(TAG, "Input video: $vMime ${w}x${h}@${fps}fps rotation=$rotation")
 
-            // ── 编码器 ──
+            // ── Encoder ──
             val targetBitrate =
                     if (vBitrate > 0) {
                         try {
@@ -1205,27 +1432,9 @@ object MediaTranscoder {
                             return false
                         }
                     } else {
-                        val estimated = w.toLong() * h * fps.coerceAtLeast(1) * 7L / 100L
-                        estimated.coerceIn(800_000L, 16_000_000L).toInt()
+                        defaultVideoBitrate(w, h, fps)
                     }
-            val encFmt =
-                    MediaFormat.createVideoFormat("video/avc", w, h).apply {
-                        setInteger(
-                                MediaFormat.KEY_COLOR_FORMAT,
-                                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-                        )
-                        setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
-                        setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                        // See the comment in hardwareTranscodeSegments: the
-                        // operating rate is frames/second and realtime priority
-                        // must not be set for an offline batch transcode.
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-                        }
-                        // No B-frames: lower encode latency and simpler decode.
-                        setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                    }
+            val encFmt = createAvcEncodeFormat(w, h, fps, targetBitrate)
             val encoderSession = createAvcEncoder(encFmt, w, h, fps, targetBitrate)
             if (encoderSession == null) {
                 Log.e(TAG, "No AVC encoder (hardware or software) is available on this device")
@@ -1276,99 +1485,118 @@ object MediaTranscoder {
             var frames = 0
             var firstVideoPts = -1L
             var lastProgressMs = System.currentTimeMillis()
-            var lastVideoDecodePts = Long.MIN_VALUE
-            var videoPtsOffset = 0L
+            val ptsTimeline = DecoderPtsTimeline()
 
             val decInfo = MediaCodec.BufferInfo()
             val encInfo = MediaCodec.BufferInfo()
 
             while (!encoderDone) {
-                // ── 1. Feed decoder ──
+                var progressed = false
+
+                // ── 1. Feed decoder until input queue is full ──
                 if (!inputDone) {
-                    val idx = decoder.dequeueInputBuffer(TIMEOUT_US)
-                    if (idx >= 0) {
+                    while (true) {
+                        val feedIdx = decoder.dequeueInputBuffer(0)
+                        if (feedIdx < 0) break
+                        progressed = true
                         lastProgressMs = System.currentTimeMillis()
-                        val buf = decoder.getInputBuffer(idx)!!
+                        val buf = decoder.getInputBuffer(feedIdx)!!
                         val sz = extractor.readSampleData(buf, 0)
                         if (sz < 0) {
                             decoder.queueInputBuffer(
-                                    idx,
+                                    feedIdx,
                                     0,
                                     0,
                                     0,
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM
                             )
                             inputDone = true
-                        } else {
-                            val rawPts = extractor.sampleTime
-                            var adjustedPts = rawPts + videoPtsOffset
-                            if (adjustedPts < lastVideoDecodePts - PTS_REBASE_THRESHOLD_US) {
-                                videoPtsOffset += (lastVideoDecodePts - adjustedPts) + 1L
-                                adjustedPts = rawPts + videoPtsOffset
-                            }
-                            lastVideoDecodePts = adjustedPts
-                            decoder.queueInputBuffer(idx, 0, sz, adjustedPts, 0)
-                            extractor.advance()
+                            break
                         }
+                        decoder.queueInputBuffer(
+                                feedIdx,
+                                0,
+                                sz,
+                                ptsTimeline.next(extractor.sampleTime),
+                                0
+                        )
+                        extractor.advance()
                     }
                 }
 
-                // ── 2. Drain decoder → Surface ──
+                // ── 2. Drain every ready decoder output → Surface ──
                 if (!decoderDone) {
-                    val idx = decoder.dequeueOutputBuffer(decInfo, TIMEOUT_US)
-                    if (idx >= 0) {
+                    while (true) {
+                        val drainIdx = decoder.dequeueOutputBuffer(decInfo, 0)
+                        if (drainIdx == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                        if (drainIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
+                        if (drainIdx < 0) break
+                        progressed = true
                         lastProgressMs = System.currentTimeMillis()
                         val eos = (decInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                        decoder.releaseOutputBuffer(idx, !eos)
+                        decoder.releaseOutputBuffer(drainIdx, !eos)
                         if (eos) {
                             decoderDone = true
                             encoder.signalEndOfInputStream()
+                            break
                         }
                     }
                 }
 
-                // ── 3. Drain encoder ──
-                val idx = encoder.dequeueOutputBuffer(encInfo, TIMEOUT_US)
-                when {
-                    idx >= 0 -> {
-                        lastProgressMs = System.currentTimeMillis()
-                        val data = encoder.getOutputBuffer(idx)!!
-
-                        if (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            encInfo.size = 0
-                        }
-                        if (encInfo.size > 0) {
-                            if (!muxerStarted) {
-                                videoMuxIdx = muxer.addTrack(encoder.outputFormat)
-                                muxer.start()
-                                muxerStarted = true
-                            }
-                            if (firstVideoPts < 0) {
-                                firstVideoPts = encInfo.presentationTimeUs
-                            }
-                            if (firstVideoPts > 0) {
-                                encInfo.presentationTimeUs -= firstVideoPts
-                            }
-                            if (encInfo.presentationTimeUs < 0) {
-                                encInfo.presentationTimeUs = 0
-                            }
-                            data.position(encInfo.offset)
-                            data.limit(encInfo.offset + encInfo.size)
-                            muxer.writeSampleData(videoMuxIdx, data, encInfo)
-                            frames++
-                        }
-                        encoder.releaseOutputBuffer(idx, false)
-
-                        if (encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                            encoderDone = true
-                        }
-                    }
-                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                // ── 3. Drain every ready encoder output → muxer ──
+                while (true) {
+                    val outIdx = encoder.dequeueOutputBuffer(encInfo, 0)
+                    if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                    if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         if (!muxerStarted) {
                             videoMuxIdx = muxer.addTrack(encoder.outputFormat)
                             muxer.start()
                             muxerStarted = true
                         }
+                        continue
+                    }
+                    if (outIdx < 0) break
+                    progressed = true
+                    lastProgressMs = System.currentTimeMillis()
+                    val data = encoder.getOutputBuffer(outIdx)!!
+                    if (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        encInfo.size = 0
+                    }
+                    if (encInfo.size > 0) {
+                        if (!muxerStarted) {
+                            videoMuxIdx = muxer.addTrack(encoder.outputFormat)
+                            muxer.start()
+                            muxerStarted = true
+                        }
+                        if (firstVideoPts < 0) {
+                            firstVideoPts = encInfo.presentationTimeUs
+                        }
+                        if (firstVideoPts > 0) {
+                            encInfo.presentationTimeUs -= firstVideoPts
+                        }
+                        if (encInfo.presentationTimeUs < 0) {
+                            encInfo.presentationTimeUs = 0
+                        }
+                        data.position(encInfo.offset)
+                        data.limit(encInfo.offset + encInfo.size)
+                        muxer.writeSampleData(videoMuxIdx, data, encInfo)
+                        frames++
+                    }
+                    encoder.releaseOutputBuffer(outIdx, false)
+                    if (encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        encoderDone = true
+                        break
+                    }
+                }
+
+                // Nothing was ready this pass (codecs still busy): yield the
+                // CPU briefly instead of spinning, then poll again.
+                if (!progressed && !encoderDone) {
+                    try {
+                        Thread.sleep(1L)
+                    } catch (ignored: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
                     }
                 }
 
@@ -1402,6 +1630,53 @@ object MediaTranscoder {
             extractor.release()
         }
     }
+
+    /**
+     * Resolution-aware default bitrate (~0.10 bits per pixel per frame).
+     * Keeps re-encoded H.264 crisp while staying in the encoder's range.
+     */
+    private fun defaultVideoBitrate(width: Int, height: Int, fps: Int): Int {
+        val estimated = width.toLong() * height * fps.coerceAtLeast(1) * 10L / 100L
+        return estimated.coerceIn(800_000L, 16_000_000L).toInt()
+    }
+
+    /**
+     * AVC encoder format for Surface input. VBR keeps quality high at the
+     * same average bitrate; no B-frames keeps the output timeline monotonic
+     * and easy to decode. KEY_PRIORITY and KEY_OPERATING_RATE are both
+     * deliberately unset: this is a batch/offline transcode fed as fast as the
+     * disk allows, so hinting a realtime input rate (or realtime priority)
+     * makes some vendor encoders pace themselves against the wall clock and
+     * the transcode crawls. Frame timing is fully owned by the PTS we feed.
+     *
+     * KEY_I_FRAME_INTERVAL is 2 s instead of 1 s: an I-frame costs roughly an
+     * order of magnitude more to encode than a P-frame, so halving the forced
+     * keyframe rate meaningfully speeds up the encode (and shrinks the file)
+     * while keeping seeking snappy. HLS sources usually carry 2-6 s GOPs, so
+     * 2 s also avoids re-inserting extra keyframes the source never had.
+     */
+    private fun createAvcEncodeFormat(
+            width: Int,
+            height: Int,
+            fps: Int,
+            bitrate: Int
+    ): MediaFormat =
+            MediaFormat.createVideoFormat("video/avc", width, height).apply {
+                setInteger(
+                        MediaFormat.KEY_COLOR_FORMAT,
+                        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                )
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    setInteger(
+                            MediaFormat.KEY_BITRATE_MODE,
+                            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+                    )
+                }
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            }
 
     /**
      * Creates an AVC encoder that prefers dedicated hardware and falls back to a software (CPU)
@@ -1523,16 +1798,15 @@ object MediaTranscoder {
                 info.size = sz
                 val rawPts = ext.sampleTime
                 var adjustedPts = rawPts + ptsOffset
-                if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
+                // MediaMuxer REQUIRES per-track monotonic PTS.
+                if (adjustedPts <= lastPts) {
                     ptsOffset += (lastPts - adjustedPts) + 1L
                     adjustedPts = rawPts + ptsOffset
                 }
                 lastPts = adjustedPts
                 info.presentationTimeUs = adjustedPts
                 info.flags = ext.sampleFlags
-                // Zero-base the audio timeline exactly like the video encoder
-                // output, so A/V stays in sync regardless of the source PTS
-                // origin (TS streams often start at arbitrary offsets).
+
                 if (firstPts < 0) firstPts = info.presentationTimeUs
                 if (firstPts > 0) info.presentationTimeUs -= firstPts
                 if (info.presentationTimeUs < 0) info.presentationTimeUs = 0

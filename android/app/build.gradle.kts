@@ -22,7 +22,6 @@ val hasReleaseSigning = releaseStoreFile != null &&
 
 android {
     namespace = "com.bluevale.m3u8_downloader"
-    // permission_handler_android 14.x 要求 SDK 37;显式抬升(向后兼容)。
     compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
@@ -42,10 +41,7 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.blue.ferrisload"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
@@ -79,7 +75,6 @@ android {
     }
 
     lint {
-        // CI 关闭 release 阶段的致命 lint，避免 file_picker 产物缺失导致构建失败
         abortOnError = false
         checkReleaseBuilds = false
         disable.addAll(listOf("LintVital", "LintVitalRelease"))

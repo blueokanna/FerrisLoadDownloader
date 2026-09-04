@@ -123,7 +123,7 @@ class MainActivity : FlutterActivity() {
                         result.success(dl.absolutePath)
                     }
 
-                    // ── 前台服务 ──
+                    // ── Foreground service ──
                     "startForegroundService" -> {
                         DownloadForegroundService.start(applicationContext)
                         result.success(true)
@@ -139,7 +139,7 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
 
-                    // ── 电池优化 ──
+                    // ── Battery optimization ──
                     "isIgnoringBatteryOptimizations" -> {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                             val pm = getSystemService(POWER_SERVICE) as PowerManager

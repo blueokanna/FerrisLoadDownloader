@@ -13,7 +13,6 @@ import 'package:m3u8_downloader/src/home/home_page_controller.dart';
 import 'package:m3u8_downloader/src/home/home_history_card.dart';
 import 'package:m3u8_downloader/src/home/home_input_card.dart';
 import 'package:m3u8_downloader/src/home/home_settings_sheet.dart';
-import 'package:m3u8_downloader/src/home/home_status_card.dart';
 import 'package:m3u8_downloader/src/home/home_widgets.dart';
 import 'package:m3u8_downloader/src/home/source_input.dart';
 import 'package:m3u8_downloader/src/rust/api/downloader.dart';
@@ -585,17 +584,6 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Future<void> _retryCurrentAction(HomeRetryAction action) async {
-    switch (action) {
-      case HomeRetryAction.none:
-        return;
-      case HomeRetryAction.analyze:
-        await _analyze();
-      case HomeRetryAction.download:
-        await _download();
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
@@ -791,25 +779,6 @@ class _HomePageState extends State<HomePage> {
     EdgeInsetsGeometry padding = EdgeInsets.zero,
   }) {
     final children = <Widget>[
-      HomeStatusCard(
-        status: vm.status,
-        error: vm.error,
-        resultPath: vm.resultPath,
-        progress: vm.progress,
-        running: vm.running,
-        analyzing: vm.analyzing,
-        stage: vm.stage,
-        stageRevision: vm.stageRevision,
-        recoveryMessage: vm.recoveryMessage,
-        recoveryRevision: vm.recoveryRevision,
-        retryAction: vm.retryAction,
-        onRetry: vm.busy || vm.retryAction == HomeRetryAction.none
-            ? null
-            : () {
-                _retryCurrentAction(vm.retryAction);
-              },
-      ),
-      const SizedBox(height: 12),
       HomeDownloadTasksCard(tasks: vm.downloadTasks),
       const SizedBox(height: 12),
       HomeHistoryCard(history: vm.history),

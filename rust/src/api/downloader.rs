@@ -4890,15 +4890,29 @@ fn download_hls_resource(
         let result = match request.byte_range {
             Some((start, end)) => client
                 .get_range(&request.url, headers, start, end)
-                .map(|(status, _, body)| (status, body)),
+                .map(|(status, response_headers, body)| (status, response_headers, body)),
             None => client
                 .get(&request.url, headers)
-                .map(|(status, _, body)| (status, body)),
+                .map(|(status, response_headers, body)| (status, response_headers, body)),
         };
 
         match result {
-            Ok((status, bytes)) if (200..300).contains(&status) => {
-                match hls_response_bytes(status, &bytes, request.byte_range) {
+            Ok((status, response_headers, body)) if (200..300).contains(&status) => {
+                let declared = response_headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok());
+                if let Some(expected) = declared {
+                    if request.byte_range.is_none() && body.len() != expected {
+                        warn!(
+                            "Attempt {} body truncated for {}: expected {expected} bytes, got {}",
+                            attempt,
+                            request.url,
+                            body.len()
+                        );
+                    }
+                }
+                match hls_response_bytes(status, &body, request.byte_range) {
                     Ok(data) => return Ok(data),
                     Err(error) => {
                         warn!(
@@ -4908,7 +4922,7 @@ fn download_hls_resource(
                     }
                 }
             }
-            Ok((status, _)) => {
+            Ok((status, _, _)) => {
                 warn!(
                     "Attempt {} failed: {} HTTP {}",
                     attempt, request.url, status
@@ -4944,6 +4958,87 @@ fn decrypt_hls_resource(data: Vec<u8>, crypto: Option<&(Vec<u8>, Vec<u8>)>) -> R
         bail!("AES-128 key and IV must contain exactly 16 bytes");
     }
     aes_128_cbc_decrypt(key, iv, &data).map_err(|e| anyhow!("AES-128-CBC decryption failed: {e}"))
+}
+
+/// True when `data` looks like a clear MPEG-TS stream: the 0x47 sync byte
+/// appears at the expected 188-byte boundaries for the first several packets.
+/// AES-128 ciphertext is pseudorandom, so it would not match this pattern.
+fn looks_like_mpeg_ts(data: &[u8]) -> bool {
+    if data.len() < 188 * 4 {
+        return false;
+    }
+    let sync_hits = (0..8).filter(|packet| data.get(packet * 188) == Some(&0x47)).count();
+    // Require most sampled boundaries to be sync bytes; also accept the very
+    // common 0x47 at offset 0 even if later offsets drift on some muxers.
+    sync_hits >= 6 || (data[0] == 0x47 && sync_hits >= 4)
+}
+
+/// Downloads an optional init section plus one media segment and decrypts
+/// them with the segment's AES-128 key. The whole operation is retried so a
+/// transient truncated response (which would otherwise surface as a
+/// confusing CBC block-length error) gets a fresh attempt before failing.
+fn download_and_decrypt_segment(
+    client: &SyncHttpClient,
+    headers: &[(String, String)],
+    segment_request: &HlsResourceRequest,
+    init_request: Option<&HlsResourceRequest>,
+    crypto: Option<&(Vec<u8>, Vec<u8>)>,
+    retries: u8,
+) -> Result<Vec<u8>> {
+    let attempts = retries.max(2);
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        let result = (|| -> Result<Vec<u8>> {
+            let mut buffer = Vec::new();
+            if let Some(init) = init_request {
+                let init_data = download_hls_resource(client, init, headers, attempts)?;
+                match decrypt_hls_resource(init_data.clone(), crypto) {
+                    Ok(decrypted) => buffer.extend_from_slice(&decrypted),
+                    Err(error) => {
+                        warn!(
+                            "Init section for {} is not AES-128 encrypted as declared ({}); keeping raw bytes",
+                            init.url,
+                            error
+                        );
+                        buffer.extend_from_slice(&init_data);
+                    }
+                }
+            }
+            let segment_data =
+                download_hls_resource(client, segment_request, headers, attempts)?;
+            match decrypt_hls_resource(segment_data.clone(), crypto) {
+                Ok(decrypted) => buffer.extend_from_slice(&decrypted),
+                Err(error) => {
+                    if looks_like_mpeg_ts(&segment_data) {
+                        warn!(
+                            "Segment {} is declared AES-128 but looks like clear MPEG-TS ({error}); keeping raw bytes",
+                            segment_request.url
+                        );
+                        buffer.extend_from_slice(&segment_data);
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(buffer)
+        })();
+        match result {
+            Ok(buffer) => return Ok(buffer),
+            Err(error) => {
+                last_error = Some(error);
+                warn!(
+                    "Segment fetch+decrypt attempt {attempt}/{} failed for {}: {}",
+                    attempts,
+                    segment_request.url,
+                    last_error.as_ref().unwrap()
+                );
+                if attempt < attempts {
+                    std::thread::sleep(retry_backoff_delay(attempt, None));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Segment download failed")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5182,17 +5277,14 @@ fn download_and_merge_once(
                         let init_request = init_requests[idx].clone();
                         let key = segment_crypto.get(idx).cloned().flatten();
 
-                        let mut buffer = Vec::new();
-                        if let Some(init_request) = init_request {
-                            let init_data =
-                                download_hls_resource(&client, &init_request, &headers, retries)?;
-                            let init_data = decrypt_hls_resource(init_data, key.as_ref())?;
-                            buffer.extend_from_slice(&init_data);
-                        }
-                        let segment_data =
-                            download_hls_resource(&client, &segment_request, &headers, retries)?;
-                        let segment_data = decrypt_hls_resource(segment_data, key.as_ref())?;
-                        buffer.extend_from_slice(&segment_data);
+                        let buffer = download_and_decrypt_segment(
+                            &client,
+                            &headers,
+                            &segment_request,
+                            init_request.as_ref(),
+                            key.as_ref(),
+                            retries,
+                        )?;
 
                         let file_name = format!("{}_{:05}.part", segment_prefix, idx);
                         let tmp_path = temp_dir.join(file_name);
@@ -5245,17 +5337,12 @@ fn download_and_merge_once(
 
     let is_fmp4 = segments.iter().any(|segment| segment.map.is_some());
     let use_concat = !is_fmp4 && cfg!(not(target_os = "android"));
-    // Keep the per-segment `.part` files when a later stage needs them:
-    // ffmpeg's concat demuxer (desktop) and the Android segment-based
-    // transcoder both consume the individual segment files.
     let keep_segments = use_concat || cfg!(target_os = "android");
     let concat_list_path = PathBuf::from(format!("{}.concat.txt", output_file));
     if use_concat {
         let mut list_content = String::new();
         for i in 0..total {
             let segment_path = temp_dir.join(format!("{}_{:05}.part", segment_prefix, i));
-            // MSRV 1.78 has no `std::path::absolute`; make the path absolute
-            // by hand so the concat list always contains absolute paths.
             let absolute = if segment_path.is_absolute() {
                 segment_path
             } else {

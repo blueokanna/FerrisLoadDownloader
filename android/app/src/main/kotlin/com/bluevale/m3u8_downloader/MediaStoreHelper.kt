@@ -12,21 +12,21 @@ import java.io.File
 import java.io.FileInputStream
 
 /**
- * 使用 MediaStore API 将文件保存到公共存储，
- * 确保在 Android 10+ (Scoped Storage) 下文件对用户可见。
+ * Saves files to shared storage via MediaStore so they remain visible on
+ * Android 10+ (scoped storage).
  */
 object MediaStoreHelper {
     private const val TAG = "MediaStoreHelper"
 
     /**
-     * 将应用私有目录中的文件复制到公共 Downloads 子目录。
+     * Copies a file from app-private storage into a public Downloads subdir.
      *
-     * @param context    应用上下文
-     * @param srcPath    源文件绝对路径（应用私有目录中）
-     * @param fileName   目标文件名（如 "output.mp4"）
-     * @param mimeType   MIME 类型（如 "video/mp4"）
-     * @param subDir     Downloads 下的子目录名（如 "FerrisLoad"）
-     * @return 保存成功后的公共路径字符串，失败返回 null
+     * @param context application context
+     * @param srcPath absolute source path (app-private)
+     * @param fileName target file name, e.g. "output.mp4"
+     * @param mimeType MIME type, e.g. "video/mp4"
+     * @param subDir sub-directory under Downloads, e.g. "FerrisLoad"
+     * @return the saved public path, or null on failure
      */
     @JvmStatic
     fun saveToDownloads(
@@ -80,9 +80,8 @@ object MediaStoreHelper {
     }
 
     /**
-     * 将文件直接复制到用户指定的绝对路径目录。
-     * 用于 Android 9 及以下，或用户通过 SAF 选择了可写目录后
-     * 在 Dart 侧拿到了真实路径的场景。
+     * Copies a file to a caller-provided absolute directory (Android 9 and
+     * below, or after the user grants a writable dir via SAF).
      */
     @JvmStatic
     fun saveToPath(
