@@ -119,11 +119,11 @@ impl<'a> Parser<'a> {
     fn skip_prolog(&mut self) {
         loop {
             self.skip_whitespace();
-            if self.input[self.pos..].starts_with("<?xml") {
-                if let Some(end) = self.input[self.pos..].find("?>") {
-                    self.pos += end + 2;
-                    continue;
-                }
+            if self.input[self.pos..].starts_with("<?xml")
+                && let Some(end) = self.input[self.pos..].find("?>")
+            {
+                self.pos += end + 2;
+                continue;
             }
             break;
         }

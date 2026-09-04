@@ -57,12 +57,12 @@ pub(crate) fn extract_page_title(html: &str) -> Option<String> {
 
     for pattern in patterns {
         let regex = Regex::new(pattern).ok()?;
-        if let Some(caps) = regex.captures(html) {
-            if let Some(value) = caps.get(1) {
-                let cleaned = html_unescape(value.as_str()).trim().to_string();
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
-                }
+        if let Some(caps) = regex.captures(html)
+            && let Some(value) = caps.get(1)
+        {
+            let cleaned = html_unescape(value.as_str()).trim().to_string();
+            if !cleaned.is_empty() {
+                return Some(cleaned);
             }
         }
     }
@@ -153,11 +153,7 @@ pub(crate) fn extract_text_runs_pointer(value: &Value, pointer: &str) -> Option<
         .collect::<String>()
         .trim()
         .to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 pub(crate) fn first_media_url(value: &Value) -> Option<String> {

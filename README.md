@@ -24,7 +24,7 @@ rust/           Rust 核心
   src/api_server/ 可选的 HTTP API 服务（Docker）
   src/crypto/   自研 AES-128-CBC 与 SHA-256（依赖标准库）
   src/hls.rs    自研 HLS 播放列表解析器（带资源上限）
-  src/net.rs    同步 HTTP 客户端（courierust + rustls 后备）
+  src/net.rs    同步 HTTP 客户端（courierust，Mozilla 根证书；单一 TLS 栈）
 android/        Android 宿主：MediaCodec 转码器、MediaStore 导出、前台服务
 ```
 
@@ -64,10 +64,10 @@ flutter_rust_bridge_codegen generate
 Android 端没有 FFmpeg，转码完全靠系统 `MediaCodec`：
 
 - **解码/编码都优先硬件**（按厂商名评分：高通、联发科、海思、三星等），没有可用硬件编码器时才回退软件编码器。
-- **HLS 逐段处理**：不再把 TS 字节硬拼成一个文件（那样每段的时间戳会重置，导致 MediaCodec 只解出前几秒）。现在把每一段独立喂给解码器，跨段连续重建时间戳，等价于 FFmpeg 的 concat demuxer。
+- **HLS 逐段处理**：不再把 TS 字节硬拼成一个文件（那样每段的时间戳会重置，导致 MediaCodec 只解出前几秒）。现在把每一段独立喂给解码器，跨段连续重建时间戳，等价于 FFmpeg 的 concat demuxer。重建只在真正的时间戳断层（回退超过 500ms）时触发，绝不碰带 B 帧流里 GOP 内部正常的回摆——把那些回摆当断层重写，正是时间轴被拉长、播放帧率减半的元凶。
 - **纯转封装优先**：码率为 0 时先尝试无损 remux（视频/音频直接搬进 MP4）；失败或时长被截断时才做硬件重编码。
-- **输出自检**：转完会用 `MediaExtractor` / `MediaMetadataRetriever` 验证轨道存在、时长达标，不产出"只有前几秒"的废文件。
-- 编码器按分辨率自适应默认码率、实测帧率设 `KEY_FRAME_RATE` / `KEY_OPERATING_RATE`、实时优先级、无 B 帧，尽量减少播放时的卡顿。
+- **输出自检**：转完会用 `MediaExtractor` / `MediaMetadataRetriever` 验证轨道存在、时长达标，不产出"只有前几秒"的废文件。时长双向校验：明显短于播放列表（截断）或明显长于播放列表（编码器把时间轴拉长，例如 30 分钟变 60 分钟）都会判失败并重试。
+- 编码器按分辨率自适应默认码率、实测帧率设 `KEY_FRAME_RATE` / `KEY_OPERATING_RATE`（按帧/秒传入，避免编码器重排时间轴）、无 B 帧，尽量减少播放时的卡顿；不用实时优先级（离线批量转码按实时喂帧反而会让部分厂商编码器按墙钟重打时间戳）。
 
 ## iOS 转码说明（Apple A / M 系列硬件）
 
@@ -123,7 +123,7 @@ CI（GitHub Actions）会构建并推送 `linux/amd64`、`linux/arm64`、`linux/
 - 只允许 `http/https` 目标，网络层与解析层都有 scheme 白名单（防 SSRF / 本地文件读取）。
 - 自定义请求头做了 CR/LF 注入校验；Cookie 等凭据只在内存里，不落盘。
 - HLS 密钥、DASH 片段 URL 同样强制 `http/https`。
-- TLS 校验默认全开；内置客户端对某些 P-384 证书链兼容性差时自动切换到 rustls 后备。
+- TLS 校验默认全开；`courierust` 1.0.3 原生支持 P-256 / P-384 证书链验签，不再需要第二套 rustls 后备栈。
 - 输出文件名做了路径穿越消毒。
 - Web 端把会话凭据转给 API 服务时，非本机地址强制 HTTPS（`ApiDownloadEngine` 传输安全校验）。
 - CI 每天/每次提交跑安全扫描：`cargo audit`（Rust 漏洞）、`flutter pub outdated`（Dart 依赖）、Trivy（容器漏洞 + 密钥 + 配置错误）。

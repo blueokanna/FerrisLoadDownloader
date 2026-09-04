@@ -6,7 +6,7 @@
 //! to a worker thread, and long-running download tasks run on their own
 //! dedicated threads so the accept loop is never blocked.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use courierust::courierust_body::Body;
 use courierust::courierust_http::header::HeaderName;
 use courierust::courierust_http::request::Request;
@@ -141,11 +141,16 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
                 || octets[0] >= 224
         }
         std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
                 || v6.is_multicast()
+                // fc00::/7 unique local (stable manual checks: the
+                // `is_unique_local`/`is_unicast_link_local` helpers only
+                // stabilized in later Rust than this crate's MSRV).
+                || (segments[0] & 0xfe00) == 0xfc00
+                // fe80::/10 link local.
+                || (segments[0] & 0xffc0) == 0xfe80
         }
     }
 }

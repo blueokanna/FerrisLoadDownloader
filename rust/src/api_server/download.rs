@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
-use crate::api::downloader::{inspect_media_with_context_sync, RequestContext};
+use crate::api::downloader::{RequestContext, inspect_media_with_context_sync};
 use crate::download_service::{self, DownloadProgressHandler};
 
 use super::models::DownloadRequest;

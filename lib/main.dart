@@ -13,9 +13,6 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await MediaStoreBridge.requestPermissions();
   final settings = await AppSettings.load();
-  // The Rust bridge only exists in native builds. On the web (WASM) the
-  // download engine talks to the FerrisLoad HTTP API instead, so skipping
-  // initialization here is expected and must not fail the app.
   if (!kIsWeb) {
     try {
       await RustLib.init();

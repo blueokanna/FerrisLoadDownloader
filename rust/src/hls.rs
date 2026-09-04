@@ -572,7 +572,7 @@ fn parse_key(attrs: &BTreeMap<String, String>, line: usize) -> Result<Key, Playl
         None => {
             return Err(playlist_error(format!(
                 "line {line}: EXT-X-KEY missing METHOD"
-            )))
+            )));
         }
     };
     let key = Key {
@@ -613,7 +613,7 @@ fn parse_alternative_media(
         None => {
             return Err(playlist_error(format!(
                 "line {line}: EXT-X-MEDIA missing TYPE"
-            )))
+            )));
         }
     };
     let group_id = attrs

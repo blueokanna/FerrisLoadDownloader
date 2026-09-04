@@ -24,7 +24,7 @@ rust/           Rust core
   src/api_server/  optional HTTP API (Docker)
   src/crypto/   self-contained AES-128-CBC and SHA-256
   src/hls.rs    self-contained HLS playlist parser (resource-bounded)
-  src/net.rs    synchronous HTTP client (courierust + rustls fallback)
+  src/net.rs    synchronous HTTP client (courierust, Mozilla roots; single TLS stack)
 android/        Android host: MediaCodec transcoder, MediaStore export, foreground service
 ```
 
@@ -64,16 +64,17 @@ For login-gated sites: open the authorization browser in settings, sign in yours
 There is no FFmpeg on Android; everything goes through `MediaCodec`:
 
 - **Hardware first for both decode and encode** (codecs are scored by vendor: Qualcomm, MediaTek, HiSilicon, Samsung, …), falling back to a software encoder only when no hardware AVC encoder works.
-- **Segment-by-segment HLS** — we no longer byte-concatenate TS segments (their PTS resets at every boundary, which made MediaCodec decode only the first few seconds). Each segment is fed to the decoder independently and the timeline is re-based continuously across segments — the equivalent of FFmpeg's concat demuxer.
+- **Segment-by-segment HLS** — we no longer byte-concatenate TS segments (their PTS resets at every boundary, which made MediaCodec decode only the first few seconds). Each segment is fed to the decoder independently and the timeline is re-based continuously across segments — the equivalent of FFmpeg's concat demuxer. Re-basing only fires on a real discontinuity (a 500 ms backward jump), never on the ordinary intra-GOP PTS reordering of B-frame streams: rewriting those timestamps is exactly what stretched timelines and halved playback frame rates on B-frame content.
 - **Stream-copy remux first** — at bitrate 0 we try a lossless remux into MP4; only fall back to a hardware re-encode when that fails or the output is truncated.
-- **Self-checking output** — after conversion, `MediaExtractor` / `MediaMetadataRetriever` verify the tracks and duration exist, so a broken "first few seconds only" file never ships.
-- Encoder bitrate is scaled to resolution, the real frame rate is measured for `KEY_FRAME_RATE` / `KEY_OPERATING_RATE`, realtime priority is set, and B-frames are disabled to reduce playback stutter.
+- **Self-checking output** — after conversion, `MediaExtractor` / `MediaMetadataRetriever` verify the tracks and duration exist, so a broken "first few seconds only" file never ships. Duration is checked both ways: an output much shorter than the playlist (truncation) or much longer (an encoder that stretched the timeline, e.g. 30 min becoming 60 min) is rejected and retried.
+- Encoder bitrate is scaled to resolution, the real frame rate is measured for `KEY_FRAME_RATE` / `KEY_OPERATING_RATE` (passed in frames per second so the codec does not re-time the timeline), and B-frames are disabled to reduce playback stutter. Realtime priority is deliberately not used: this is an offline batch transcode, and realtime priority makes some vendor encoders re-stamp output against the wall clock, stretching the timeline.
 
 ## Docker API
 
 The container runs the real downloader (not simulated progress). Endpoints:
 
 - `GET /health`
+- `POST /inspect` — analyze a page/direct link and return the candidate streams (used by the Web UI)
 - `POST /download` — pass `url`, or specify exact streams via `media_url` / `audio_url`
 - `GET /status/:task_id`
 - `GET /tasks`
@@ -89,7 +90,7 @@ docker run --rm -p 3000:3000 -e DOWNLOAD_DIR=/app/downloads \
 - Only `http/https` targets; scheme allow-lists at both the network and parsing layers (SSRF / local-file protection).
 - Custom request headers are validated against CR/LF injection; cookies and other credentials live in memory only, never on disk.
 - HLS keys and DASH segment URLs are forced to `http/https` as well.
-- TLS verification is always on; when the built-in client can't validate certain P-384 certificate chains, it transparently switches to a rustls-backed client.
+- TLS verification is always on; `courierust` 1.0.3 natively verifies P-256/P-384 certificate chains, so no second rustls-backed stack is needed.
 - Output file names are sanitized against path traversal.
 - Download only content you own or are authorized to access.
 

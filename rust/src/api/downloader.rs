@@ -1,15 +1,15 @@
 #![allow(unused_imports, unused_variables, dead_code)]
-use crate::api::site_adapters::{extractor_name_for_host, inspect_page_candidates, SiteWarning};
-use crate::crypto::{aes_128_cbc_decrypt, sha256, Sha256};
+use crate::api::site_adapters::{SiteWarning, extractor_name_for_host, inspect_page_candidates};
+use crate::crypto::{Sha256, aes_128_cbc_decrypt, sha256};
 use crate::frb_generated::StreamSink;
 use crate::hls::{
-    parse_playlist, AlternativeMedia, AlternativeMediaType, ByteRange, KeyMethod, Map,
-    MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
+    AlternativeMedia, AlternativeMediaType, ByteRange, KeyMethod, Map, MasterPlaylist,
+    MediaPlaylist, Playlist, VariantStream, parse_playlist,
 };
 use crate::net::SyncHttpClient;
 use crate::xml::{self, Element};
-use anyhow::{anyhow, bail, Context, Result};
-use ferrisload_core::{DownloadPlan, DOWNLOAD_PLAN_VERSION};
+use anyhow::{Context, Result, anyhow, bail};
+use ferrisload_core::{DOWNLOAD_PLAN_VERSION, DownloadPlan};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use nextjson::Value;
@@ -28,11 +28,11 @@ use url::Url;
 use uuid::Uuid;
 
 #[cfg(target_os = "android")]
-use jni::objects::{GlobalRef, JClass, JObject, JValue};
-#[cfg(target_os = "android")]
 use jni::JNIEnv;
 #[cfg(target_os = "android")]
 use jni::JavaVM;
+#[cfg(target_os = "android")]
+use jni::objects::{GlobalRef, JClass, JObject, JValue};
 
 pub(crate) type ProgressReporter = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
@@ -84,9 +84,10 @@ enum TranscoderKind {
 // FFI into the native iOS transcoder (`ios/Runner/VideoToolboxBridge.m`).
 //
 // The symbols are provided by the Runner app target, which links the Rust
-// static library; they only exist on iOS, hence the `cfg` gate.
+// static library; they only exist on iOS, hence the `cfg` gate. Edition 2024
+// requires extern blocks to be marked `unsafe`.
 #[cfg(target_os = "ios")]
-extern "C" {
+unsafe extern "C" {
     fn ferrisload_videotoolbox_available() -> i32;
     fn ferrisload_videotoolbox_transcode(
         input: *const std::os::raw::c_char,
@@ -117,7 +118,7 @@ mod ios_videotoolbox {
     use std::os::raw::c_char;
     use std::time::Duration;
 
-    use anyhow::{anyhow, Context, Result};
+    use anyhow::{Context, Result, anyhow};
 
     // The `extern "C"` items live in the parent module; bring them into scope
     // explicitly (they do not resolve through parent-module lookup).
@@ -303,10 +304,10 @@ fn command_with_timeout(
         Err(_) => {
             // Timeout: kill the child if it still exists, then wait for
             // the worker to finish draining pipes.
-            if let Ok(mut guard) = child.lock() {
-                if let Some(child) = guard.as_mut() {
-                    let _ = child.kill();
-                }
+            if let Ok(mut guard) = child.lock()
+                && let Some(child) = guard.as_mut()
+            {
+                let _ = child.kill();
             }
             let _ = handle.join();
             None
@@ -410,11 +411,11 @@ fn resolve_ffmpeg_path() -> Option<PathBuf> {
     if let Some(configured) = env::var_os("FERRISLOAD_FFMPEG_PATH") {
         candidates.push(PathBuf::from(configured));
     }
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(directory) = current_exe.parent() {
-            candidates.push(directory.join("tools").join(executable_name));
-            candidates.push(directory.join(executable_name));
-        }
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(directory) = current_exe.parent()
+    {
+        candidates.push(directory.join("tools").join(executable_name));
+        candidates.push(directory.join(executable_name));
     }
     candidates.push(PathBuf::from(executable_name));
 
@@ -437,17 +438,17 @@ fn resolve_ytdlp_command() -> Option<ExternalCommandSpec> {
             prefix_args: Vec::new(),
         });
     }
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(directory) = current_exe.parent() {
-            candidates.push(ExternalCommandSpec {
-                program: directory.join("tools").join(executable_name),
-                prefix_args: Vec::new(),
-            });
-            candidates.push(ExternalCommandSpec {
-                program: directory.join(executable_name),
-                prefix_args: Vec::new(),
-            });
-        }
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(directory) = current_exe.parent()
+    {
+        candidates.push(ExternalCommandSpec {
+            program: directory.join("tools").join(executable_name),
+            prefix_args: Vec::new(),
+        });
+        candidates.push(ExternalCommandSpec {
+            program: directory.join(executable_name),
+            prefix_args: Vec::new(),
+        });
     }
     if let Ok(cached) = ytdlp_cache_path() {
         candidates.push(ExternalCommandSpec {
@@ -1494,16 +1495,15 @@ pub(crate) fn inspect_media_with_context_sync(
             &request_context,
             &mut collector,
             &mut warnings,
-        ) {
-            if !had_candidates {
-                warnings.push(SiteWarning::site(
-                    "bilibili-playurl-fallback-failed",
-                    format!(
-                        "Bilibili playurl API could not resolve this video: {}",
-                        error
-                    ),
-                ));
-            }
+        ) && !had_candidates
+        {
+            warnings.push(SiteWarning::site(
+                "bilibili-playurl-fallback-failed",
+                format!(
+                    "Bilibili playurl API could not resolve this video: {}",
+                    error
+                ),
+            ));
         }
     }
 
@@ -1528,22 +1528,22 @@ pub(crate) fn inspect_media_with_context_sync(
 
     let candidates = score_candidates(collector.finish(), &request_context);
 
-    if candidates.is_empty() {
-        if let Some(auth_warning) = warnings.iter().find(|warning| warning.scope() == "auth") {
-            let challenge_reason = auth_warning.message().to_string();
-            return Ok(MediaInspectionResult {
-                page_url: url,
-                page_title,
-                extractor,
-                candidates,
-                warnings: warnings
-                    .into_iter()
-                    .map(SiteWarning::into_display)
-                    .collect(),
-                auth_required: true,
-                challenge_reason,
-            });
-        }
+    if candidates.is_empty()
+        && let Some(auth_warning) = warnings.iter().find(|warning| warning.scope() == "auth")
+    {
+        let challenge_reason = auth_warning.message().to_string();
+        return Ok(MediaInspectionResult {
+            page_url: url,
+            page_title,
+            extractor,
+            candidates,
+            warnings: warnings
+                .into_iter()
+                .map(SiteWarning::into_display)
+                .collect(),
+            auth_required: true,
+            challenge_reason,
+        });
     }
 
     if candidates.is_empty() {
@@ -2581,12 +2581,12 @@ pub(crate) fn run_hls_pipeline(
     // file) when the output's parent directory does not exist — e.g. when the
     // external files dir has not been materialised yet. Create it up-front so
     // a missing directory can never cause a spurious "no output file".
-    if let Some(parent) = Path::new(output).parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create output directory: {}", parent.display())
-            })?;
-        }
+    if let Some(parent) = Path::new(output).parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
     }
 
     let concurrency = concurrency.max(1) as usize;
@@ -3085,10 +3085,10 @@ fn normalize_source_url(input: &str) -> Result<String> {
         bail!("Source URL is empty");
     }
 
-    if let Ok(url) = Url::parse(input) {
-        if matches!(url.scheme(), "http" | "https") {
-            return Ok(url.to_string());
-        }
+    if let Ok(url) = Url::parse(input)
+        && matches!(url.scheme(), "http" | "https")
+    {
+        return Ok(url.to_string());
     }
 
     let url_pattern = Regex::new(r#"https?://[^\s<>\"']+"#)?;
@@ -3184,18 +3184,17 @@ fn protocol_from_url(url: &str) -> String {
 }
 
 fn container_from_url(url: &str) -> String {
-    if let Ok(parsed) = Url::parse(url) {
-        if let Some((_, mime)) = parsed
+    if let Ok(parsed) = Url::parse(url)
+        && let Some((_, mime)) = parsed
             .query_pairs()
             .find(|(name, _)| name == "mime" || name == "type")
-        {
-            let mime = mime.to_ascii_lowercase();
-            if mime.contains("mp4") {
-                return "mp4".to_string();
-            }
-            if mime.contains("webm") {
-                return "webm".to_string();
-            }
+    {
+        let mime = mime.to_ascii_lowercase();
+        if mime.contains("mp4") {
+            return "mp4".to_string();
+        }
+        if mime.contains("webm") {
+            return "webm".to_string();
         }
     }
     let without_query = url.split('?').next().unwrap_or(url);
@@ -3442,16 +3441,14 @@ fn stream_media_response_to_file(
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.to_ascii_lowercase())
-    {
-        if content_type.starts_with("text/html")
+        && (content_type.starts_with("text/html")
             || content_type.starts_with("application/json")
-            || content_type.starts_with("text/json")
-        {
-            bail!(
-                "Media request returned non-media content type {}",
-                content_type
-            );
-        }
+            || content_type.starts_with("text/json"))
+    {
+        bail!(
+            "Media request returned non-media content type {}",
+            content_type
+        );
     }
 
     let total = first_headers
@@ -3754,11 +3751,12 @@ fn join_manifest_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        bilibili_playurl_api_url, canonical_site_context, checksum_for_release_asset,
-        has_mp4_signature, hls_response_bytes, is_valid_header_value_byte, normalize_source_url,
-        parse_ytdlp_progress, playlist_base_url, resolve_dash_download_plan_from_manifest,
-        resolve_hls_byte_range, select_best_hls_variant, select_hls_audio_rendition,
-        should_auto_inspect_download_target, youtube_itag_from_media_url, ByteRange, Playlist,
+        ByteRange, Playlist, bilibili_playurl_api_url, canonical_site_context,
+        checksum_for_release_asset, has_mp4_signature, hls_response_bytes,
+        is_valid_header_value_byte, normalize_source_url, parse_ytdlp_progress, playlist_base_url,
+        resolve_dash_download_plan_from_manifest, resolve_hls_byte_range, select_best_hls_variant,
+        select_hls_audio_rendition, should_auto_inspect_download_target,
+        youtube_itag_from_media_url,
     };
     use crate::hls::parse_playlist;
     use url::Url;
@@ -3812,9 +3810,11 @@ mod tests {
             .expect("episode API URL should resolve")
             .expect("episode id should be sufficient");
         assert_eq!(episode_api.path(), "/pgc/player/web/playurl");
-        assert!(episode_api
-            .query_pairs()
-            .any(|(name, value)| { name == "ep_id" && value == "987654" }));
+        assert!(
+            episode_api
+                .query_pairs()
+                .any(|(name, value)| { name == "ep_id" && value == "987654" })
+        );
     }
 
     #[test]
@@ -3841,16 +3841,20 @@ mod tests {
                 .bytes()
                 .all(is_valid_header_value_byte)
         );
-        assert!("Mozilla/5.0 (中文设备) Chrome/120"
-            .bytes()
-            .all(is_valid_header_value_byte));
+        assert!(
+            "Mozilla/5.0 (中文设备) Chrome/120"
+                .bytes()
+                .all(is_valid_header_value_byte)
+        );
         assert!(!b"\r".iter().copied().all(is_valid_header_value_byte));
         assert!(!b"\n".iter().copied().all(is_valid_header_value_byte));
         assert!(!b"\x00".iter().copied().all(is_valid_header_value_byte));
         assert!(!b"\x7f".iter().copied().all(is_valid_header_value_byte));
-        assert!(!"text/html\r\nX-Evil: 1"
-            .bytes()
-            .all(is_valid_header_value_byte));
+        assert!(
+            !"text/html\r\nX-Evil: 1"
+                .bytes()
+                .all(is_valid_header_value_byte)
+        );
     }
 
     #[test]
@@ -3862,8 +3866,7 @@ mod tests {
 
     #[test]
     fn accepts_only_the_requested_official_release_checksum() {
-        let checksums =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  yt-dlp\n\
+        let checksums = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  yt-dlp\n\
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *yt-dlp.exe\n";
         assert_eq!(
             checksum_for_release_asset(checksums, "yt-dlp.exe").as_deref(),
@@ -3925,15 +3928,17 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *yt-dlp.exe\n";
             .expect("implicit range should continue from the prior range"),
             Some((6, 8))
         );
-        assert!(resolve_hls_byte_range(
-            "other.mp4",
-            Some(&ByteRange {
-                length: 2,
-                offset: None,
-            }),
-            &mut cursor,
-        )
-        .is_err());
+        assert!(
+            resolve_hls_byte_range(
+                "other.mp4",
+                Some(&ByteRange {
+                    length: 2,
+                    offset: None,
+                }),
+                &mut cursor,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4773,8 +4778,7 @@ fn download_and_merge(
             Err(error) => {
                 warn!(
                     "Multi-thread segment download failed with concurrency {}. Retrying single-threaded: {}",
-                    concurrency,
-                    error
+                    concurrency, error
                 );
                 cleanup_segment_temp_files(temp_dir, output_file);
                 emit_progress(
@@ -5162,69 +5166,71 @@ fn download_and_merge_once(
             let segment_requests = &segment_requests_shared;
             let init_requests = &init_requests_shared;
             let segment_crypto = &segment_crypto_shared;
-            scope.spawn(move || loop {
-                // Stop early if a previous worker failed.
-                if errors.lock().unwrap().is_some() {
-                    break;
-                }
-                let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if idx >= total {
-                    break;
-                }
-
-                let result = (|| -> Result<()> {
-                    let segment_request = segment_requests[idx].clone();
-                    let init_request = init_requests[idx].clone();
-                    let key = segment_crypto.get(idx).cloned().flatten();
-
-                    let mut buffer = Vec::new();
-                    if let Some(init_request) = init_request {
-                        let init_data =
-                            download_hls_resource(&client, &init_request, &headers, retries)?;
-                        let init_data = decrypt_hls_resource(init_data, key.as_ref())?;
-                        buffer.extend_from_slice(&init_data);
+            scope.spawn(move || {
+                loop {
+                    // Stop early if a previous worker failed.
+                    if errors.lock().unwrap().is_some() {
+                        break;
                     }
-                    let segment_data =
-                        download_hls_resource(&client, &segment_request, &headers, retries)?;
-                    let segment_data = decrypt_hls_resource(segment_data, key.as_ref())?;
-                    buffer.extend_from_slice(&segment_data);
-
-                    let file_name = format!("{}_{:05}.part", segment_prefix, idx);
-                    let tmp_path = temp_dir.join(file_name);
-                    std::fs::write(&tmp_path, &buffer).with_context(|| {
-                        format!(
-                            "Failed to write segment: {} (url: {})",
-                            tmp_path.display(),
-                            segment_request.url
-                        )
-                    })?;
-
-                    let count = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    pb.set_position(count);
-
-                    let total_u64 = total as u64;
-                    let coarse = ((count as f64) / (total as f64) * 900.0) as u64;
-                    let is_final = count >= total_u64;
-                    let should_emit = is_final
-                        || coarse.saturating_sub(
-                            last_reported.load(std::sync::atomic::Ordering::Relaxed),
-                        ) >= 9;
-                    if should_emit {
-                        last_reported.store(coarse, std::sync::atomic::Ordering::Relaxed);
-                        pb.set_message(format!("Downloading segments [{}/{}]", count, total));
-                        emit_progress(
-                            &reporter,
-                            format!("Downloading segments [{}/{}]", count, total),
-                            (count as f64) / (total as f64) * 0.9,
-                        );
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if idx >= total {
+                        break;
                     }
-                    Ok(())
-                })();
 
-                if let Err(error) = result {
-                    let mut slot = errors.lock().unwrap();
-                    if slot.is_none() {
-                        *slot = Some(error);
+                    let result = (|| -> Result<()> {
+                        let segment_request = segment_requests[idx].clone();
+                        let init_request = init_requests[idx].clone();
+                        let key = segment_crypto.get(idx).cloned().flatten();
+
+                        let mut buffer = Vec::new();
+                        if let Some(init_request) = init_request {
+                            let init_data =
+                                download_hls_resource(&client, &init_request, &headers, retries)?;
+                            let init_data = decrypt_hls_resource(init_data, key.as_ref())?;
+                            buffer.extend_from_slice(&init_data);
+                        }
+                        let segment_data =
+                            download_hls_resource(&client, &segment_request, &headers, retries)?;
+                        let segment_data = decrypt_hls_resource(segment_data, key.as_ref())?;
+                        buffer.extend_from_slice(&segment_data);
+
+                        let file_name = format!("{}_{:05}.part", segment_prefix, idx);
+                        let tmp_path = temp_dir.join(file_name);
+                        std::fs::write(&tmp_path, &buffer).with_context(|| {
+                            format!(
+                                "Failed to write segment: {} (url: {})",
+                                tmp_path.display(),
+                                segment_request.url
+                            )
+                        })?;
+
+                        let count = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        pb.set_position(count);
+
+                        let total_u64 = total as u64;
+                        let coarse = ((count as f64) / (total as f64) * 900.0) as u64;
+                        let is_final = count >= total_u64;
+                        let should_emit = is_final
+                            || coarse.saturating_sub(
+                                last_reported.load(std::sync::atomic::Ordering::Relaxed),
+                            ) >= 9;
+                        if should_emit {
+                            last_reported.store(coarse, std::sync::atomic::Ordering::Relaxed);
+                            pb.set_message(format!("Downloading segments [{}/{}]", count, total));
+                            emit_progress(
+                                &reporter,
+                                format!("Downloading segments [{}/{}]", count, total),
+                                (count as f64) / (total as f64) * 0.9,
+                            );
+                        }
+                        Ok(())
+                    })();
+
+                    if let Err(error) = result {
+                        let mut slot = errors.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
                     }
                 }
             });
@@ -5248,7 +5254,15 @@ fn download_and_merge_once(
         let mut list_content = String::new();
         for i in 0..total {
             let segment_path = temp_dir.join(format!("{}_{:05}.part", segment_prefix, i));
-            let absolute = std::path::absolute(&segment_path).unwrap_or(segment_path);
+            // MSRV 1.78 has no `std::path::absolute`; make the path absolute
+            // by hand so the concat list always contains absolute paths.
+            let absolute = if segment_path.is_absolute() {
+                segment_path
+            } else {
+                std::env::current_dir()
+                    .map(|dir| dir.join(&segment_path))
+                    .unwrap_or(segment_path)
+            };
             let normalized = absolute.to_string_lossy().replace('\\', "/");
             let escaped = normalized.replace('\'', "'\\''");
             list_content.push_str(&format!("file '{}'\n", escaped));
@@ -5426,11 +5440,7 @@ fn push_accel_encode_args(args: &mut Vec<String>, accel: AccelType) {
 /// was the root cause of outputs containing only the first few seconds.
 fn concat_list_for_input(input_path: &Path) -> Option<PathBuf> {
     let list = PathBuf::from(format!("{}.concat.txt", input_path.to_string_lossy()));
-    if list.is_file() {
-        Some(list)
-    } else {
-        None
-    }
+    if list.is_file() { Some(list) } else { None }
 }
 
 fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
@@ -5459,14 +5469,13 @@ fn probe_media_duration(path: &Path, ffmpeg_path: &Path) -> Option<f64> {
         path.to_string_lossy().to_string(),
     ];
     let probe = run_ffmpeg(&ffprobe_path, &probe_args, Duration::from_secs(20)).ok()?;
-    if probe.status.success() {
-        if let Ok(text) = String::from_utf8(probe.stdout) {
-            if let Ok(seconds) = text.trim().parse::<f64>() {
-                if seconds.is_finite() && seconds > 0.0 {
-                    return Some(seconds);
-                }
-            }
-        }
+    if probe.status.success()
+        && let Ok(text) = String::from_utf8(probe.stdout)
+        && let Ok(seconds) = text.trim().parse::<f64>()
+        && seconds.is_finite()
+        && seconds > 0.0
+    {
+        return Some(seconds);
     }
 
     let inspect_args = [
@@ -5933,7 +5942,8 @@ pub fn init_android_transcoder_check() -> Result<String> {
 }
 
 #[cfg(target_os = "android")]
-#[no_mangle]
+// Edition 2024 requires unsafe attributes to be spelled `#[unsafe(...)]`.
+#[unsafe(no_mangle)]
 pub extern "C" fn JNI_OnLoad(
     vm: *mut jni::sys::JavaVM,
     _reserved: *mut std::os::raw::c_void,

@@ -6,9 +6,8 @@ use url::Url;
 use crate::api::downloader::CandidateCollector;
 
 use super::common::{
-    extract_json_object_after_any, extract_json_string_after_any, extract_page_title,
+    SiteWarning, extract_json_object_after_any, extract_json_string_after_any, extract_page_title,
     extract_text_runs_pointer, first_media_url, first_string_pointer, normalize_exposed_media_url,
-    SiteWarning,
 };
 
 pub(crate) fn extract_youtube_candidates(

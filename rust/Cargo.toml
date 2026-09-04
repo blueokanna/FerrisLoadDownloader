@@ -1,12 +1,12 @@
 [package]
 name = "rust_lib_m3u8_downloader"
 version = "0.1.3"
-edition = "2021"
-rust-version = "1.95"
+edition = "2024"
+rust-version = "1.88"
 license-file = "../LICENSE"
 authors = ["blueokanna"]
-description = "FerrisLoad application runtime and Flutter bridge"
-repository = "https://github.com/blueokanna/m3u8-downloader"
+description = "FerrisLoad application runtime and Flutter bridge for video downloading"
+repository = "https://github.com/blueokanna/FerrisLoadDownloader"
 
 [workspace]
 members = ["core"]
@@ -17,15 +17,12 @@ name = "rust_lib_m3u8_downloader"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-aes = "0.9"
 anyhow = "1.0.104"
-clap = { version = "4.6.6", features = ["derive"] }
 ferrisload-core = { path = "core", version = "0.1.3", features = ["std"] }
 
 flutter_rust_bridge = "2.13.0"
 
 hex = "0.4.3"
-indicatif = "0.18.6"
 jni = "0.21.1"
 log = "0.4.34"
 env_logger = "0.11.11"
@@ -33,19 +30,16 @@ env_logger = "0.11.11"
 regex = "1.13.1"
 
 nextjson = { version = "0.1.4", features = ["derive", "std"] }
-tzcraft = { version = "0.1.1", default-features = false, features = [
+tzcraft = { version = "0.1.2", default-features = false, features = [
     "std",
     "serde",
 ] }
-courierust = "1.0.1"
-ureq = { version = "3.4.0", default-features = false, features = [
-    "rustls",
-    "gzip",
-] }
+courierust = "1.0.3"
 webpki-root-certs = "1.0.9"
 url = "2.5.8"
-uuid = { version = "1.25.0", features = ["v4"] }
 dashmap = "6.2.1"
+indicatif = "0.18.6"
+uuid = { version = "1.26.0", features = ["v4"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15.1"

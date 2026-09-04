@@ -5,8 +5,8 @@ use url::Url;
 use crate::api::downloader::CandidateCollector;
 
 use super::common::{
-    extract_json_object_after_any, extract_json_string_after_any, extract_page_title,
-    first_array_pointer, first_media_url, first_string_pointer, SiteWarning,
+    SiteWarning, extract_json_object_after_any, extract_json_string_after_any, extract_page_title,
+    first_array_pointer, first_media_url, first_string_pointer,
 };
 
 pub(crate) fn extract_bilibili_candidates(

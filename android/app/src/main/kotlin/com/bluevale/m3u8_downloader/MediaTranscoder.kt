@@ -56,6 +56,16 @@ object MediaTranscoder {
     private const val TIMEOUT_US = 10_000L // 10ms per poll
     private const val MAX_STALL_MS = 30_000L // 30s stall → abort
 
+    // PTS re-basing threshold. MediaExtractor yields samples in DECODE order,
+    // so H.264/HEVC streams with B-frames legitimately step BACKWARD by a few
+    // frame periods inside every GOP. Re-basing on every backward step (the
+    // old `<= lastPts` test) rewrote the whole timeline of B-frame content:
+    // stretched duration, duplicated/lost timestamps, wrong effective fps.
+    // Only treat a backward jump bigger than this as a real discontinuity (an
+    // HLS/TS segment resetting its PTS back to ~0), which is always
+    // seconds-scale, never a sub-second B-frame reorder.
+    private const val PTS_REBASE_THRESHOLD_US = 500_000L // 500 ms
+
     private data class EncoderSession(val codec: MediaCodec, val surface: Surface)
 
     @JvmStatic
@@ -337,7 +347,7 @@ object MediaTranscoder {
             var firstPts = Long.MAX_VALUE
             var lastPts = Long.MIN_VALUE
             var frames = 0
-            val scratch = ByteBuffer.allocateDirect(64 * 1024)
+            val scratch = ByteBuffer.allocateDirect(4 * 1024 * 1024)
             while (true) {
                 val sz = ext.readSampleData(scratch, 0)
                 if (sz < 0) break
@@ -406,7 +416,7 @@ object MediaTranscoder {
                     info.size = sz
                     val rawPts = ext.sampleTime
                     var adjustedPts = rawPts + ptsOffset
-                    if (adjustedPts <= lastPts) {
+                    if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
                         ptsOffset += (lastPts - adjustedPts) + 1L
                         adjustedPts = rawPts + ptsOffset
                     }
@@ -623,17 +633,23 @@ object MediaTranscoder {
                         setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
                         setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                         setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                        // Real input rate (µs units, API 26+) so the encoder's
-                        // scheduler does not re-time frames and cause stutter.
+                        // `KEY_OPERATING_RATE` is documented in *frames per
+                        // second* (not µs): asking for `fps * 1000` (e.g.
+                        // 30_000 fps for 30 fps content) confuses the codec's
+                        // rate scheduler and can make it re-time the output
+                        // timeline.  Pass the real rate only.
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            setInteger(MediaFormat.KEY_OPERATING_RATE, fps * 1000)
+                            setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
                         }
-                        // Realtime priority (API 23+): keeps the hardware encoder from
-                        // being starved by background work, which otherwise causes
-                        // missed frame deadlines and playback stutter.
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            setInteger(MediaFormat.KEY_PRIORITY, 0)
-                        }
+                        // Deliberately do NOT set KEY_PRIORITY=0 (realtime).
+                        // This is an offline batch transcode fed as fast as the
+                        // hardware can consume it; realtime priority makes some
+                        // vendor encoders pace output against the wall clock
+                        // instead of the input timestamps, which stretches the
+                        // timeline (the source of “30 min becomes 60 min” and
+                        // “30 fps plays at ~15 fps” reports).  The default
+                        // non-realtime priority lets the encoder honor input
+                        // presentation timestamps.
                         // No B-frames: lower encode latency and simpler decode on
                         // low-end players; most AVC hardware encoders default to 0.
                         setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
@@ -741,7 +757,7 @@ object MediaTranscoder {
                             }
                             val rawPts = ext.sampleTime
                             var adjustedPts = rawPts + videoPtsOffset
-                            if (adjustedPts <= lastVideoDecodePts) {
+                            if (adjustedPts < lastVideoDecodePts - PTS_REBASE_THRESHOLD_US) {
                                 videoPtsOffset += (lastVideoDecodePts - adjustedPts) + 1L
                                 adjustedPts = rawPts + videoPtsOffset
                             }
@@ -783,11 +799,14 @@ object MediaTranscoder {
                                 muxer.start()
                                 muxerStarted = true
                             }
-                            if (firstVideoPts < 0 && encInfo.presentationTimeUs > 0) {
+                            if (firstVideoPts < 0) {
                                 firstVideoPts = encInfo.presentationTimeUs
                             }
                             if (firstVideoPts > 0) {
                                 encInfo.presentationTimeUs -= firstVideoPts
+                            }
+                            if (encInfo.presentationTimeUs < 0) {
+                                encInfo.presentationTimeUs = 0
                             }
                             data.position(encInfo.offset)
                             data.limit(encInfo.offset + encInfo.size)
@@ -917,9 +936,21 @@ object MediaTranscoder {
                     future.shutdownNow()
                 }
         if (actualMs <= 0) return true // cannot determine; do not block on it
-        val tolerance = (expectedMs * 85L / 100L).coerceAtLeast(expectedMs - 5000L)
-        if (actualMs + 1000L < tolerance) {
+        val minTolerance = (expectedMs * 85L / 100L).coerceAtLeast(expectedMs - 5000L)
+        if (actualMs + 1000L < minTolerance) {
             Log.e(TAG, "$what duration check failed: expected≈${expectedMs}ms got ${actualMs}ms")
+            return false
+        }
+        // Upper bound: an output that is significantly LONGER than the playlist
+        // says (e.g. a doubled timeline from an encoder that re-times Surface
+        // input) is just as wrong as a truncated one.  Allow normal container
+        // slack (trailing frames / segment rounding): up to 120% + 30 s.
+        val maxTolerance = expectedMs + maxOf(30_000L, expectedMs / 5L)
+        if (actualMs > maxTolerance) {
+            Log.e(
+                    TAG,
+                    "$what duration check failed: expected≈${expectedMs}ms got ${actualMs}ms (inflated)"
+            )
             return false
         }
         return true
@@ -981,7 +1012,7 @@ object MediaTranscoder {
                 info.size = size
                 val rawPts = extractor.sampleTime
                 var adjustedPts = rawPts + ptsOffset
-                if (adjustedPts <= lastPts) {
+                if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
                     ptsOffset += (lastPts - adjustedPts) + 1L
                     adjustedPts = rawPts + ptsOffset
                 }
@@ -1077,7 +1108,7 @@ object MediaTranscoder {
                     info.size = sz
                     val rawPts = ext.sampleTime
                     var adjustedPts = rawPts + ptsOffset
-                    if (adjustedPts <= lastPts) {
+                    if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
                         ptsOffset += (lastPts - adjustedPts) + 1L
                         adjustedPts = rawPts + ptsOffset
                     }
@@ -1169,11 +1200,11 @@ object MediaTranscoder {
                         setInteger(MediaFormat.KEY_BIT_RATE, targetBitrate)
                         setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                         setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                        // See the comment in hardwareTranscodeSegments: the
+                        // operating rate is frames/second and realtime priority
+                        // must not be set for an offline batch transcode.
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            setInteger(MediaFormat.KEY_OPERATING_RATE, fps * 1000)
-                        }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            setInteger(MediaFormat.KEY_PRIORITY, 0)
+                            setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
                         }
                         // No B-frames: lower encode latency and simpler decode.
                         setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
@@ -1254,7 +1285,7 @@ object MediaTranscoder {
                         } else {
                             val rawPts = extractor.sampleTime
                             var adjustedPts = rawPts + videoPtsOffset
-                            if (adjustedPts <= lastVideoDecodePts) {
+                            if (adjustedPts < lastVideoDecodePts - PTS_REBASE_THRESHOLD_US) {
                                 videoPtsOffset += (lastVideoDecodePts - adjustedPts) + 1L
                                 adjustedPts = rawPts + videoPtsOffset
                             }
@@ -1295,11 +1326,14 @@ object MediaTranscoder {
                                 muxer.start()
                                 muxerStarted = true
                             }
-                            if (firstVideoPts < 0 && encInfo.presentationTimeUs > 0) {
+                            if (firstVideoPts < 0) {
                                 firstVideoPts = encInfo.presentationTimeUs
                             }
                             if (firstVideoPts > 0) {
                                 encInfo.presentationTimeUs -= firstVideoPts
+                            }
+                            if (encInfo.presentationTimeUs < 0) {
+                                encInfo.presentationTimeUs = 0
                             }
                             data.position(encInfo.offset)
                             data.limit(encInfo.offset + encInfo.size)
@@ -1472,7 +1506,7 @@ object MediaTranscoder {
                 info.size = sz
                 val rawPts = ext.sampleTime
                 var adjustedPts = rawPts + ptsOffset
-                if (adjustedPts <= lastPts) {
+                if (adjustedPts < lastPts - PTS_REBASE_THRESHOLD_US) {
                     ptsOffset += (lastPts - adjustedPts) + 1L
                     adjustedPts = rawPts + ptsOffset
                 }

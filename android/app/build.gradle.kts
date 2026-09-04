@@ -22,7 +22,8 @@ val hasReleaseSigning = releaseStoreFile != null &&
 
 android {
     namespace = "com.bluevale.m3u8_downloader"
-    compileSdk = flutter.compileSdkVersion
+    // permission_handler_android 14.x 要求 SDK 37;显式抬升(向后兼容)。
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
