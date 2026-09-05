@@ -84,10 +84,18 @@ object MediaTranscoder {
                 return false
             }
 
-            // 1) Try remux first (only when no re-encode is requested and the
-            //    stream is B-frame free; see `videoNeedsReencode`).
-            if (vBitrate <= 0 && aBitrate <= 0 && !videoNeedsReencode(inputPath)) {
-                val remuxOk = tryRemux(inputPath, outputPath)
+            // 1) Try a lossless stream-copy remux first whenever no re-encode
+            //    is requested. MediaMuxer (API 25+) writes a proper ctts table
+            //    when B-frame samples are fed in decode order with their REAL
+            //    PTS, so even B-frame content is remuxed at disk speed
+            //    (seconds for a full movie) instead of being re-encoded. Only
+            //    a pre-API-25 device cannot represent B-frames losslessly;
+            //    that (and any remux failure caught by the checks below)
+            //    falls through to the hardware pipeline.
+            val hasBframes = videoNeedsReencode(inputPath)
+            val canMuxBframes = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1
+            if (vBitrate <= 0 && aBitrate <= 0 && (!hasBframes || canMuxBframes)) {
+                val remuxOk = tryRemux(inputPath, outputPath, hasBframes && canMuxBframes)
                 if (remuxOk &&
                                 verifyOutput(outputPath) &&
                                 verifyDuration(outputPath, expectedDurationMs, "remux")
@@ -164,8 +172,31 @@ object MediaTranscoder {
             val muxVideoIndex = muxer.addTrack(videoTrack.format)
             val muxAudioIndex = muxer.addTrack(audioTrack.format)
             muxer.start()
-            val videoSamples = writeTrackSamples(videoPath, videoTrack.index, muxVideoIndex, muxer)
-            val audioSamples = writeTrackSamples(audioPath, audioTrack.index, muxAudioIndex, muxer)
+            // MediaMuxer (API 25+) can stream-copy B-frame H.264 into MP4 when
+            // samples arrive in decode order with their REAL PTS (it writes a
+            // ctts table), so keep the B-frames and make the merge lossless at
+            // disk speed. The audio track is always flattened because the MP4
+            // writer requires strictly monotonic audio PTS.
+            val videoHasBframes = videoNeedsReencode(videoPath)
+            val canMuxBframes = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1
+            val videoSamples =
+                    writeTrackSamples(
+                            videoPath,
+                            videoTrack.index,
+                            muxVideoIndex,
+                            muxer,
+                            video = true,
+                            preserveBframes = videoHasBframes && canMuxBframes
+                    )
+            val audioSamples =
+                    writeTrackSamples(
+                            audioPath,
+                            audioTrack.index,
+                            muxAudioIndex,
+                            muxer,
+                            video = false,
+                            preserveBframes = false
+                    )
             muxer.stop()
             val ok =
                     videoSamples > 0 &&
@@ -426,12 +457,18 @@ object MediaTranscoder {
     }
 
     /**
-     * True when the video stream in `path` cannot be losslessly stream-copied
-     * into an MP4. A backward PTS step between consecutive decode-order
-     * samples means the stream uses B-frame reordering; Android's MediaMuxer
-     * cannot represent that (it drops non-monotonic samples, or inflates the
-     * timeline when they are forced monotonic), so such content must be
-     * re-encoded into a B-frame-free stream instead of remuxed.
+     * True when the video stream in `path` uses B-frame reordering (a
+     * backward PTS step between consecutive decode-order samples).
+     *
+     * A B-frame stream cannot be remuxed by simply flattening its PTS to a
+     * monotonic timeline — that is exactly what makes MediaMuxer drop samples
+     * or inflate the duration. Two correct options exist: on API 25+ the
+     * stream is still copied losslessly when its REAL decode-order PTS is
+     * preserved (MediaMuxer then writes a ctts table — see
+     * [writeTrackSamples] with `preserveBframes = true`); on older platforms
+     * no lossless representation is possible and the stream must be
+     * re-encoded B-frame-free instead. Callers combine this probe with the
+     * platform check to choose which path applies.
      */
     private fun videoNeedsReencode(path: String): Boolean {
         val extractor = MediaExtractor()
@@ -1228,7 +1265,9 @@ object MediaTranscoder {
             path: String,
             sourceIndex: Int,
             destinationIndex: Int,
-            muxer: MediaMuxer
+            muxer: MediaMuxer,
+            video: Boolean,
+            preserveBframes: Boolean
     ): Int {
         val extractor = MediaExtractor()
         try {
@@ -1240,30 +1279,42 @@ object MediaTranscoder {
             val info = MediaCodec.BufferInfo()
             var firstPts = -1L
             var samples = 0
-            // HLS video/audio streams are naive concatenations of independent
-            // segments whose PTS restarts at zero at each boundary; re-base the
-            // timeline so the merged MP4 is monotonic.
+            // Map a source PTS to the PTS handed to the muxer. B-frame video
+            // keeps its real (swinging) decode-order PTS so MediaMuxer (API
+            // 25+) writes a proper ctts table and the stream is copied
+            // losslessly; every backward step of more than 500 ms is a fresh
+            // segment/timeline whose PTS restarted, and is lifted so the whole
+            // output stays continuous. Everything else (audio, and video that
+            // MediaMuxer must flatten) is clamped to a strictly monotonic
+            // timeline, which the MP4 writer requires.
+            val bframeTimeline = DecoderPtsTimeline()
             var lastPts = Long.MIN_VALUE
             var ptsOffset = 0L
+            val mapPts: (Long) -> Long =
+                    if (video && preserveBframes) {
+                        { raw -> bframeTimeline.next(raw) }
+                    } else {
+                        { raw ->
+                            var adjusted = raw + ptsOffset
+                            if (adjusted <= lastPts) {
+                                ptsOffset += (lastPts - adjusted) + 1L
+                                adjusted = raw + ptsOffset
+                            }
+                            lastPts = adjusted
+                            adjusted
+                        }
+                    }
             while (true) {
                 val size = extractor.readSampleData(buffer, 0)
                 if (size < 0) break
                 info.offset = 0
                 info.size = size
-                val rawPts = extractor.sampleTime
-                var adjustedPts = rawPts + ptsOffset
-                // MediaMuxer REQUIRES per-track monotonic PTS (B-frame decode
-                // order steps backward; the MP4 writer drops such samples).
-                if (adjustedPts <= lastPts) {
-                    ptsOffset += (lastPts - adjustedPts) + 1L
-                    adjustedPts = rawPts + ptsOffset
-                }
-                lastPts = adjustedPts
-                info.presentationTimeUs = adjustedPts
+                var adjustedPts = mapPts(extractor.sampleTime)
                 info.flags = extractor.sampleFlags
-                if (firstPts < 0) firstPts = info.presentationTimeUs
-                if (firstPts > 0) info.presentationTimeUs -= firstPts
-                if (info.presentationTimeUs < 0) info.presentationTimeUs = 0
+                if (firstPts < 0) firstPts = adjustedPts
+                if (firstPts > 0) adjustedPts -= firstPts
+                if (adjustedPts < 0) adjustedPts = 0
+                info.presentationTimeUs = adjustedPts
                 muxer.writeSampleData(destinationIndex, buffer, info)
                 samples++
                 extractor.advance()
@@ -1278,7 +1329,11 @@ object MediaTranscoder {
     //  REMUX — Pure repackaging, no recoding
     // ═══════════════════════════════════════════════════════════════════════
 
-    private fun tryRemux(inputPath: String, outputPath: String): Boolean {
+    private fun tryRemux(
+            inputPath: String,
+            outputPath: String,
+            allowBframes: Boolean = false
+    ): Boolean {
         var extractor: MediaExtractor? = null
         try {
             extractor = MediaExtractor().also { it.setDataSource(inputPath) }
@@ -1305,7 +1360,7 @@ object MediaTranscoder {
 
             extractor.release()
             extractor = null
-            remuxTracks(inputPath, outputPath, videoIdx, audioIdx)
+            remuxTracks(inputPath, outputPath, videoIdx, audioIdx, allowBframes)
             return true
         } catch (e: Exception) {
             Log.w(TAG, "Remux exception: ${e.message}", e)
@@ -1316,7 +1371,13 @@ object MediaTranscoder {
     }
 
     @Throws(IOException::class)
-    private fun remuxTracks(inputPath: String, outputPath: String, videoIdx: Int, audioIdx: Int) {
+    private fun remuxTracks(
+            inputPath: String,
+            outputPath: String,
+            videoIdx: Int,
+            audioIdx: Int,
+            allowBframes: Boolean = false
+    ) {
         val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         try {
             val setup = MediaExtractor().also { it.setDataSource(inputPath) }
@@ -1326,50 +1387,32 @@ object MediaTranscoder {
 
             muxer.start()
 
-            val buf = ByteBuffer.allocateDirect(8 * 1024 * 1024)
-            val info = MediaCodec.BufferInfo()
-
             // Write each track with its own extractor to avoid PTS interleaving.
-            val pairs = mutableListOf(videoIdx to vOutIdx)
-            if (audioIdx >= 0 && aOutIdx >= 0) pairs.add(audioIdx to aOutIdx)
-
-            for ((srcIdx, dstIdx) in pairs) {
-                val ext =
-                        MediaExtractor().also {
-                            it.setDataSource(inputPath)
-                            it.selectTrack(srcIdx)
-                        }
-                var firstPts = -1L
-                var n = 0
-                var lastPts = Long.MIN_VALUE
-                var ptsOffset = 0L
-                while (true) {
-                    val sz = ext.readSampleData(buf, 0)
-                    if (sz < 0) break
-                    info.offset = 0
-                    info.size = sz
-                    val rawPts = ext.sampleTime
-                    var adjustedPts = rawPts + ptsOffset
-                    // MediaMuxer REQUIRES per-track monotonic PTS (B-frame
-                    // decode order steps backward; MP4 writer drops samples).
-                    if (adjustedPts <= lastPts) {
-                        ptsOffset += (lastPts - adjustedPts) + 1L
-                        adjustedPts = rawPts + ptsOffset
-                    }
-                    lastPts = adjustedPts
-                    info.presentationTimeUs = adjustedPts
-                    info.flags = ext.sampleFlags
-                    if (firstPts < 0) firstPts = info.presentationTimeUs
-                    if (firstPts > 0) info.presentationTimeUs -= firstPts
-                    if (info.presentationTimeUs < 0) info.presentationTimeUs = 0
-                    muxer.writeSampleData(dstIdx, buf, info)
-                    n++
-                    ext.advance()
-                }
-                ext.release()
-                Log.i(TAG, "Remux track $srcIdx→$dstIdx: $n samples")
+            // Video keeps its B-frames when requested (real decode-order PTS →
+            // MediaMuxer writes ctts); audio is always flattened.
+            val videoSamples =
+                    writeTrackSamples(
+                            inputPath,
+                            videoIdx,
+                            vOutIdx,
+                            muxer,
+                            video = true,
+                            preserveBframes = allowBframes
+                    )
+            var audioSamples = 0
+            if (audioIdx >= 0 && aOutIdx >= 0) {
+                audioSamples =
+                        writeTrackSamples(
+                                inputPath,
+                                audioIdx,
+                                aOutIdx,
+                                muxer,
+                                video = false,
+                                preserveBframes = false
+                        )
             }
             muxer.stop()
+            Log.i(TAG, "Remux tracks: video=$videoSamples audio=$audioSamples")
         } finally {
             runCatching { muxer.release() }
         }
