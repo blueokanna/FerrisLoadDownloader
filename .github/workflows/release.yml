@@ -16,6 +16,11 @@ on:
         description: 'Release tag name (e.g. v1.0.0). Leave empty to build only.'
         required: false
         default: ''
+      skip_docker:
+        description: 'Skip publishing the Docker API image (all app artifacts are still built and released).'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -529,7 +534,12 @@ jobs:
 
   docker-api:
     name: Publish Docker API image
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    # Tag pushes always publish the Docker image; a manual dispatch can opt
+    # out by ticking the `skip_docker` input. Skipping this job must not
+    # block the GitHub Release (create-release handles a 'skipped' result).
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_docker != 'true')
     needs: validate
     runs-on: ubuntu-latest
     permissions:
@@ -588,7 +598,16 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    if: (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '') && needs.build-android.outputs.release_signed == 'true'
+    # Runs for a v* tag or a manual dispatch with a tag name, provided the
+    # Android APKs were signed. Docker is intentionally decoupled: the app
+    # release must not be blocked when the Docker image is skipped
+    # (`skip_docker`) or fails, so only a fully cancelled docker run prevents
+    # publishing. Referencing needs.docker-api.result also stops GitHub from
+    # auto-skipping this job when docker-api was skipped.
+    if: >-
+      (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '')
+      && needs.build-android.outputs.release_signed == 'true'
+      && needs.docker-api.result != 'cancelled'
     permissions:
       contents: write
     needs:
@@ -620,6 +639,11 @@ jobs:
           fi
           echo "name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/m3u8-downloader-api:${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ needs.docker-api.result }}" == "success" ]]; then
+            echo "docker_line=Docker API image: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/m3u8-downloader-api:${RELEASE_NAME}\`" >> "$GITHUB_OUTPUT"
+          else
+            echo 'docker_line=Docker API image was not published for this release (skipped or failed; app artifacts above are unaffected).' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: List release files
         run: find artifacts -type f | sort
@@ -643,7 +667,7 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            Docker API image: `${{ steps.release_tag.outputs.image }}`
+            ${{ steps.release_tag.outputs.docker_line }}
           files: |
             artifacts/android-apks/FerrisLoad-android-arm64-v8a.apk
             artifacts/android-apks/FerrisLoad-android-armeabi-v7a.apk
