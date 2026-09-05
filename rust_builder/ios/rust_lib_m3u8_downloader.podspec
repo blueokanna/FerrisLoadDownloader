@@ -29,7 +29,20 @@ A new Flutter FFI plugin project.
   s.script_phase = {
     :name => 'Build Rust library',
     # First argument is relative path to the `rust` folder, second is name of rust library
-    :script => 'sh "$PODS_TARGET_SRCROOT/../cargokit/build_pod.sh" ../../rust rust_lib_m3u8_downloader',
+    #
+    # iOS cdylib link needs `-undefined dynamic_lookup`:
+    #   * `crate-type = ["cdylib", "staticlib"]` makes cargo link a cdylib as a
+    #     side product. iOS only consumes the staticlib (force-loaded below),
+    #     but the cdylib link must still succeed.
+    #   * The crate's iOS-only `#[cfg(target_os = "ios")] extern "C"`
+    #     declarations (ferrisload_videotoolbox_*) are implemented in the App's
+    #     `VideoToolboxBridge.m`, which is only present at the final App link -
+    #     not when cargo links the cdylib.
+    #   * cargo only reads `rust/.cargo/config.toml` from its current working
+    #     directory, and under Xcode that is NOT the `rust/` folder, so that
+    #     file's rustflags never reach this build. A per-target rustflags
+    #     environment variable is honored regardless of the working directory.
+    :script => 'export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" CARGO_TARGET_X86_64_APPLE_IOS_RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup"; sh "$PODS_TARGET_SRCROOT/../cargokit/build_pod.sh" ../../rust rust_lib_m3u8_downloader',
     :execution_position => :before_compile,
     :input_files => ['${BUILT_PRODUCTS_DIR}/cargokit_phony'],
     # Let XCode know that the static library referenced in -force_load below is
