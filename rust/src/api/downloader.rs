@@ -4888,12 +4888,8 @@ fn download_hls_resource(
 ) -> Result<Vec<u8>> {
     for attempt in 1..=retries {
         let result = match request.byte_range {
-            Some((start, end)) => client
-                .get_range(&request.url, headers, start, end)
-                .map(|(status, response_headers, body)| (status, response_headers, body)),
-            None => client
-                .get(&request.url, headers)
-                .map(|(status, response_headers, body)| (status, response_headers, body)),
+            Some((start, end)) => client.get_range(&request.url, headers, start, end),
+            None => client.get(&request.url, headers),
         };
 
         match result {
@@ -4902,15 +4898,16 @@ fn download_hls_resource(
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
                     .and_then(|(_, value)| value.trim().parse::<usize>().ok());
-                if let Some(expected) = declared {
-                    if request.byte_range.is_none() && body.len() != expected {
-                        warn!(
-                            "Attempt {} body truncated for {}: expected {expected} bytes, got {}",
-                            attempt,
-                            request.url,
-                            body.len()
-                        );
-                    }
+                if let Some(expected) = declared
+                    && request.byte_range.is_none()
+                    && body.len() != expected
+                {
+                    warn!(
+                        "Attempt {} body truncated for {}: expected {expected} bytes, got {}",
+                        attempt,
+                        request.url,
+                        body.len()
+                    );
                 }
                 match hls_response_bytes(status, &body, request.byte_range) {
                     Ok(data) => return Ok(data),
