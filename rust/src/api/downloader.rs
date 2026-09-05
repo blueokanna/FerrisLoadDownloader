@@ -4967,7 +4967,9 @@ fn looks_like_mpeg_ts(data: &[u8]) -> bool {
     if data.len() < 188 * 4 {
         return false;
     }
-    let sync_hits = (0..8).filter(|packet| data.get(packet * 188) == Some(&0x47)).count();
+    let sync_hits = (0..8)
+        .filter(|packet| data.get(packet * 188) == Some(&0x47))
+        .count();
     // Require most sampled boundaries to be sync bytes; also accept the very
     // common 0x47 at offset 0 even if later offsets drift on some muxers.
     sync_hits >= 6 || (data[0] == 0x47 && sync_hits >= 4)
@@ -4997,15 +4999,13 @@ fn download_and_decrypt_segment(
                     Err(error) => {
                         warn!(
                             "Init section for {} is not AES-128 encrypted as declared ({}); keeping raw bytes",
-                            init.url,
-                            error
+                            init.url, error
                         );
                         buffer.extend_from_slice(&init_data);
                     }
                 }
             }
-            let segment_data =
-                download_hls_resource(client, segment_request, headers, attempts)?;
+            let segment_data = download_hls_resource(client, segment_request, headers, attempts)?;
             match decrypt_hls_resource(segment_data.clone(), crypto) {
                 Ok(decrypted) => buffer.extend_from_slice(&decrypted),
                 Err(error) => {
