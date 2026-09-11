@@ -69,10 +69,16 @@ object MediaTranscoder {
             Log.e(TAG, "transcode: input or output is null")
             return false
         }
-        if (aBitrate > 0) {
-            Log.e(TAG, "Audio bitrate conversion is not supported by the Android backend")
-            return false
-        }
+        val effABitrate =
+                if (aBitrate > 0) {
+                    Log.w(
+                            TAG,
+                            "transcode: audio bitrate control ($aBitrate kbit/s) is unsupported; ignoring it and keeping source audio"
+                    )
+                    0
+                } else {
+                    aBitrate
+                }
         try {
             val inFile = File(inputPath)
             if (!inFile.exists()) {
@@ -84,17 +90,9 @@ object MediaTranscoder {
                 return false
             }
 
-            // 1) Try a lossless stream-copy remux first whenever no re-encode
-            //    is requested. MediaMuxer (API 25+) writes a proper ctts table
-            //    when B-frame samples are fed in decode order with their REAL
-            //    PTS, so even B-frame content is remuxed at disk speed
-            //    (seconds for a full movie) instead of being re-encoded. Only
-            //    a pre-API-25 device cannot represent B-frames losslessly;
-            //    that (and any remux failure caught by the checks below)
-            //    falls through to the hardware pipeline.
             val hasBframes = videoNeedsReencode(inputPath)
             val canMuxBframes = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1
-            if (vBitrate <= 0 && aBitrate <= 0 && (!hasBframes || canMuxBframes)) {
+            if (vBitrate <= 0 && effABitrate <= 0 && (!hasBframes || canMuxBframes)) {
                 val remuxOk = tryRemux(inputPath, outputPath, hasBframes && canMuxBframes)
                 if (remuxOk &&
                                 verifyOutput(outputPath) &&
@@ -109,10 +107,15 @@ object MediaTranscoder {
                         TAG,
                         "Remux failed, empty or truncated output, falling back to hardware transcode"
                 )
+                Log.w(
+                        TAG,
+                        "Remux fallback diagnostics: vBitrate=$vBitrate aBitrate=$aBitrate " +
+                                "hasBframes=$hasBframes canMuxBframes=$canMuxBframes " +
+                                "expectedDurationMs=$expectedDurationMs"
+                )
             }
 
-            // 2) Hardware transcode.
-            val hwOk = hardwareTranscode(inputPath, outputPath, vBitrate, aBitrate)
+            val hwOk = hardwareTranscode(inputPath, outputPath, vBitrate, effABitrate)
             if (hwOk &&
                             verifyOutput(outputPath) &&
                             verifyDuration(outputPath, expectedDurationMs, "transcode")
@@ -172,11 +175,6 @@ object MediaTranscoder {
             val muxVideoIndex = muxer.addTrack(videoTrack.format)
             val muxAudioIndex = muxer.addTrack(audioTrack.format)
             muxer.start()
-            // MediaMuxer (API 25+) can stream-copy B-frame H.264 into MP4 when
-            // samples arrive in decode order with their REAL PTS (it writes a
-            // ctts table), so keep the B-frames and make the merge lossless at
-            // disk speed. The audio track is always flattened because the MP4
-            // writer requires strictly monotonic audio PTS.
             val videoHasBframes = videoNeedsReencode(videoPath)
             val canMuxBframes = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1
             val videoSamples =
@@ -250,10 +248,18 @@ object MediaTranscoder {
             Log.e(TAG, "transcodeDir: segment directory missing: $segmentDir")
             return false
         }
-        if (aBitrate > 0) {
-            Log.e(TAG, "Audio bitrate conversion is not supported by the Android backend")
-            return false
-        }
+        // Same graceful degradation as `transcode`: an audio bitrate request
+        // must not force the hardware re-encode path or fail the download.
+        val effABitrate =
+                if (aBitrate > 0) {
+                    Log.w(
+                            TAG,
+                            "transcodeDir: audio bitrate control ($aBitrate kbit/s) is unsupported; ignoring it and keeping source audio"
+                    )
+                    0
+                } else {
+                    aBitrate
+                }
 
         // 1) Stream-copy remux of every segment. MediaMuxer (API 25+) writes a
         //    proper ctts table when the video samples are fed in decode order
@@ -263,7 +269,7 @@ object MediaTranscoder {
         //    back to hardware re-encoding.
         val hasBframes = segmentVideoNeedsReencode(segmentDir, prefix, total)
         val canMuxBframes = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1
-        if (vBitrate <= 0 && aBitrate <= 0 && (!hasBframes || canMuxBframes)) {
+        if (vBitrate <= 0 && effABitrate <= 0 && (!hasBframes || canMuxBframes)) {
             val remuxOk =
                     remuxSegments(
                             segmentDir,
@@ -284,12 +290,25 @@ object MediaTranscoder {
                     TAG,
                     "Segment remux failed, empty or truncated output; falling back to hardware transcode"
             )
+            Log.w(
+                    TAG,
+                    "Segment remux fallback diagnostics: vBitrate=$vBitrate aBitrate=$aBitrate " +
+                            "hasBframes=$hasBframes canMuxBframes=$canMuxBframes " +
+                            "segments=$total expectedDurationMs=$expectedDurationMs"
+            )
         }
 
         // 2) Hardware (or software fallback) transcode feeding every segment
         //    into ONE continuous decode→encode→mux pipeline.
         val hwOk =
-                hardwareTranscodeSegments(segmentDir, prefix, total, outputPath, vBitrate, aBitrate)
+                hardwareTranscodeSegments(
+                        segmentDir,
+                        prefix,
+                        total,
+                        outputPath,
+                        vBitrate,
+                        effABitrate
+                )
         if (hwOk &&
                         verifyOutput(outputPath) &&
                         verifyDuration(outputPath, expectedDurationMs, "transcode")
@@ -426,14 +445,13 @@ object MediaTranscoder {
     /**
      * Maps decode-order source PTS into a continuous feed timeline.
      *
-     * A B-frame stream stores samples in decode order, so consecutive
-     * sampleTime values legitimately step backward inside each GOP. The
-     * decoder reorders to presentation order by itself, and it needs every
-     * frame's REAL PTS to do that; forcing a synthetic monotonic timeline
-     * makes the reordered Surface timestamps go backward and GraphicBufferSource
-     * drops the frames (the "going backward in time" flood). Only a large
-     * backward jump (> 500 ms) means a fresh segment whose PTS restarted;
-     * that segment is lifted so the overall timeline stays continuous.
+     * A B-frame stream stores samples in decode order, so consecutive sampleTime values
+     * legitimately step backward inside each GOP. The decoder reorders to presentation order by
+     * itself, and it needs every frame's REAL PTS to do that; forcing a synthetic monotonic
+     * timeline makes the reordered Surface timestamps go backward and GraphicBufferSource drops the
+     * frames (the "going backward in time" flood). Only a large backward jump (> 500 ms) means a
+     * fresh segment whose PTS restarted; that segment is lifted so the overall timeline stays
+     * continuous.
      */
     private class DecoderPtsTimeline {
         private var offsetUs = 0L
@@ -441,9 +459,7 @@ object MediaTranscoder {
 
         fun next(rawUs: Long): Long {
             val raw = if (rawUs < 0) 0L else rawUs
-            if (maxFedUs != Long.MIN_VALUE &&
-                    raw + offsetUs < maxFedUs - SEGMENT_RESET_US
-            ) {
+            if (maxFedUs != Long.MIN_VALUE && raw + offsetUs < maxFedUs - SEGMENT_RESET_US) {
                 offsetUs = maxFedUs - raw
             }
             val fed = raw + offsetUs
@@ -457,18 +473,16 @@ object MediaTranscoder {
     }
 
     /**
-     * True when the video stream in `path` uses B-frame reordering (a
-     * backward PTS step between consecutive decode-order samples).
+     * True when the video stream in `path` uses B-frame reordering (a backward PTS step between
+     * consecutive decode-order samples).
      *
-     * A B-frame stream cannot be remuxed by simply flattening its PTS to a
-     * monotonic timeline — that is exactly what makes MediaMuxer drop samples
-     * or inflate the duration. Two correct options exist: on API 25+ the
-     * stream is still copied losslessly when its REAL decode-order PTS is
-     * preserved (MediaMuxer then writes a ctts table — see
-     * [writeTrackSamples] with `preserveBframes = true`); on older platforms
-     * no lossless representation is possible and the stream must be
-     * re-encoded B-frame-free instead. Callers combine this probe with the
-     * platform check to choose which path applies.
+     * A B-frame stream cannot be remuxed by simply flattening its PTS to a monotonic timeline —
+     * that is exactly what makes MediaMuxer drop samples or inflate the duration. Two correct
+     * options exist: on API 25+ the stream is still copied losslessly when its REAL decode-order
+     * PTS is preserved (MediaMuxer then writes a ctts table — see [writeTrackSamples] with
+     * `preserveBframes = true`); on older platforms no lossless representation is possible and the
+     * stream must be re-encoded B-frame-free instead. Callers combine this probe with the platform
+     * check to choose which path applies.
      */
     private fun videoNeedsReencode(path: String): Boolean {
         val extractor = MediaExtractor()
@@ -501,10 +515,10 @@ object MediaTranscoder {
     }
 
     /**
-     * Runs [videoNeedsReencode] over every segment. B-frames may start well
-     * after the first few segments; a mid-stream remux failure would waste an
-     * entire copy pass before falling back, so probe the whole set up front.
-     * The probe only walks sample timestamps (no data copy), which is cheap.
+     * Runs [videoNeedsReencode] over every segment. B-frames may start well after the first few
+     * segments; a mid-stream remux failure would waste an entire copy pass before falling back, so
+     * probe the whole set up front. The probe only walks sample timestamps (no data copy), which is
+     * cheap.
      */
     private fun segmentVideoNeedsReencode(dir: String, prefix: String, total: Int): Boolean {
         for (i in 0 until total) {
@@ -1077,28 +1091,32 @@ object MediaTranscoder {
     }
 
     /**
-     * Rejects outputs whose duration is wrong versus what the HLS playlist
-     * promised. Three failure shapes are caught:
+     * Rejects outputs whose duration is wrong versus what the HLS playlist promised. Three failure
+     * shapes are caught:
      *
-     *  1. Catastrophic truncation — Android's MediaExtractor can silently stop
+     * 1. Catastrophic truncation — Android's MediaExtractor can silently stop
+     * ```
      *     early when reading a naively-concatenated TS (timestamp
      *     discontinuities), which used to produce a "successful" output
      *     containing only the first few seconds after all download traffic was
      *     already spent.
-     *  2. Timeline inflation — an encoder that re-times Surface input can
+     * ```
+     * 2. Timeline inflation — an encoder that re-times Surface input can
+     * ```
      *     stretch the output (the "30 min becomes 60 min" failure), which is
      *     just as wrong as a truncated one.
-     *  3. Zero-duration output — a muxer that ended up with an empty (or all
+     * ```
+     * 3. Zero-duration output — a muxer that ended up with an empty (or all
+     * ```
      *     samples dropped) video track still produces an MP4 whose container
      *     reports 0:00. Such a file must never be delivered as a success.
-     *
-     * The expected value is the SUM of the playlist EXTINF tags, and EXTINF is
-     * rounded UP per segment, so the real media is routinely a few seconds to
-     * a couple of minutes SHORTER than the sum for long streams (hundreds of
-     * segments). The lower bound therefore only rejects losing a significant
-     * fraction of the content (>= 20%), never a benign shortfall — otherwise a
-     * correct long download would be rejected and needlessly re-encoded. When
-     * the expected duration is unknown (0) this check is skipped.
+     * ```
+     * The expected value is the SUM of the playlist EXTINF tags, and EXTINF is rounded UP per
+     * segment, so the real media is routinely a few seconds to a couple of minutes SHORTER than the
+     * sum for long streams (hundreds of segments). The lower bound therefore only rejects losing a
+     * significant fraction of the content (>= 20%), never a benign shortfall — otherwise a correct
+     * long download would be rejected and needlessly re-encoded. When the expected duration is
+     * unknown (0) this check is skipped.
      */
     private fun verifyDuration(path: String, expectedMs: Long, what: String): Boolean {
         if (expectedMs <= 0) return true
@@ -1148,10 +1166,10 @@ object MediaTranscoder {
     }
 
     /**
-     * Secondary duration source when MediaMetadataRetriever reports nothing.
-     * Prefers the per-track KEY_DURATION metadata that MediaExtractor exposes
-     * for MP4 (cheap, no sample I/O); only if that is absent walks the last
-     * samples to recover a timeline. Returns ms, or -1 for an unreadable file.
+     * Secondary duration source when MediaMetadataRetriever reports nothing. Prefers the per-track
+     * KEY_DURATION metadata that MediaExtractor exposes for MP4 (cheap, no sample I/O); only if
+     * that is absent walks the last samples to recover a timeline. Returns ms, or -1 for an
+     * unreadable file.
      */
     private fun probeDurationMs(path: String): Long {
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
@@ -1194,7 +1212,8 @@ object MediaTranscoder {
                                             if (lastPts > longestUs) longestUs = lastPts
                                         }
                                     }
-                                    if (longestUs <= 0) -1L else (longestUs / 1000L).coerceAtLeast(1L)
+                                    if (longestUs <= 0) -1L
+                                    else (longestUs / 1000L).coerceAtLeast(1L)
                                 } catch (error: Exception) {
                                     Log.e(TAG, "probeDurationMs failed: ${error.message}", error)
                                     -1L
@@ -1675,8 +1694,8 @@ object MediaTranscoder {
     }
 
     /**
-     * Resolution-aware default bitrate (~0.10 bits per pixel per frame).
-     * Keeps re-encoded H.264 crisp while staying in the encoder's range.
+     * Resolution-aware default bitrate (~0.10 bits per pixel per frame). Keeps re-encoded H.264
+     * crisp while staying in the encoder's range.
      */
     private fun defaultVideoBitrate(width: Int, height: Int, fps: Int): Int {
         val estimated = width.toLong() * height * fps.coerceAtLeast(1) * 10L / 100L
@@ -1684,19 +1703,17 @@ object MediaTranscoder {
     }
 
     /**
-     * AVC encoder format for Surface input. VBR keeps quality high at the
-     * same average bitrate; no B-frames keeps the output timeline monotonic
-     * and easy to decode. KEY_PRIORITY and KEY_OPERATING_RATE are both
-     * deliberately unset: this is a batch/offline transcode fed as fast as the
-     * disk allows, so hinting a realtime input rate (or realtime priority)
-     * makes some vendor encoders pace themselves against the wall clock and
-     * the transcode crawls. Frame timing is fully owned by the PTS we feed.
+     * AVC encoder format for Surface input. VBR keeps quality high at the same average bitrate; no
+     * B-frames keeps the output timeline monotonic and easy to decode. KEY_PRIORITY and
+     * KEY_OPERATING_RATE are both deliberately unset: this is a batch/offline transcode fed as fast
+     * as the disk allows, so hinting a realtime input rate (or realtime priority) makes some vendor
+     * encoders pace themselves against the wall clock and the transcode crawls. Frame timing is
+     * fully owned by the PTS we feed.
      *
-     * KEY_I_FRAME_INTERVAL is 2 s instead of 1 s: an I-frame costs roughly an
-     * order of magnitude more to encode than a P-frame, so halving the forced
-     * keyframe rate meaningfully speeds up the encode (and shrinks the file)
-     * while keeping seeking snappy. HLS sources usually carry 2-6 s GOPs, so
-     * 2 s also avoids re-inserting extra keyframes the source never had.
+     * KEY_I_FRAME_INTERVAL is 2 s instead of 1 s: an I-frame costs roughly an order of magnitude
+     * more to encode than a P-frame, so halving the forced keyframe rate meaningfully speeds up the
+     * encode (and shrinks the file) while keeping seeking snappy. HLS sources usually carry 2-6 s
+     * GOPs, so 2 s also avoids re-inserting extra keyframes the source never had.
      */
     private fun createAvcEncodeFormat(
             width: Int,

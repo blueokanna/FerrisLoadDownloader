@@ -1,4 +1,6 @@
-import 'package:flutter/cupertino.dart' show CupertinoPageTransitionsBuilder;
+// CupertinoPageTransitionsBuilder lives in flutter/material
+// (page_transitions_theme.dart); newer Flutter versions no longer export it
+// from flutter/cupertino.dart, so it is resolved through the material import.
 import 'package:flutter/material.dart';
 
 class AppThemeProfile {

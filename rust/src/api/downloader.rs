@@ -106,6 +106,15 @@ unsafe extern "C" {
         errbuf: *mut std::os::raw::c_char,
         errbuf_len: usize,
     ) -> i32;
+    fn ferrisload_videotoolbox_merge_segments(
+        dir: *const std::os::raw::c_char,
+        prefix: *const std::os::raw::c_char,
+        count: i32,
+        output: *const std::os::raw::c_char,
+        expected_ms: i64,
+        errbuf: *mut std::os::raw::c_char,
+        errbuf_len: usize,
+    ) -> i32;
 }
 
 /// Thin Rust wrappers around the iOS VideoToolbox FFI. They mirror the
@@ -123,8 +132,8 @@ mod ios_videotoolbox {
     // The `extern "C"` items live in the parent module; bring them into scope
     // explicitly (they do not resolve through parent-module lookup).
     use super::{
-        ferrisload_videotoolbox_available, ferrisload_videotoolbox_mux,
-        ferrisload_videotoolbox_transcode,
+        ferrisload_videotoolbox_available, ferrisload_videotoolbox_merge_segments,
+        ferrisload_videotoolbox_mux, ferrisload_videotoolbox_transcode,
     };
 
     const ERROR_BUF_LEN: usize = 512;
@@ -158,8 +167,6 @@ mod ios_videotoolbox {
             .spawn(move || {
                 let result = (|| {
                     let mut errbuf = [0 as c_char; ERROR_BUF_LEN];
-                    // SAFETY: all pointers are valid for the call; errbuf is a
-                    // writable buffer of the declared length.
                     let ok = unsafe {
                         ferrisload_videotoolbox_transcode(
                             input_c.as_ptr(),
@@ -208,7 +215,6 @@ mod ios_videotoolbox {
             .spawn(move || {
                 let result = (|| {
                     let mut errbuf = [0 as c_char; ERROR_BUF_LEN];
-                    // SAFETY: see `transcode`.
                     let ok = unsafe {
                         ferrisload_videotoolbox_mux(
                             video_c.as_ptr(),
@@ -234,6 +240,61 @@ mod ios_videotoolbox {
         rx.recv_timeout(timeout).map_err(|_| {
             anyhow!(
                 "iOS VideoToolbox mux timed out after {}s",
+                timeout.as_secs()
+            )
+        })?
+    }
+
+    /// Assemble `{dir}/{prefix}_{i:05}.part` (i = 0..count) into one MP4 by
+    /// feeding each segment through AVFoundation independently on a continuous
+    /// timeline. Individual HLS segments are internally PTS-consistent, so
+    /// this avoids the PTS resets of a byte-concatenated TS that made
+    /// AVFoundation drop everything after the first segment.
+    pub fn merge_segments(
+        dir: &str,
+        prefix: &str,
+        count: usize,
+        output: &str,
+        expected_duration: Option<f64>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let dir_c = CString::new(dir).context("iOS segment dir contains NUL")?;
+        let prefix_c = CString::new(prefix).context("iOS segment prefix contains NUL")?;
+        let output_c = CString::new(output).context("iOS segment output path contains NUL")?;
+        let expected_ms = (expected_duration.unwrap_or(0.0) * 1000.0).round() as i64;
+        let count_i32 = i32::try_from(count).context("too many iOS segments")?;
+        let (tx, rx) = std::sync::mpsc::channel::<Result<()>>();
+        std::thread::Builder::new()
+            .name("ferrisload-ios-videotoolbox-merge".into())
+            .spawn(move || {
+                let result = (|| {
+                    let mut errbuf = [0 as c_char; ERROR_BUF_LEN];
+                    let ok = unsafe {
+                        ferrisload_videotoolbox_merge_segments(
+                            dir_c.as_ptr(),
+                            prefix_c.as_ptr(),
+                            count_i32,
+                            output_c.as_ptr(),
+                            expected_ms,
+                            errbuf.as_mut_ptr(),
+                            errbuf.len(),
+                        )
+                    };
+                    if ok != 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "iOS per-segment merge failed: {}",
+                            take_error(&errbuf)
+                        ))
+                    }
+                })();
+                let _ = tx.send(result);
+            })
+            .context("Failed to spawn iOS segment merge thread")?;
+        rx.recv_timeout(timeout).map_err(|_| {
+            anyhow!(
+                "iOS per-segment merge timed out after {}s",
                 timeout.as_secs()
             )
         })?
@@ -3320,6 +3381,37 @@ fn has_mp4_signature(prefix: &[u8]) -> bool {
         .any(|window| window == b"ftyp" || window == b"styp")
 }
 
+/// True when `path` already starts with an MP4 `ftyp`/`styp` signature — i.e.
+/// the input is an (optionally fragmented) MP4 and "converting" it only means
+/// copying it to the final output. This is the fMP4 fast path: fragmented MP4
+/// HLS streams are assembled byte-for-byte during download and must never be
+/// re-encoded (re-encoding would heat the phone, waste battery and risk
+/// failure for zero benefit).
+fn is_mp4_file(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0u8; 64];
+    let Ok(bytes_read) = file.read(&mut prefix) else {
+        return false;
+    };
+    has_mp4_signature(&prefix[..bytes_read])
+}
+
+/// True when `path` starts with the MPEG-TS sync pattern (0x47 every 188
+/// bytes). Such inputs are eligible for the native lossless stream-copy
+/// remuxer.
+fn is_mpeg_ts_file(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 377];
+    let Ok(bytes_read) = file.read(&mut head) else {
+        return false;
+    };
+    crate::remux::is_mpeg_ts(&head[..bytes_read])
+}
+
 fn ensure_output_file_ready(path: &Path) -> Result<()> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("Output file not found after download: {}", path.display()))?;
@@ -4886,6 +4978,7 @@ fn download_hls_resource(
     headers: &[(String, String)],
     retries: u8,
 ) -> Result<Vec<u8>> {
+    let mut saw_truncation = false;
     for attempt in 1..=retries {
         let result = match request.byte_range {
             Some((start, end)) => client.get_range(&request.url, headers, start, end),
@@ -4894,28 +4987,37 @@ fn download_hls_resource(
 
         match result {
             Ok((status, response_headers, body)) if (200..300).contains(&status) => {
+                let compressed = response_headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-encoding")
+                        && (value.contains("gzip")
+                            || value.contains("deflate")
+                            || value.contains("br")
+                            || value.contains("zstd"))
+                });
                 let declared = response_headers
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
                     .and_then(|(_, value)| value.trim().parse::<usize>().ok());
-                if let Some(expected) = declared
+                let truncated = !compressed
                     && request.byte_range.is_none()
-                    && body.len() != expected
-                {
+                    && declared.is_some_and(|expected| body.len() < expected);
+                if truncated {
+                    saw_truncation = true;
+                    let expected = declared.unwrap_or(0);
                     warn!(
-                        "Attempt {} body truncated for {}: expected {expected} bytes, got {}",
-                        attempt,
+                        "Attempt {attempt}: truncated body for {} (declared {expected} bytes, got {}). Retrying.",
                         request.url,
                         body.len()
                     );
-                }
-                match hls_response_bytes(status, &body, request.byte_range) {
-                    Ok(data) => return Ok(data),
-                    Err(error) => {
-                        warn!(
-                            "Attempt {} returned an invalid HLS resource {}: {}",
-                            attempt, request.url, error
-                        );
+                } else {
+                    match hls_response_bytes(status, &body, request.byte_range) {
+                        Ok(data) => return Ok(data),
+                        Err(error) => {
+                            warn!(
+                                "Attempt {} returned an invalid HLS resource {}: {}",
+                                attempt, request.url, error
+                            );
+                        }
                     }
                 }
             }
@@ -4944,6 +5046,13 @@ fn download_hls_resource(
         }
     }
 
+    if saw_truncation {
+        bail!(
+            "Failed after {} attempts (server repeatedly returned truncated bodies): {}",
+            retries,
+            request.url
+        );
+    }
     bail!("Failed after {} attempts: {}", retries, request.url)
 }
 
@@ -5627,6 +5736,75 @@ fn convert_to_mp4(
 
     emit_progress(&reporter, "Converting to MP4...", 0.95);
 
+    // ── Fast path: input is ALREADY an MP4 (fragmented MP4 HLS assembled
+    // byte-for-byte during download, or a progressive MP4). "Conversion"
+    // then is a plain copy: no decode, no hardware encoder, no heat, and it
+    // is finished in the time it takes to write the file. Only when the user
+    // explicitly requested re-encoding (bitrate > 0) do we skip this path.
+    let requires_reencode = video_bitrate > 0 || audio_bitrate > 0;
+    if !requires_reencode && is_mp4_file(Path::new(input_ts)) {
+        info!(
+            "Input is already an MP4; copying without re-encoding: {}",
+            input_ts
+        );
+        emit_progress(&reporter, "Already MP4 — copying (no re-encoding)", 0.96);
+        std::fs::copy(input_ts, output_path).with_context(|| {
+            format!(
+                "Failed to copy already-MP4 input {} to {}",
+                input_ts, output_path
+            )
+        })?;
+        ensure_output_file_ready(Path::new(output_path))?;
+        convert_pb.finish_with_message("MP4 ready (copied, no re-encoding)");
+        info!("Output file: {}", output_path);
+        return Ok(());
+    }
+
+    // ── Native lossless TS → MP4 stream copy: a self-contained equivalent of
+    // `ffmpeg -c copy`. The H.264 access units and AAC frames are copied
+    // bit-for-bit (no decoder, no encoder, no MediaCodec/VideoToolbox), and
+    // the per-segment HLS PTS resets are re-based onto one continuous
+    // timeline. This is the fast path for ordinary H.264/AAC TS feeds: disk
+    // speed, zero heat, platform independent. Any error (unsupported codec,
+    // odd structure…) falls through to the platform transcoder below, so this
+    // can never regress an existing download.
+    if !requires_reencode && is_mpeg_ts_file(Path::new(input_ts)) {
+        emit_progress(&reporter, "Remuxing TS → MP4 (stream copy)", 0.96);
+        match crate::remux::remux_ts_to_mp4(Path::new(input_ts), Path::new(output_path)) {
+            Ok(summary) => {
+                let duration_ok = expected_duration.is_none_or(|expected| {
+                    summary.duration_seconds + 1.0 >= (expected * 0.85).max(expected - 5.0)
+                });
+                if duration_ok {
+                    info!(
+                        "Native stream copy complete: {}x{}, {:.2}s, {} video / {} audio samples",
+                        summary.width,
+                        summary.height,
+                        summary.duration_seconds,
+                        summary.video_samples,
+                        summary.audio_samples
+                    );
+                    convert_pb.finish_with_message("MP4 ready (stream copy, no re-encoding)");
+                    info!("Output file: {}", output_path);
+                    return Ok(());
+                }
+                warn!(
+                    "Native stream copy produced {:.2}s but ~{:.2}s was expected; falling back to the platform transcoder",
+                    summary.duration_seconds,
+                    expected_duration.unwrap_or(0.0)
+                );
+                let _ = std::fs::remove_file(output_path);
+            }
+            Err(error) => {
+                warn!(
+                    "Native TS stream copy unavailable ({}); falling back to the platform transcoder",
+                    error
+                );
+                let _ = std::fs::remove_file(output_path);
+            }
+        }
+    }
+
     match backend {
         TranscoderKind::Ffmpeg(accel) => {
             let requires_reencode = video_bitrate > 0 || audio_bitrate > 0;
@@ -5782,19 +5960,51 @@ fn convert_to_mp4(
             Ok(())
         }
         TranscoderKind::IosVideoToolbox => {
-            emit_progress(
-                &reporter,
-                "Using Apple VideoToolbox hardware H.264 encoder",
-                0.955,
-            );
-            ios_hardware_transcode(
-                input_ts,
-                output_path,
-                video_bitrate,
-                audio_bitrate,
-                expected_duration,
-            )?;
-            convert_pb.finish_with_message("VideoToolbox transcode complete");
+            // Split the "no re-encode requested" (bitrate 0) flow from the
+            // "user explicitly wants re-encoding" flow:
+            //  * bitrate 0 + per-segment files → per-segment continuous
+            //    pipeline (each HLS segment is internally PTS-consistent, so
+            //    building the MP4 from independent inputs avoids the PTS
+            //    resets of a naively concatenated TS, which used to make
+            //    AVFoundation drop everything after the first segment and
+            //    fail the duration check). This is still a hardware encode on
+            //    iOS (AVFoundation has no TS→MP4 remux), but it is reliable.
+            //  * bitrate > 0 → single-file VideoToolbox pipeline that honors
+            //    the requested bitrate.
+            // Any per-segment failure falls back to the single-file path so a
+            // download can never regress.
+            let requires_reencode = video_bitrate > 0 || audio_bitrate > 0;
+            let mut per_segment_done = false;
+            if !requires_reencode && let Some(segments) = video_segments.as_ref() {
+                match ios_hardware_merge_segments(segments, output_path, expected_duration) {
+                    Ok(()) => per_segment_done = true,
+                    Err(error) => warn!(
+                        "iOS per-segment merge failed ({}); falling back to single-file VideoToolbox",
+                        error
+                    ),
+                }
+            }
+            if per_segment_done {
+                emit_progress(
+                    &reporter,
+                    "Per-segment conversion complete (continuous timeline)",
+                    0.98,
+                );
+            } else {
+                emit_progress(
+                    &reporter,
+                    "Using Apple VideoToolbox hardware H.264 encoder",
+                    0.955,
+                );
+                ios_hardware_transcode(
+                    input_ts,
+                    output_path,
+                    video_bitrate,
+                    audio_bitrate,
+                    expected_duration,
+                )?;
+            }
+            convert_pb.finish_with_message("VideoToolbox conversion complete");
             info!("Output file: {}", output_path);
 
             let out_meta = std::fs::metadata(output_path)
@@ -5841,6 +6051,34 @@ fn ios_hardware_transcode(
     _expected_duration: Option<f64>,
 ) -> Result<()> {
     bail!("Apple VideoToolbox transcoding is only available on iOS")
+}
+
+/// Merge the per-segment `.part` files into one MP4 on the iOS per-segment
+/// pipeline (continuous timeline, immune to per-segment PTS resets).
+#[cfg(target_os = "ios")]
+fn ios_hardware_merge_segments(
+    segments: &SegmentInput,
+    output_mp4: &str,
+    expected_duration: Option<f64>,
+) -> Result<()> {
+    let timeout = ios_videotoolbox_timeout(expected_duration);
+    ios_videotoolbox::merge_segments(
+        segments.dir.to_string_lossy().as_ref(),
+        &segments.prefix,
+        segments.total,
+        output_mp4,
+        expected_duration,
+        timeout,
+    )
+}
+
+#[cfg(not(target_os = "ios"))]
+fn ios_hardware_merge_segments(
+    _segments: &SegmentInput,
+    _output_mp4: &str,
+    _expected_duration: Option<f64>,
+) -> Result<()> {
+    bail!("Apple per-segment merging is only available on iOS")
 }
 
 fn run_ffmpeg_conversion(

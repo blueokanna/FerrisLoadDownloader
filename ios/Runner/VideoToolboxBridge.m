@@ -423,6 +423,170 @@ static BOOL ferris_mux_impl(NSString *videoPath,
     return ferris_finish_writer(writer, expectedMs, errbuf, errbufLen);
 }
 
+/// Pick the AVAssetExportSession preset that best preserves the source
+/// resolution (export presets only scale down, never up).
+static NSString *ferris_export_preset(CGFloat dimension) {
+    if (dimension > 1920.0) {
+        if (@available(iOS 9.0, *)) {
+            return AVAssetExportPreset3840x2160;
+        }
+        return AVAssetExportPreset1920x1080;
+    }
+    if (dimension > 1280.0) {
+        return AVAssetExportPreset1920x1080;
+    }
+    if (dimension > 640.0) {
+        return AVAssetExportPreset1280x720;
+    }
+    return AVAssetExportPreset640x480;
+}
+
+/// Assemble `{dir}/{prefix}_{i:05}.part` (i = 0..count-1) into one MP4.
+/// Every segment is opened through its own AVURLAsset (a single HLS segment
+/// is internally PTS-consistent) and inserted onto an AVMutableComposition at
+/// a running cursor, producing a continuous timeline. This is the iOS
+/// equivalent of the Android segment pipeline and avoids the "only the first
+/// few seconds survive" failure mode of a naively concatenated TS. Audio is
+/// only included when a track is present; a corrupt segment is skipped rather
+/// than failing the whole merge.
+static BOOL ferris_merge_segments_impl(NSString *dir,
+                                       NSString *prefix,
+                                       NSInteger count,
+                                       NSString *outputPath,
+                                       long long expectedMs,
+                                       char *errbuf,
+                                       size_t errbufLen) {
+    [[NSFileManager defaultManager] removeItemAtPath:outputPath error:NULL];
+
+    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (NSInteger i = 0; i < count; i++) {
+        NSString *path =
+            [NSString stringWithFormat:@"%@/%@_%05ld.part", dir, prefix, (long)i];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            [paths addObject:path];
+        }
+    }
+    if (paths.count == 0) {
+        return ferris_write_error(errbuf, errbufLen, @"No segment files found to merge");
+    }
+
+    AVMutableComposition *composition = [AVMutableComposition composition];
+    AVMutableCompositionTrack *videoTrack = nil;
+    AVMutableCompositionTrack *audioTrack = nil;
+    CGFloat largestDimension = 0.0;
+    CMTime videoCursor = kCMTimeZero;
+    CMTime audioCursor = kCMTimeZero;
+    CMTime assembled = kCMTimeZero;
+
+    for (NSString *path in paths) {
+        AVURLAsset *asset =
+            [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path]
+                                options:@{AVURLAssetPreferPreciseDurationAndTimingKey : @YES}];
+        if (!ferris_wait_for_tracks(asset, 30.0)) {
+            NSLog(@"[FerrisLoad] merge: skipping unreadable segment %@", path);
+            continue;
+        }
+        AVAssetTrack *v = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+        AVAssetTrack *a = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+        if (v == nil && a == nil) {
+            NSLog(@"[FerrisLoad] merge: skipping segment with no usable tracks %@", path);
+            continue;
+        }
+        if (v != nil) {
+            if (videoTrack == nil) {
+                videoTrack = [composition addMutableTrackWithMediaType:AVMediaTypeVideo
+                                                       preferredTrackID:kCMPersistentTrackID_Invalid];
+                if (videoTrack == nil) {
+                    return ferris_write_error(errbuf, errbufLen,
+                                              @"Cannot create composition video track");
+                }
+                CGSize size = v.naturalSize;
+                if (size.width > 0.0 || size.height > 0.0) {
+                    largestDimension = MAX(size.width, size.height);
+                }
+            }
+            NSError *error = nil;
+            if (![videoTrack insertTimeRange:v.timeRange
+                                     ofTrack:v
+                                      atTime:videoCursor
+                                       error:&error]) {
+                NSLog(@"[FerrisLoad] merge: dropping unreadable video in %@ (%@)", path,
+                      error.localizedDescription);
+            } else {
+                videoCursor = CMTimeAdd(videoCursor, v.timeRange.duration);
+            }
+        }
+        if (a != nil) {
+            if (audioTrack == nil) {
+                audioTrack = [composition addMutableTrackWithMediaType:AVMediaTypeAudio
+                                                       preferredTrackID:kCMPersistentTrackID_Invalid];
+            }
+            if (audioTrack != nil) {
+                NSError *error = nil;
+                if (![audioTrack insertTimeRange:a.timeRange
+                                         ofTrack:a
+                                          atTime:audioCursor
+                                           error:&error]) {
+                    NSLog(@"[FerrisLoad] merge: dropping unreadable audio in %@ (%@)", path,
+                          error.localizedDescription);
+                } else {
+                    audioCursor = CMTimeAdd(audioCursor, a.timeRange.duration);
+                }
+            }
+        }
+        CMTime segmentDuration = CMTimeMaximum(v ? v.timeRange.duration : kCMTimeZero,
+                                               a ? a.timeRange.duration : kCMTimeZero);
+        assembled = CMTimeAdd(assembled, segmentDuration);
+    }
+
+    if (videoTrack == nil) {
+        return ferris_write_error(errbuf, errbufLen, @"No readable video segments to merge");
+    }
+    double assembledSeconds = CMTimeGetSeconds(assembled);
+
+    NSString *preset = ferris_export_preset(largestDimension);
+    AVAssetExportSession *export =
+        [[AVAssetExportSession alloc] initWithAsset:composition presetName:preset];
+    if (export == nil) {
+        return ferris_write_error(
+            errbuf, errbufLen,
+            [NSString stringWithFormat:@"Cannot create export session for preset %@", preset]);
+    }
+    export.outputURL = [NSURL fileURLWithPath:outputPath];
+    export.outputFileType = AVFileTypeMP4;
+    export.shouldOptimizeForNetworkUse = YES;
+
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block BOOL finished = NO;
+    [export exportAsynchronouslyWithCompletionHandler:^{
+      finished = YES;
+      dispatch_semaphore_signal(semaphore);
+    }];
+    NSTimeInterval budget = MAX(300.0, assembledSeconds * 4.0 + 60.0);
+    dispatch_time_t deadline =
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(budget * NSEC_PER_SEC));
+    dispatch_semaphore_wait(semaphore, deadline);
+
+    if (!finished || export.status != AVAssetExportSessionStatusCompleted) {
+        NSString *reason = export.error.localizedDescription;
+        return ferris_write_error(errbuf, errbufLen,
+                                  [NSString stringWithFormat:@"Export did not complete%@%@",
+                                                             reason != nil ? @": " : @"",
+                                                             reason != nil ? reason : @"(timed out)"]);
+    }
+    if (expectedMs > 0 && assembledSeconds > 0.0) {
+        double expected = expectedMs / 1000.0;
+        double tolerance = MAX(expected * 0.85, expected - 5.0);
+        if (assembledSeconds + 1.0 < tolerance) {
+            return ferris_write_error(errbuf, errbufLen,
+                                      [NSString stringWithFormat:
+                                                     @"Output truncated: expected ~%.1fs but assembled %.1fs",
+                                                     expected, assembledSeconds]);
+        }
+    }
+    return YES;
+}
+
 #pragma mark - C entry points
 
 int ferrisload_videotoolbox_available(void) {
@@ -473,6 +637,30 @@ int ferrisload_videotoolbox_mux(const char *video,
             return ferris_write_error(errbuf, errbuf_len, @"Mux paths are not valid UTF-8");
         }
         return ferris_mux_impl(videoPath, audioPath, outputPath, expected_ms, errbuf, errbuf_len)
+                   ? 1
+                   : 0;
+    }
+}
+
+int ferrisload_videotoolbox_merge_segments(const char *dir,
+                                           const char *prefix,
+                                           int count,
+                                           const char *output,
+                                           long long expected_ms,
+                                           char *errbuf,
+                                           size_t errbuf_len) {
+    if (dir == NULL || prefix == NULL || output == NULL || count < 0) {
+        return ferris_write_error(errbuf, errbuf_len, @"Null or invalid merge argument");
+    }
+    @autoreleasepool {
+        NSString *dirPath = [NSString stringWithUTF8String:dir];
+        NSString *prefixName = [NSString stringWithUTF8String:prefix];
+        NSString *outputPath = [NSString stringWithUTF8String:output];
+        if (dirPath == nil || prefixName == nil || outputPath == nil) {
+            return ferris_write_error(errbuf, errbuf_len, @"Merge paths are not valid UTF-8");
+        }
+        return ferris_merge_segments_impl(dirPath, prefixName, (NSInteger)count, outputPath,
+                                          expected_ms, errbuf, errbuf_len)
                    ? 1
                    : 0;
     }
