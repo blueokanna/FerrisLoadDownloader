@@ -485,8 +485,11 @@ fn write_ctts(out: &mut Out, offsets: &[i32]) -> Result<()> {
 }
 
 fn write_stss(out: &mut Out, keyframes: &[u32], sample_count: usize) -> Result<()> {
+    if keyframes.is_empty() {
+        bail!("video track contains no sync samples");
+    }
     if keyframes.len() == sample_count {
-        return Ok(()); // every sample is a sync sample: stss is optional
+        return Ok(());
     }
     let stss = begin_box(out, b"stss")?;
     write_full_box_header(out, 0, 0)?;
