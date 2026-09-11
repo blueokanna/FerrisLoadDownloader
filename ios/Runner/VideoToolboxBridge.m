@@ -567,6 +567,11 @@ static BOOL ferris_merge_segments_impl(NSString *dir,
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(budget * NSEC_PER_SEC));
     dispatch_semaphore_wait(semaphore, deadline);
 
+    if (!finished) {
+        [export cancelExport];
+        dispatch_semaphore_wait(
+            semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)));
+    }
     if (!finished || export.status != AVAssetExportSessionStatusCompleted) {
         NSString *reason = export.error.localizedDescription;
         return ferris_write_error(errbuf, errbufLen,
