@@ -1048,7 +1048,7 @@ fn read_pts(bytes: &[u8]) -> Result<i64> {
         bail!("truncated PTS field");
     }
     let value = (i64::from(bytes[0] >> 1) & 0x07) << 30
-        | i64::from(u16::from(bytes[1]) << 8 | u16::from(bytes[2])) << 15
+        | (i64::from((u16::from(bytes[1]) << 8 | u16::from(bytes[2])) >> 1) << 15)
         | i64::from(u16::from(bytes[3]) << 8 | u16::from(bytes[4])) >> 1;
     Ok(value)
 }
