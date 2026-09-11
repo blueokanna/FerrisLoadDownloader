@@ -505,10 +505,8 @@ impl<'s> TsParser<'s> {
         }
     }
 
-    fn process_nal(&mut self, mut nal: Vec<u8>) -> Result<()> {
-        while matches!(nal.last(), Some(0x00) | Some(0xFF)) {
-            nal.pop();
-        }
+    fn process_nal(&mut self, nal: Vec<u8>) -> Result<()> {
+        // The NAL is already bounded by start-code delimiters; preserve every payload byte.
         if nal.is_empty() {
             return Ok(());
         }
