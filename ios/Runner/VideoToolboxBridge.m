@@ -534,9 +534,7 @@ static BOOL ferris_merge_segments_impl(NSString *dir,
                 }
             }
         }
-        CMTime segmentDuration = CMTimeMaximum(v ? v.timeRange.duration : kCMTimeZero,
-                                               a ? a.timeRange.duration : kCMTimeZero);
-        assembled = CMTimeAdd(assembled, segmentDuration);
+        assembled = videoCursor;
     }
 
     if (videoTrack == nil) {
