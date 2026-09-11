@@ -642,8 +642,8 @@ fn write_mp4a(out: &mut Out, config: &AacConfig) -> Result<()> {
     write_full_box_header(out, 0, 0)?;
 
     let asc = &config.asc;
-    let dcd_len = 13 + 1 + asc.len();
-    let es_len = 3 + 1 + dcd_len;
+let dcd_len = 13 + 2 + asc.len();
+    let es_len = 3 + 2 + dcd_len + 3;
     write_descriptor_header(out, 0x03, es_len)?;
     out.u16(0)?; // ES_ID
     out.u8(0)?; // flags
