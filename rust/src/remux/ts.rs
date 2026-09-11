@@ -382,7 +382,12 @@ impl<'s> TsParser<'s> {
                     }
                     self.unsupported_audio_type = Some(stream_type);
                 }
-                0x06 => warn!("MPEG-TS: ignoring private stream 0x06 (subtitles or AC-3)"),
+                0x06 => {
+                    if self.unsupported_audio_type.is_none() {
+                        warn!("MPEG-TS: unsupported private stream 0x06 (subtitles or AC-3)");
+                    }
+                    self.unsupported_audio_type = Some(stream_type);
+                }
                 0x24 | 0x27 => self.unsupported_video_type = Some(stream_type),
                 _ => {}
             }
