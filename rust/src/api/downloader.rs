@@ -256,7 +256,6 @@ mod ios_videotoolbox {
         count: usize,
         output: &str,
         expected_duration: Option<f64>,
-        timeout: Duration,
     ) -> Result<()> {
         let dir_c = CString::new(dir).context("iOS segment dir contains NUL")?;
         let prefix_c = CString::new(prefix).context("iOS segment prefix contains NUL")?;
@@ -292,12 +291,8 @@ mod ios_videotoolbox {
                 let _ = tx.send(result);
             })
             .context("Failed to spawn iOS segment merge thread")?;
-        rx.recv_timeout(timeout).map_err(|_| {
-            anyhow!(
-                "iOS per-segment merge timed out after {}s",
-                timeout.as_secs()
-            )
-        })?
+        rx.recv()
+            .context("iOS segment merge thread exited unexpectedly")?
     }
 }
 
@@ -6061,14 +6056,12 @@ fn ios_hardware_merge_segments(
     output_mp4: &str,
     expected_duration: Option<f64>,
 ) -> Result<()> {
-    let timeout = ios_videotoolbox_timeout(expected_duration);
     ios_videotoolbox::merge_segments(
         segments.dir.to_string_lossy().as_ref(),
         &segments.prefix,
         segments.total,
         output_mp4,
         expected_duration,
-        timeout,
     )
 }
 
