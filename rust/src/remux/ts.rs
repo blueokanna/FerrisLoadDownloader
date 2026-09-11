@@ -79,7 +79,9 @@ pub fn parse_ts<R: Read>(reader: R, sink: &mut dyn SampleSink) -> Result<()> {
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => return Err(error).context("reading MPEG-TS input"),
         }
-        reader.read_exact(&mut buffer[1..]).context("reading MPEG-TS input")?;
+        reader
+            .read_exact(&mut buffer[1..])
+            .context("reading MPEG-TS input")?;
         parser.packet(&buffer)?;
     }
     parser.finish()
