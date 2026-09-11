@@ -3,6 +3,8 @@ name: Build and Release
 # 质量关卡（validate / security-scan）在每次 push 到 main 与每个 PR 上运行；
 # 跨平台产物构建与 Docker 镜像只由 v* tag 或手动触发执行，避免每次提交都
 # 消耗 Windows/macOS runner 分钟数并把镜像推到 GHCR。
+# 手动触发时 iOS 默认跳过（skip_ios 预勾选；取消勾选即可构建），v* tag 发版
+# 仍构建 iOS；跳过或失败的 iOS / Docker 都不会阻塞 Release 的创建。
 on:
   push:
     branches:
@@ -21,6 +23,11 @@ on:
         type: boolean
         required: false
         default: false
+      skip_ios:
+        description: 'Skip the iOS build on manual runs (untick to build it). v* tag releases always build iOS.'
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -461,7 +468,12 @@ jobs:
 
   build-ios:
     name: Build iOS arm64 (unsigned)
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    # Manual runs skip iOS by default (`skip_ios` is pre-ticked); untick the
+    # input to build it on demand. Tag pushes always build iOS so a release
+    # ships the sideload archive whenever the build is healthy.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_ios != 'true')
     needs: validate
     runs-on: macos-15
     timeout-minutes: 60
@@ -599,15 +611,23 @@ jobs:
   create-release:
     name: Create GitHub Release
     # Runs for a v* tag or a manual dispatch with a tag name, provided the
-    # Android APKs were signed. Docker is intentionally decoupled: the app
-    # release must not be blocked when the Docker image is skipped
-    # (`skip_docker`) or fails, so only a fully cancelled docker run prevents
-    # publishing. Referencing needs.docker-api.result also stops GitHub from
-    # auto-skipping this job when docker-api was skipped.
+    # Android APKs were signed. Docker and iOS are intentionally decoupled:
+    # the app release must not be blocked when they are skipped or fail.
+    # `!cancelled()` removes the implicit success() requirement on the build
+    # jobs; validate/build-android failures are still stopped by the Android
+    # signing gate, the other desktop/Web builds are checked explicitly, and
+    # a missing required artifact fails the publish step loudly. The iOS
+    # archive is attached only when the iOS job actually succeeded.
     if: >-
-      (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '')
+      ${{ !cancelled()
+      && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag_name != '')
       && needs.build-android.outputs.release_signed == 'true'
+      && needs.build-windows.result == 'success'
+      && needs.build-macos.result == 'success'
+      && needs.build-linux.result == 'success'
+      && needs.build-web.result == 'success'
       && needs.docker-api.result != 'cancelled'
+      && needs.build-ios.result != 'cancelled' }}
     permissions:
       contents: write
     needs:
@@ -644,6 +664,35 @@ jobs:
           else
             echo 'docker_line=Docker API image was not published for this release (skipped or failed; app artifacts above are unaffected).' >> "$GITHUB_OUTPUT"
           fi
+          if [[ "${{ needs.build-ios.result }}" == "success" ]]; then
+            echo 'ios_line=iOS arm64 (unsigned) archive: `FerrisLoad-ios-arm64-unsigned.zip`.' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ios_line=iOS archive was not built for this release (skipped or failed; other artifacts are unaffected).' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute release file list
+        id: release_files
+        shell: bash
+        # The iOS job can be skipped (`skip_ios`) or fail; its archive is only
+        # listed when the job actually produced one. Every other entry is
+        # unconditional so a missing required artifact still fails the publish
+        # step (fail_on_unmatched_files) instead of being silently dropped.
+        run: |
+          {
+            echo 'files<<EOF'
+            echo 'artifacts/android-apks/FerrisLoad-android-arm64-v8a.apk'
+            echo 'artifacts/android-apks/FerrisLoad-android-armeabi-v7a.apk'
+            echo 'artifacts/android-apks/FerrisLoad-android-x86_64.apk'
+            echo 'artifacts/windows-x64/FerrisLoad-windows-x64.zip'
+            echo 'artifacts/macos-x64/FerrisLoad-macos-x64.zip'
+            echo 'artifacts/macos-arm64/FerrisLoad-macos-arm64.zip'
+            echo 'artifacts/linux-x64/FerrisLoad-linux-x64.tar.gz'
+            if [[ "${{ needs.build-ios.result }}" == "success" ]]; then
+              echo 'artifacts/ios-arm64/FerrisLoad-ios-arm64-unsigned.zip'
+            fi
+            echo 'artifacts/SHA256SUMS'
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: List release files
         run: find artifacts -type f | sort
@@ -668,13 +717,5 @@ jobs:
           fail_on_unmatched_files: true
           body: |
             ${{ steps.release_tag.outputs.docker_line }}
-          files: |
-            artifacts/android-apks/FerrisLoad-android-arm64-v8a.apk
-            artifacts/android-apks/FerrisLoad-android-armeabi-v7a.apk
-            artifacts/android-apks/FerrisLoad-android-x86_64.apk
-            artifacts/windows-x64/FerrisLoad-windows-x64.zip
-            artifacts/macos-x64/FerrisLoad-macos-x64.zip
-            artifacts/macos-arm64/FerrisLoad-macos-arm64.zip
-            artifacts/linux-x64/FerrisLoad-linux-x64.tar.gz
-            artifacts/ios-arm64/FerrisLoad-ios-arm64-unsigned.zip
-            artifacts/SHA256SUMS
+            ${{ steps.release_tag.outputs.ios_line }}
+          files: ${{ steps.release_files.outputs.files }}

@@ -138,7 +138,7 @@ cargo test --manifest-path rust/Cargo.toml
 cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked -- -D warnings
 ```
 
-CI 还会额外构建 Web（JS + WASM）与 iOS（arm64，未签名），并对 Rust/Dart/容器依赖做安全扫描。
+CI 还会构建 Web（JS + WASM）等跨平台产物，并对 Rust/Dart/容器依赖做安全扫描。iOS（arm64，未签名）只在推送 `v*` tag 发版时构建，手动触发默认跳过（取消勾选 `skip_ios` 可构建）；iOS 或 Docker（`skip_docker`）被跳过 / 失败时都不会阻塞 Release 发布。
 
 ## License
 
