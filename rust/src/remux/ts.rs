@@ -72,11 +72,15 @@ pub fn parse_ts<R: Read>(reader: R, sink: &mut dyn SampleSink) -> Result<()> {
     let mut buffer = [0u8; TS_PACKET_SIZE];
     let mut reader = reader;
     loop {
-        match reader.read_exact(&mut buffer) {
-            Ok(()) => parser.packet(&buffer)?,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+        match reader.read(&mut buffer[..1]) {
+            Ok(0) => break,
+            Ok(1) => {}
+            Ok(_) => unreachable!(),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => return Err(error).context("reading MPEG-TS input"),
         }
+        reader.read_exact(&mut buffer[1..]).context("reading MPEG-TS input")?;
+        parser.packet(&buffer)?;
     }
     parser.finish()
 }
