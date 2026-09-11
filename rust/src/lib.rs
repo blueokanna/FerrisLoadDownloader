@@ -5,6 +5,7 @@ pub mod download_service;
 mod frb_generated;
 pub mod hls;
 pub mod net;
+pub mod remux;
 pub mod xml;
 
 pub use ferrisload_core as core;

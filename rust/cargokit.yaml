@@ -1,0 +1,53 @@
+# cargokit per-build options (parsed by rust_builder/cargokit/build_tool).
+#
+# Purpose: make the iOS cdylib link tolerate the iOS-only VideoToolbox externs
+# (`ferrisload_videotoolbox_*`), whose definitions live in the App's
+# `VideoToolboxBridge.m` and only exist at the final App link.
+#
+# The crate builds `crate-type = ["cdylib", "staticlib", "rlib"]`; the cdylib
+# is an unused side product on iOS (the app consumes the staticlib via
+# -force_load), but cargo still has to LINK it, and a plain cdylib link fails
+# with "Undefined symbols: _ferrisload_videotoolbox_*".
+#
+# `-undefined dynamic_lookup` tells the iOS linker to leave those symbols
+# unresolved in the dylib, which is exactly what we want here.
+#
+# Why `--config` instead of the `.cargo/config.toml` / env vars:
+#   * cargo only discovers `.cargo/config.toml` from the *current working
+#     directory* upward; Xcode/cargokit invokes cargo from a different CWD, so
+#     `rust/.cargo/config.toml` never reaches the iOS build.
+#   * `CARGO_TARGET_<triple>_RUSTFLAGS` env vars ARE honoured by cargo, but a
+#     global `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` in the build environment
+#     silently disables them (they are mutually exclusive sources), and an
+#     unset/overridden env var fails silently.
+#   * CLI `--config` is the HIGHEST-precedence source (above env vars and
+#     files), is applied for the exact triple being built, and cannot be
+#     silently skipped. This is the bullet-proof mechanism.
+#
+# The values only match the three Apple iOS triples; every other platform
+# build (macOS/Android/desktop) is unaffected.
+cargo:
+  debug:
+    extra_flags:
+      - --config
+      - 'target.aarch64-apple-ios.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+      - --config
+      - 'target.aarch64-apple-ios-sim.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+      - --config
+      - 'target.x86_64-apple-ios.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+  release:
+    extra_flags:
+      - --config
+      - 'target.aarch64-apple-ios.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+      - --config
+      - 'target.aarch64-apple-ios-sim.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+      - --config
+      - 'target.x86_64-apple-ios.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+  profile:
+    extra_flags:
+      - --config
+      - 'target.aarch64-apple-ios.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+      - --config
+      - 'target.aarch64-apple-ios-sim.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'
+      - --config
+      - 'target.x86_64-apple-ios.rustflags=["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"]'

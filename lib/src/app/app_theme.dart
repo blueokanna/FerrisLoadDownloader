@@ -1,4 +1,9 @@
-import 'package:flutter/cupertino.dart' show CupertinoPageTransitionsBuilder;
+// Page transitions are configured through the platform default builders.
+// `CupertinoPageTransitionsBuilder` deliberately is NOT referenced here: it
+// moved from `flutter/material.dart` to `flutter/cupertino.dart` upstream, so
+// naming it directly breaks `flutter analyze` on whichever Flutter version
+// does not export it from the imported library. Omitting the iOS entry keeps
+// the framework default (the Cupertino transition) and stays version-proof.
 import 'package:flutter/material.dart';
 
 class AppThemeProfile {
@@ -336,8 +341,9 @@ ThemeData buildAppTheme(
     ),
     pageTransitionsTheme: const PageTransitionsTheme(
       builders: {
+        // Only Android is overridden (predictive back). iOS/macOS use the
+        // framework default, which already is the Cupertino page transition.
         TargetPlatform.android: PredictiveBackPageTransitionsBuilder(),
-        TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
       },
     ),
     splashFactory: InkSparkle.splashFactory,

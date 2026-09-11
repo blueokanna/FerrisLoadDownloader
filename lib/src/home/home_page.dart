@@ -38,8 +38,8 @@ class _HomePageState extends State<HomePage> {
   final _formKey = GlobalKey<FormState>();
   final _urlCtrl = TextEditingController();
   final _fileNameCtrl = TextEditingController(text: 'video.mp4');
-  final _concurrencyCtrl = TextEditingController(text: '8');
-  final _retriesCtrl = TextEditingController(text: '3');
+  final _concurrencyCtrl = TextEditingController(text: '4');
+  final _retriesCtrl = TextEditingController(text: '5');
   final _vBitrateCtrl = TextEditingController(text: '0');
   final _aBitrateCtrl = TextEditingController(text: '0');
   final _userAgentCtrl = TextEditingController();
@@ -69,8 +69,6 @@ class _HomePageState extends State<HomePage> {
   @override
   void didUpdateWidget(HomePage oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // On the web the engine is bound to the API base URL + token; recreate it
-    // when the user changes those settings so requests use the new endpoint.
     if (oldWidget.settings.apiBaseUrl != widget.settings.apiBaseUrl ||
         oldWidget.settings.apiToken != widget.settings.apiToken) {
       _engine = createDownloadEngine(
@@ -104,7 +102,6 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _pickDir() async {
     if (_pageController.value.analyzing || FerrisPlatform.isWeb) {
-      // The web build saves to the API server, so there is no local directory.
       return;
     }
     final dir = await FilePicker.getDirectoryPath();
@@ -115,7 +112,6 @@ class _HomePageState extends State<HomePage> {
 
   Future<String> _tempOutputPathFor(String name, String? chosenDir) async {
     if (FerrisPlatform.isWeb) {
-      // The web build sends only the file name; the API server owns the path.
       return name;
     }
     if (FerrisPlatform.isAndroid) {
@@ -135,9 +131,6 @@ class _HomePageState extends State<HomePage> {
 
   String _normalizeOutputName(String value) {
     final trimmed = value.trim().isEmpty ? 'video.mp4' : value.trim();
-    // Strip any directory components so the file name cannot escape the chosen
-    // output directory (path traversal), then replace reserved and control
-    // characters with underscores so it is safe on every platform.
     final basename = trimmed.split(RegExp(r'[\\/]')).last.trim();
     final sanitized = basename.replaceAll(
       RegExp(r'[\\/:*?"<>|\x00-\x1f]'),
@@ -156,10 +149,6 @@ class _HomePageState extends State<HomePage> {
     return _normalizeOutputName(sanitized);
   }
 
-  /// Strip CR/LF and other control bytes from a pasted header value so a
-  /// multi-line clipboard paste can never reach the Rust engine and trigger
-  /// a header-injection guard (or corrupt an upstream request). Non-ASCII
-  /// characters are preserved.
   String _sanitizeHeaderValue(String value) {
     return value.replaceAll(RegExp(r'[\x00-\x08\x0A-\x1F\x7F]'), '');
   }
@@ -404,10 +393,16 @@ class _HomePageState extends State<HomePage> {
     final chosenDir = vm.chosenDir;
     final keepTemp = vm.keepTemp;
     final output = await _tempOutputPathFor(fileName, chosenDir);
-    final concurrency = int.parse(_concurrencyCtrl.text.trim());
-    final retries = int.parse(_retriesCtrl.text.trim());
-    final vBitrate = int.parse(_vBitrateCtrl.text.trim());
-    final aBitrate = int.parse(_aBitrateCtrl.text.trim());
+    // Sanity-clamp the numeric knobs before they reach the native engine so a
+    // stray/typoed value can never cause pathological resource use. The Rust
+    // downloader shares one connection pool of 4 per host, so a concurrency
+    // above 4 only adds worker contention and timeouts, never more speed.
+    final concurrency =
+        int.parse(_concurrencyCtrl.text.trim()).clamp(1, 16).toInt();
+    final retries = int.parse(_retriesCtrl.text.trim()).clamp(1, 10).toInt();
+    final vBitrate =
+        int.parse(_vBitrateCtrl.text.trim()).clamp(0, 20000).toInt();
+    final aBitrate = int.parse(_aBitrateCtrl.text.trim()).clamp(0, 512).toInt();
 
     final taskId = _pageController.beginDownloadTask(
       fileName: fileName,

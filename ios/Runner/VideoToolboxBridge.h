@@ -53,6 +53,20 @@ int ferrisload_videotoolbox_mux(const char *video,
                                 char *errbuf,
                                 size_t errbuf_len);
 
+/// Assemble an ordered set of per-segment media files
+/// (`dir`/`prefix_00000.part` .. `prefix_<count-1>.part`) into one MP4.
+/// Every segment is loaded through its OWN AVURLAsset and laid onto a single
+/// continuous timeline, so the per-segment PTS resets that break a
+/// byte-concatenated TS never reach one reader. Used by the Rust engine for
+/// HLS TS sources (the fMP4 fast path bypasses this entirely).
+int ferrisload_videotoolbox_merge_segments(const char *dir,
+                                           const char *prefix,
+                                           int count,
+                                           const char *output,
+                                           long long expected_ms,
+                                           char *errbuf,
+                                           size_t errbuf_len);
+
 #ifdef __cplusplus
 }
 #endif
